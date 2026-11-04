@@ -148,6 +148,19 @@ func (s *Store) TasksFor(agentID string) []*model.Task {
 	return out
 }
 
+// WorkingAgents returns the IDs of agents with a task currently running.
+func (s *Store) WorkingAgents() map[string]bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := map[string]bool{}
+	for _, t := range s.data.Tasks {
+		if t.Status == "running" {
+			out[t.AgentID] = true
+		}
+	}
+	return out
+}
+
 // GetTask returns a task or nil.
 func (s *Store) GetTask(id string) *model.Task {
 	s.mu.Lock()

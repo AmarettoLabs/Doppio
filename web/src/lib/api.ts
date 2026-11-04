@@ -22,6 +22,8 @@ export interface AgentView {
 	error?: string;
 	lastPollAt?: string;
 	nextPollAt?: string;
+	/** a task is currently running */
+	working: boolean;
 	createdAt: string;
 	updatedAt: string;
 }

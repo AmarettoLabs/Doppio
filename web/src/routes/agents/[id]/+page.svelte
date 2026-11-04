@@ -142,7 +142,7 @@
 			<dt>Poll</dt><dd>every {agent.pollSeconds}s</dd>
 			<dt>Next git check</dt><dd>
 				{#if agent.gitProvider && agent.gitProvider !== 'none'}
-					<PollTimer nextPollAt={agent.nextPollAt} pollSeconds={agent.pollSeconds} running={agent.status === 'running'} textOnly />
+					<PollTimer nextPollAt={agent.nextPollAt} pollSeconds={agent.pollSeconds} running={agent.status === 'running'} working={agent.working} textOnly />
 				{:else}
 					<span class="muted">git not configured</span>
 				{/if}

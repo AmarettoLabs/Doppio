@@ -129,8 +129,11 @@ type AgentView struct {
 	Error       string     `json:"error,omitempty"`
 	LastPollAt  *time.Time `json:"lastPollAt,omitempty"`
 	NextPollAt  *time.Time `json:"nextPollAt,omitempty"`
-	CreatedAt   time.Time  `json:"createdAt"`
-	UpdatedAt   time.Time  `json:"updatedAt"`
+	// Working is true while one of the agent's tasks is running. Only set
+	// by the list/get endpoints.
+	Working   bool      `json:"working"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
 }
 
 func toView(a *model.Agent) AgentView {
@@ -328,9 +331,12 @@ func (s *Server) handleProviders(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) handleListAgents(w http.ResponseWriter, _ *http.Request) {
 	agents := s.store.Agents()
 	views := make([]AgentView, 0, len(agents))
+	working := s.store.WorkingAgents()
 	for _, a := range agents {
 		a.Status = liveStatus(s.rt, a)
-		views = append(views, toView(a))
+		v := toView(a)
+		v.Working = working[a.ID]
+		views = append(views, v)
 	}
 	writeJSON(w, http.StatusOK, views)
 }
@@ -342,7 +348,9 @@ func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.Status = liveStatus(s.rt, a)
-	writeJSON(w, http.StatusOK, toView(a))
+	v := toView(a)
+	v.Working = s.store.WorkingAgents()[a.ID]
+	writeJSON(w, http.StatusOK, v)
 }
 
 // liveStatus resolves the container state, mapping "not-found" to the stored

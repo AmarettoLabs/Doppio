@@ -73,12 +73,12 @@ Manager environment variables:
 Agent containers use Docker's DNS, which can't resolve names that only work
 on the host (mDNS `*.local`, LAN names without a search domain), and they
 reject self-signed certificates. For a local server such as
-`https://ascent:8443/v1`, map the name and trust its CA:
+`https://llm-server:8443/v1`, map the name and trust its CA:
 
 ```sh
-mkdir -p /opt/doppio/data/ca && cp ascent-ca.pem /opt/doppio/data/ca/
-AGENT_EXTRA_HOSTS=ascent:192.168.0.16 \
-AGENT_CA_BUNDLE=/opt/doppio/data/ca/ascent-ca.pem ./deploy/up.sh
+mkdir -p /opt/doppio/data/ca && cp llm-server-ca.pem /opt/doppio/data/ca/
+AGENT_EXTRA_HOSTS=llm-server:192.168.1.50 \
+AGENT_CA_BUNDLE=/opt/doppio/data/ca/llm-server-ca.pem ./deploy/up.sh
 ```
 
 The bundle must be readable by the manager (under `DATA_DIR` in compose); it

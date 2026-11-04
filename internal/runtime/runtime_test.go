@@ -18,18 +18,18 @@ import (
 )
 
 func TestParseExtraHosts(t *testing.T) {
-	got, err := ParseExtraHosts(" ascent:192.168.0.16, gpu-box.lan:10.0.0.2\nv6:fd00::1 ")
+	got, err := ParseExtraHosts(" llm-server:192.168.1.50, gpu-box.lan:10.0.0.2\nv6:fd00::1 ")
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"ascent:192.168.0.16", "gpu-box.lan:10.0.0.2", "v6:fd00::1"}
+	want := []string{"llm-server:192.168.1.50", "gpu-box.lan:10.0.0.2", "v6:fd00::1"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %v, want %v", got, want)
 	}
 	if got, err := ParseExtraHosts(""); err != nil || got != nil {
 		t.Fatalf("empty: got %v, %v", got, err)
 	}
-	for _, bad := range []string{"ascent", "ascent:notanip", ":1.2.3.4", "-x:1.2.3.4", "a b:1.2.3.4", "a_b:1.2.3.4"} {
+	for _, bad := range []string{"llm-server", "llm-server:notanip", ":1.2.3.4", "-x:1.2.3.4", "a b:1.2.3.4", "a_b:1.2.3.4"} {
 		if _, err := ParseExtraHosts(bad); err == nil {
 			t.Errorf("%q: expected error", bad)
 		}

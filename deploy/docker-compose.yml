@@ -44,7 +44,7 @@ services:
       PORTAL_PASSWORD: ${PORTAL_PASSWORD:-}
       # Hosts agent containers can't resolve through DNS (e.g. LAN machines
       # only reachable via mDNS), as comma-separated "name:ip" entries:
-      #   AGENT_EXTRA_HOSTS=ascent:192.168.0.16
+      #   AGENT_EXTRA_HOSTS=llm-server:192.168.1.50
       AGENT_EXTRA_HOSTS: ${AGENT_EXTRA_HOSTS:-}
       # PEM file with extra CA certificates agents should trust (e.g. a
       # self-signed local inference server). Must be readable inside this

@@ -7,9 +7,13 @@ package runtime
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
+	"log"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -26,10 +30,49 @@ type Runtime struct {
 	DataDir      string
 	ManagerURL   string
 	ManagerToken string
+	// ExtraHosts are "name:ip" entries added to every agent container's
+	// /etc/hosts (docker --add-host), for hosts the container's DNS can't
+	// resolve, e.g. LAN machines only reachable via mDNS on the host.
+	ExtraHosts []string
+	// CABundle is the path (as seen by the manager) of a PEM file with extra
+	// CA certificates agents should trust on top of the system ones, e.g. the
+	// CA of a self-signed local inference server.
+	CABundle string
 }
 
-// NewFromEnv builds a Runtime from the environment:
-// DOCKER_BIN, AGENT_IMAGE, AGENT_NETWORK, MANAGER_URL plus dataDir/token.
+// extraCAFile is the extra CA bundle's name in the per-agent state dir,
+// mounted in the container at /agent/state.
+const extraCAFile = "extra-ca.pem"
+
+// ParseExtraHosts parses a comma- or whitespace-separated list of
+// "hostname:ip" entries (IPv6 addresses allowed: "name:fd00::1").
+func ParseExtraHosts(s string) ([]string, error) {
+	var out []string
+	for _, e := range strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' || r == '\n' }) {
+		name, ip, ok := strings.Cut(e, ":")
+		if !ok || !validHostname(name) || net.ParseIP(ip) == nil {
+			return nil, fmt.Errorf("invalid extra host %q (want hostname:ip)", e)
+		}
+		out = append(out, name+":"+ip)
+	}
+	return out, nil
+}
+
+func validHostname(h string) bool {
+	if h == "" || len(h) > 253 || strings.HasPrefix(h, "-") || strings.HasPrefix(h, ".") {
+		return false
+	}
+	for _, c := range h {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '.') {
+			return false
+		}
+	}
+	return true
+}
+
+// NewFromEnv builds a Runtime from the environment: DOCKER_BIN, AGENT_IMAGE,
+// AGENT_NETWORK, MANAGER_URL, AGENT_EXTRA_HOSTS, AGENT_CA_BUNDLE plus
+// dataDir/token.
 func NewFromEnv(dataDir, managerToken string) *Runtime {
 	get := func(k, def string) string {
 		if v := os.Getenv(k); v != "" {
@@ -42,7 +85,14 @@ func NewFromEnv(dataDir, managerToken string) *Runtime {
 	if err != nil {
 		absData = dataDir
 	}
+	hosts, err := ParseExtraHosts(os.Getenv("AGENT_EXTRA_HOSTS"))
+	if err != nil {
+		log.Printf("warning: AGENT_EXTRA_HOSTS ignored: %v", err)
+		hosts = nil
+	}
 	return &Runtime{
+		ExtraHosts:   hosts,
+		CABundle:     os.Getenv("AGENT_CA_BUNDLE"),
 		DockerBin:    get("DOCKER_BIN", "docker"),
 		Image:        get("AGENT_IMAGE", "doppio-agent:latest"),
 		Network:      get("AGENT_NETWORK", "doppio_agents"),
@@ -113,9 +163,61 @@ func (r *Runtime) writeConfig(a *model.Agent) (string, error) {
 	return p, nil
 }
 
+// writeCABundle copies the configured extra CA bundle into the agent's state
+// dir, or removes a stale copy when none is configured. Reports whether the
+// agent has a bundle.
+func (r *Runtime) writeCABundle(a *model.Agent) (bool, error) {
+	dst := filepath.Join(r.agentDir(a.ID), extraCAFile)
+	if r.CABundle == "" {
+		if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
+			return false, err
+		}
+		return false, nil
+	}
+	b, err := os.ReadFile(r.CABundle)
+	if err != nil {
+		return false, fmt.Errorf("AGENT_CA_BUNDLE: %w", err)
+	}
+	if err := checkPEMCerts(b); err != nil {
+		return false, fmt.Errorf("AGENT_CA_BUNDLE %s: %w", r.CABundle, err)
+	}
+	if err := os.WriteFile(dst, b, 0o644); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// checkPEMCerts verifies b holds at least one PEM certificate and that every
+// certificate in it parses.
+func checkPEMCerts(b []byte) error {
+	n := 0
+	for {
+		var blk *pem.Block
+		blk, b = pem.Decode(b)
+		if blk == nil {
+			break
+		}
+		if blk.Type != "CERTIFICATE" {
+			continue
+		}
+		if _, err := x509.ParseCertificate(blk.Bytes); err != nil {
+			return fmt.Errorf("certificate %d: %w", n+1, err)
+		}
+		n++
+	}
+	if n == 0 {
+		return fmt.Errorf("no PEM certificates found")
+	}
+	return nil
+}
+
 // Start creates and starts the agent's container, returning its ID.
 func (r *Runtime) Start(a *model.Agent) (string, error) {
 	if _, err := r.writeConfig(a); err != nil {
+		return "", err
+	}
+	hasCA, err := r.writeCABundle(a)
+	if err != nil {
 		return "", err
 	}
 	name := ContainerName(a.ID)
@@ -134,8 +236,14 @@ func (r *Runtime) Start(a *model.Agent) (string, error) {
 		"-v", filepath.Join(r.agentDir(a.ID), "workspace") + ":/agent/workspace:z",
 		"-e", "AGENT_CONFIG=/agent/state/config.json",
 		"-e", "AGENT_WORKSPACE=/agent/workspace",
-		r.Image,
 	}
+	for _, h := range r.ExtraHosts {
+		args = append(args, "--add-host", h)
+	}
+	if hasCA {
+		args = append(args, "-e", "DOPPIO_EXTRA_CA=/agent/state/"+extraCAFile)
+	}
+	args = append(args, r.Image)
 	out, err := r.run(args...)
 	if err != nil {
 		return "", fmt.Errorf("docker run: %v: %s", err, strings.TrimSpace(out))

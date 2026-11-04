@@ -13,6 +13,8 @@
 //	PORTAL_PASSWORD  if set, the portal requires login with this password
 //	MAX_EVENTS_PER_AGENT  persisted events per agent (default 5000, 0 = unlimited)
 //	DOCKER_BIN       docker CLI binary (default docker)
+//	AGENT_EXTRA_HOSTS  "host:ip" entries (comma-separated) added to agents' /etc/hosts
+//	AGENT_CA_BUNDLE  PEM file of extra CA certificates agents trust (path as seen by the manager)
 package main
 
 import (

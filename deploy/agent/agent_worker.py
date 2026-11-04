@@ -18,6 +18,7 @@ import datetime
 import json
 import os
 import re
+import ssl
 import subprocess
 import sys
 import time
@@ -57,12 +58,37 @@ def normalize_repo(r):
     return r.strip("/")
 
 
+SYSTEM_CA = "/etc/ssl/certs/ca-certificates.crt"
+_ssl_ctx = None
+
+
+def setup_extra_ca():
+    """Trust the extra CAs the manager mounted (DOPPIO_EXTRA_CA) on top of the
+    system ones, for this worker and for the commands its shell tool runs
+    (git, curl, python requests...)."""
+    global _ssl_ctx
+    extra = os.environ.get("DOPPIO_EXTRA_CA")
+    if not extra:
+        return
+    bundle = "/tmp/doppio-ca-bundle.pem"
+    with open(bundle, "w") as out:
+        if os.path.exists(SYSTEM_CA):
+            with open(SYSTEM_CA) as f:
+                out.write(f.read().rstrip("\n") + "\n")
+        with open(extra) as f:
+            out.write(f.read())
+    for k in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO"):
+        os.environ[k] = bundle
+    _ssl_ctx = ssl.create_default_context(cafile=bundle)
+    log("trusting extra CA certificates from", extra)
+
+
 def http_json(method, url, headers, body=None, timeout=30):
     """HTTP request returning parsed JSON; HTTP errors carry the response body."""
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=_ssl_ctx) as resp:
             raw = resp.read()
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace")[:300]
@@ -630,6 +656,7 @@ def run_task(mgr, agent, system, t):
 
 
 def main():
+    setup_extra_ca()
     with open(CFG_PATH) as f:
         cfg = json.load(f)
     agent = cfg["agent"]

@@ -65,6 +65,26 @@ Manager environment variables:
 | `MANAGER_URL` | `http://manager:8080` | URL agents use to reach the manager |
 | `MAX_EVENTS_PER_AGENT` | `5000` | Persisted events per agent (`0` = unlimited) |
 | `DOCKER_BIN` | `docker` | Docker CLI binary |
+| `AGENT_EXTRA_HOSTS` | _(empty)_ | Comma-separated `name:ip` entries added to every agent's `/etc/hosts` |
+| `AGENT_CA_BUNDLE` | _(empty)_ | PEM file of extra CA certificates agents trust, on top of the system ones |
+
+### Local / self-hosted model servers
+
+Agent containers use Docker's DNS, which can't resolve names that only work
+on the host (mDNS `*.local`, LAN names without a search domain), and they
+reject self-signed certificates. For a local server such as
+`https://ascent:8443/v1`, map the name and trust its CA:
+
+```sh
+mkdir -p /opt/doppio/data/ca && cp ascent-ca.pem /opt/doppio/data/ca/
+AGENT_EXTRA_HOSTS=ascent:192.168.0.16 \
+AGENT_CA_BUNDLE=/opt/doppio/data/ca/ascent-ca.pem ./deploy/up.sh
+```
+
+The bundle must be readable by the manager (under `DATA_DIR` in compose); it
+is copied into each agent's state dir when the agent is (re)deployed, and
+trusted by the worker and the commands it runs (git, curl, requests). Redeploy
+existing agents after changing either setting.
 
 Compose only: `BIND_ADDR` (default `127.0.0.1`) is the host interface the
 portal port is published on.

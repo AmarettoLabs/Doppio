@@ -42,6 +42,14 @@ services:
       # Require a login password on the portal (strongly recommended whenever
       # the port is reachable by anyone but you):
       PORTAL_PASSWORD: ${PORTAL_PASSWORD:-}
+      # Hosts agent containers can't resolve through DNS (e.g. LAN machines
+      # only reachable via mDNS), as comma-separated "name:ip" entries:
+      #   AGENT_EXTRA_HOSTS=ascent:192.168.0.16
+      AGENT_EXTRA_HOSTS: ${AGENT_EXTRA_HOSTS:-}
+      # PEM file with extra CA certificates agents should trust (e.g. a
+      # self-signed local inference server). Must be readable inside this
+      # container, so put it under DATA_DIR, e.g. ${DATA_DIR}/ca/local-ca.pem.
+      AGENT_CA_BUNDLE: ${AGENT_CA_BUNDLE:-}
     networks:
       - agents
     restart: unless-stopped

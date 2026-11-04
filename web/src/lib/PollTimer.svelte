@@ -5,7 +5,8 @@
 	// ring sweeps the whole poll interval (minutes scale), the inner ring
 	// sweeps the seconds of the current minute. While the agent is working (a
 	// task is running, or the check is due and hasn't been rescheduled yet) the
-	// same rings spin as a busy indicator instead.
+	// same rings spin as a busy indicator instead. When the agent isn't
+	// running, both rings are drawn full in red.
 	let {
 		nextPollAt,
 		pollSeconds = 0,
@@ -53,7 +54,14 @@
 	}
 </script>
 
-{#if busy && textOnly}
+{#if !running && !textOnly}
+	<span class="poll-timer" title="agent is not running" role="img" aria-label="agent is not running">
+		<svg viewBox="0 0 40 40" width="88" height="88">
+			<circle cx="20" cy="20" r={R_OUT} fill="none" stroke="var(--err)" stroke-width="3.5" />
+			<circle cx="20" cy="20" r={R_IN} fill="none" stroke="var(--err)" stroke-width="3" />
+		</svg>
+	</span>
+{:else if busy && textOnly}
 	<span class="poll-label" title="agent is working">working…</span>
 {:else if busy}
 	<span class="poll-timer" title="agent is working" role="status" aria-label="agent is working">

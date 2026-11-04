@@ -68,7 +68,7 @@
 	{#each agents as a (a.id)}
 		<div class="agent-row">
 			<div class="timer-block" title="next git check">
-				{#if a.gitProvider && a.gitProvider !== 'none'}
+				{#if a.status !== 'running' || (a.gitProvider && a.gitProvider !== 'none')}
 					<PollTimer nextPollAt={a.nextPollAt} pollSeconds={a.pollSeconds} running={a.status === 'running'} working={a.working} />
 				{:else}
 					<span class="muted">—</span>

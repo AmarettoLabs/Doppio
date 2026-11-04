@@ -1,9 +1,13 @@
-<img src="web/static/assets/doppio-logo.png" alt="Doppio logo" width="96" align="right">
+<p align="center">
+  <img src="web/static/assets/doppio-logo.png" alt="Doppio logo" width="120">
+</p>
 
-# Doppio
+<h1 align="center">Doppio</h1>
 
-[![CI](https://github.com/AmarettoLabs/Doppio/actions/workflows/ci.yml/badge.svg)](https://github.com/AmarettoLabs/Doppio/actions/workflows/ci.yml)
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+<p align="center">
+  <a href="https://github.com/AmarettoLabs/Doppio/actions/workflows/ci.yml"><img src="https://github.com/AmarettoLabs/Doppio/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License: Apache 2.0"></a>
+</p>
 
 ![Doppio main view](assets/doppio-home.png)
 

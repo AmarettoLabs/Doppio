@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { serverNow } from './api';
+
 	// Countdown to the agent's next git poll: two concentric rings — the outer
 	// ring sweeps the whole poll interval (minutes scale), the inner ring
 	// sweeps the seconds of the current minute. While the agent is working (a
@@ -12,16 +14,24 @@
 		textOnly = false
 	}: { nextPollAt?: string; pollSeconds?: number; running?: boolean; working?: boolean; textOnly?: boolean } = $props();
 
-	let now = $state(Date.now());
+	let now = $state(serverNow());
 	$effect(() => {
-		const t = setInterval(() => (now = Date.now()), 500);
+		const t = setInterval(() => (now = serverNow()), 250);
 		return () => clearInterval(t);
 	});
 
 	const remainingMs = $derived(
 		nextPollAt && running ? Math.max(0, new Date(nextPollAt).getTime() - now) : null
 	);
-	const busy = $derived(running && (working || !nextPollAt || remainingMs === 0));
+	// A git check often takes about a second, less than the portal's refresh
+	// interval: keep spinning a few seconds so it is actually visible.
+	const MIN_SPIN_MS = 3000;
+	const busyNow = $derived(running && (working || !nextPollAt || remainingMs === 0));
+	let spinUntil = $state(0);
+	$effect(() => {
+		if (busyNow) spinUntil = now + MIN_SPIN_MS;
+	});
+	const busy = $derived(running && (busyNow || now < spinUntil));
 	const totalMs = $derived(Math.max(1, (pollSeconds || 1) * 1000));
 	// outer ring: fraction of the whole interval left; inner ring: seconds within the current minute
 	const outerFrac = $derived(remainingMs === null ? 0 : remainingMs / totalMs);

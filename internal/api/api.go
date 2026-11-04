@@ -129,8 +129,8 @@ type AgentView struct {
 	Error       string     `json:"error,omitempty"`
 	LastPollAt  *time.Time `json:"lastPollAt,omitempty"`
 	NextPollAt  *time.Time `json:"nextPollAt,omitempty"`
-	// Working is true while one of the agent's tasks is running. Only set
-	// by the list/get endpoints.
+	// Working is true while one of the agent's tasks is running or pending.
+	// Only set by the list/get endpoints.
 	Working   bool      `json:"working"`
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`

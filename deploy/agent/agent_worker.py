@@ -143,7 +143,8 @@ class Manager:
             log("finish failed:", e)
 
     def set_poll(self, last_iso, next_iso):
-        """Tell the manager when the last git poll ran and when the next one is."""
+        """Tell the manager when the last git poll ran and when the next one is.
+        next_iso None means a check is in progress (the portal shows a spinner)."""
         try:
             self.req(
                 "POST",
@@ -428,7 +429,15 @@ def poll_git(mgr, agent, state, state_path):
     now_dt = datetime.datetime.now(datetime.timezone.utc)
     now = now_dt.isoformat()
     nxt = (now_dt + datetime.timedelta(seconds=agent.get("pollSeconds", 1800))).isoformat()
-    mgr.set_poll(now, nxt)
+    mgr.set_poll(now, None)  # checking: no next time until this pass is over
+    try:
+        check_git_items(mgr, agent, state, state_path, now)
+    finally:
+        mgr.set_poll(now, nxt)
+
+
+def check_git_items(mgr, agent, state, state_path, now):
+    """One git pass: turn new mentions/assignments/review requests into tasks."""
     handled = set(state.get("handled", []))
     items = find_git_items(agent, mgr)
     if "baseline" not in state:
@@ -674,19 +683,22 @@ def main():
     log("worker starting:", agent["name"], f"({agent['provider']}/{agent['model']})")
     mgr.emit("status", f"worker started: {agent['name']} ({agent['provider']}/{agent['model']})")
     last_git = 0.0
+    poll_every = agent.get("pollSeconds", 1800)
     while True:
         try:
             t = mgr.next_task()
             if t:
                 run_task(mgr, agent, system, t)
-            if time.time() - last_git >= agent.get("pollSeconds", 1800):
+            if time.time() - last_git >= poll_every:
                 last_git = time.time()
                 poll_git(mgr, agent, state, state_path)
         except Exception as e:
             mgr.emit("error", f"loop error: {type(e).__name__}: {e}")
             time.sleep(10)
             continue
-        time.sleep(TASK_POLL_SECONDS)
+        # Wake up in time for the next git check, so it starts when the
+        # portal's countdown runs out rather than up to TASK_POLL_SECONDS late.
+        time.sleep(max(0.2, min(TASK_POLL_SECONDS, last_git + poll_every - time.time())))
 
 
 if __name__ == "__main__":

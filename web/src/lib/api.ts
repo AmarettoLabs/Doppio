@@ -22,6 +22,8 @@ export interface AgentView {
 	error?: string;
 	lastPollAt?: string;
 	nextPollAt?: string;
+	/** a task is running or about to be picked up */
+	working: boolean;
 	createdAt: string;
 	updatedAt: string;
 }
@@ -82,8 +84,26 @@ export interface GitProviderInfo {
 	name: string;
 }
 
+/**
+ * Estimated server clock minus browser clock, in ms, from the Date header of
+ * API responses. Countdowns to server timestamps add this to Date.now() so a
+ * skewed browser clock doesn't make them end early or late.
+ */
+export const clock = { offsetMs: 0 };
+
+export function serverNow(): number {
+	return Date.now() + clock.offsetMs;
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
+	const sent = Date.now();
 	const r = await fetch(path, init);
+	const date = r.headers.get('Date');
+	if (date) {
+		const server = Date.parse(date);
+		// Date has 1s resolution (truncated): +500ms is the expected value.
+		if (!Number.isNaN(server)) clock.offsetMs = server + 500 - (sent + Date.now()) / 2;
+	}
 	if (!r.ok) {
 		let msg = `${r.status} ${r.statusText}`;
 		try {

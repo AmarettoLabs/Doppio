@@ -1,0 +1,55 @@
+# Runs the agent manager. The manager talks to the Docker daemon through the
+# mounted socket and creates one container per deployed agent on the shared
+# `doppio_agents` network.
+#
+# First build the agent image:
+#   docker build -f deploy/Dockerfile.agent -t doppio-agent:latest .
+name: doppio
+
+services:
+  manager:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.manager
+    image: doppio-manager:latest
+    ports:
+      # Loopback only by default: the portal controls the host Docker daemon,
+      # so exposing it is equivalent to exposing root on this machine. To reach
+      # it from other hosts, set PORTAL_PASSWORD and put it behind a TLS
+      # reverse proxy, then change this to e.g. "0.0.0.0:8080:8080".
+      - "${BIND_ADDR:-127.0.0.1}:8080:8080"
+    volumes:
+      # z: SELinux relabel so the container can use the host socket
+      - /var/run/docker.sock:/var/run/docker.sock:z
+      # Host bind mounted at the SAME absolute path inside the container, so
+      # the manager can bind-mount per-agent state dirs into agent containers
+      # (the daemon resolves those paths on the host). Override with an
+      # absolute host path: DATA_DIR=/srv/doppio/data docker compose up
+      - ${DATA_DIR:-/opt/doppio/data}:${DATA_DIR:-/opt/doppio/data}:z
+    # The manager controls the host Docker daemon through the socket, so it is
+    # already host-equivalent; disable its SELinux label so the socket connect
+    # is allowed on enforcing hosts (Fedora etc.).
+    security_opt:
+      - label=disable
+    environment:
+      ADDR: :8080
+      STATIC_DIR: /app/web-build
+      DATA_DIR: ${DATA_DIR:-/opt/doppio/data}
+      AGENT_IMAGE: doppio-agent:latest
+      AGENT_NETWORK: doppio_agents
+      # URL agent containers use to reach this API over the shared network
+      MANAGER_URL: http://manager:8080
+      # Require a login password on the portal (strongly recommended whenever
+      # the port is reachable by anyone but you):
+      PORTAL_PASSWORD: ${PORTAL_PASSWORD:-}
+    networks:
+      - agents
+    restart: unless-stopped
+
+# Shared network for the manager and all agent containers. Created by the
+# manager itself if missing; create it once before the first `compose up`:
+#   docker network create doppio_agents
+networks:
+  agents:
+    name: doppio_agents
+    external: true

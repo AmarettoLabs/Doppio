@@ -1,0 +1,25 @@
+# Runtime state: holds the manager token, agent API/git tokens and configs
+data/
+/doppio-data/
+
+# Build output
+/doppio
+/bin/
+web/build/
+web/.svelte-kit/
+node_modules/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Logs, editors, OS
+*.log
+.idea/
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc

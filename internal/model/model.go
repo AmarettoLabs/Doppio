@@ -1,0 +1,115 @@
+// Package model defines the domain types of Doppio.
+package model
+
+import "time"
+
+// LLMProvider is a supported model company.
+type LLMProvider string
+
+const (
+	ProvOpenAI    LLMProvider = "openai"
+	ProvAnthropic LLMProvider = "anthropic"
+	ProvMistral   LLMProvider = "mistral"
+)
+
+// GitProvider is a supported git hosting service.
+type GitProvider string
+
+const (
+	GitNone   GitProvider = "none"
+	GitGitHub GitProvider = "github"
+	GitGitLab GitProvider = "gitlab"
+)
+
+// Agent is a configured coding agent. Deploying it starts one Docker
+// container running the generic worker with this configuration.
+type Agent struct {
+	ID          string      `json:"id"`
+	Name        string      `json:"name"`
+	Persona     string      `json:"persona"` // system prompt defining who the agent is and how it behaves
+	Task        string      `json:"task"`    // standing task / instructions
+	Provider    LLMProvider `json:"provider"`
+	Model       string      `json:"model"`
+	APIBase     string      `json:"apiBase,omitempty"` // optional override, e.g. a local OpenAI-compatible server
+	APIToken    string      `json:"apiToken,omitempty"`
+	Emails      []string    `json:"emails,omitempty"`
+	GitProvider GitProvider `json:"gitProvider,omitempty"`
+	GitBaseURL  string      `json:"gitBaseURL,omitempty"` // e.g. self-hosted GitLab
+	GitToken    string      `json:"gitToken,omitempty"`
+	GitLogin    string      `json:"gitLogin,omitempty"` // the agent's own account on the git host
+	GitRepos    []string    `json:"gitRepos,omitempty"` // e.g. "AmarettoLabs/Palazzo"
+	OwnerLogin  string      `json:"ownerLogin,omitempty"`
+	PeerLogins  []string    `json:"peerLogins,omitempty"`
+	PollSeconds int         `json:"pollSeconds"`
+	MaxTurns    int         `json:"maxTurns"` // tool-loop turns per task; -1 = unlimited (until the model's context limit)
+
+	Status      string `json:"status"` // created, running, stopped, error
+	ContainerID string `json:"containerId,omitempty"`
+	Error       string `json:"error,omitempty"`
+	// Git poll scheduling, reported by the worker so the UI can show a
+	// countdown to the next check.
+	LastPollAt *time.Time `json:"lastPollAt,omitempty"`
+	NextPollAt *time.Time `json:"nextPollAt,omitempty"`
+	CreatedAt  time.Time  `json:"createdAt"`
+	UpdatedAt  time.Time  `json:"updatedAt"`
+}
+
+// Task is one unit of work for an agent: a manual task from the portal, a
+// git mention, or an assigned issue/MR.
+type Task struct {
+	ID         string     `json:"id"`
+	AgentID    string     `json:"agentId"`
+	Kind       string     `json:"kind"` // manual, mention, assigned
+	Title      string     `json:"title"`
+	Input      string     `json:"input"`
+	Source     string     `json:"source,omitempty"` // e.g. "github:AmarettoLabs/Palazzo#12"
+	Status     string     `json:"status"`           // pending, running, done, failed
+	Output     string     `json:"output,omitempty"`
+	Error      string     `json:"error,omitempty"`
+	CreatedAt  time.Time  `json:"createdAt"`
+	StartedAt  *time.Time `json:"startedAt,omitempty"`
+	FinishedAt *time.Time `json:"finishedAt,omitempty"`
+}
+
+// Event is one entry in an agent's live stream: status, log lines, the
+// discussion with the model (user/assistant), actions, errors.
+type Event struct {
+	ID      int64     `json:"id"`
+	AgentID string    `json:"agentId"`
+	TaskID  string    `json:"taskId,omitempty"`
+	TS      time.Time `json:"ts"`
+	Type    string    `json:"type"` // status, log, user, assistant, action, error
+	Content string    `json:"content"`
+}
+
+// ProviderInfo describes one model company in the catalog.
+type ProviderInfo struct {
+	ID      string   `json:"id"`
+	Name    string   `json:"name"`
+	APIBase string   `json:"apiBase"`
+	Models  []string `json:"models"`
+}
+
+// Providers is the catalog of supported companies/models.
+func Providers() []ProviderInfo {
+	return []ProviderInfo{
+		{ID: string(ProvOpenAI), Name: "OpenAI", APIBase: "https://api.openai.com/v1", Models: []string{
+			"gpt-6.1-sol", "gpt-5.2", "gpt-5.2-pro", "gpt-5-mini", "gpt-4.1", "gpt-4o",
+		}},
+		{ID: string(ProvAnthropic), Name: "Anthropic", APIBase: "https://api.anthropic.com", Models: []string{
+			"claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1",
+		}},
+		{ID: string(ProvMistral), Name: "Mistral AI", APIBase: "https://api.mistral.ai/v1", Models: []string{
+			"mistral-large-4", "mistral-medium-3", "codestral-2",
+		}},
+	}
+}
+
+// GitProviders lists the git host options for the UI.
+func GitProviders() []map[string]string {
+	return []map[string]string{
+		{"id": string(GitNone), "name": "None"},
+		{"id": string(GitGitHub), "name": "GitHub"},
+		{"id": string(GitGitLab), "name": "GitLab"},
+	}
+}

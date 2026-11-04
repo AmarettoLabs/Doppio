@@ -1,0 +1,11 @@
+# syntax=docker/dockerfile:1
+# Generic agent image. The manager starts one container per deployed agent,
+# mounting the agent's config (mode 0600) at /agent/config.json. The worker
+# polls the manager for tasks and the git host for mentions/assigned work,
+# calls the configured LLM provider, and streams events back to the manager.
+FROM python:3.14-slim
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /agent
+COPY deploy/agent/agent_worker.py /agent/agent_worker.py
+ENTRYPOINT ["python3", "-u", "/agent/agent_worker.py"]

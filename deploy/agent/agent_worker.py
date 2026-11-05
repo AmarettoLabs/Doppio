@@ -602,7 +602,8 @@ def poll_git(mgr, agent, state, state_path):
     if not repos:
         return
     login = normalize_login(agent["gitLogin"])
-    mgr.emit("log", f"polling {provider} for mentions of @{login} / assignments in {', '.join(repos)}")
+    what = ", ".join(t.replace("_", " ") for t in TRIGGERS if t in agent_triggers(agent))
+    mgr.emit("log", f"checking {provider} for {what} of @{login} in {', '.join(repos)}")
     now_dt = datetime.datetime.now(datetime.timezone.utc)
     now = now_dt.isoformat()
     nxt = (now_dt + datetime.timedelta(seconds=agent.get("pollSeconds", 1800))).isoformat()

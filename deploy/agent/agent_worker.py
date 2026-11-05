@@ -498,7 +498,11 @@ def last_request_actor(agent, it):
             else:
                 hit = e.get("event") == "assigned" and ((e.get("assignee") or {}).get("login") or "").lower() == login
             if hit:
-                actor = (e.get("actor") or {}).get("login") or ""
+                # In this API the "actor" of an assigned event is the assignee;
+                # who did it is "assigner" (and "review_requester" for review
+                # requests). Fall back to actor if GitHub ever drops them.
+                who = e.get("review_requester" if review else "assigner") or e.get("actor") or {}
+                actor = who.get("login") or ""
         return actor
     if agent.get("gitProvider") == "gitlab":
         proj = urllib.parse.quote(repo, safe="")

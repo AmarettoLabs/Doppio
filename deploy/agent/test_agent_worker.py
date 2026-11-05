@@ -121,7 +121,9 @@ class OwnerGateTest(Patched):
         return dict(base, _repo=REPO, _kind="pull_requests" if "pull_request" in base else "issues", _trigger=trigger)
 
     def test_assignment_by_owner_only(self):
-        assigned = lambda actor: {"event": "assigned", "assignee": {"login": "bot"}, "actor": {"login": actor}}
+        # Real GitHub shape: actor is the assignee, assigner is who assigned.
+        assigned = lambda who: {"event": "assigned", "assignee": {"login": "bot"},
+                                "actor": {"login": "bot"}, "assigner": {"login": who}}
         self.use({r"/repos/o/r/issues/7/events.*": events(assigned("peer"), assigned("Boss"))})
         self.assertEqual(w.owner_requested(agent(), self.it(ISSUE, "assigned_issues")), (True, ""))
         self.use({r"/repos/o/r/issues/7/events.*": events(assigned("boss"), assigned("peer"))})
@@ -130,11 +132,14 @@ class OwnerGateTest(Patched):
         self.assertIn("assigned by peer", why)
 
     def test_review_request_by_owner(self):
-        req = {"event": "review_requested", "requested_reviewer": {"login": "bot"}, "actor": {"login": "peer"}}
-        self.use({r"/repos/o/r/issues/8/events.*": events(req)})
+        req = lambda who: {"event": "review_requested", "requested_reviewer": {"login": "bot"},
+                           "actor": {"login": who}, "review_requester": {"login": who}}
+        self.use({r"/repos/o/r/issues/8/events.*": events(req("peer"))})
         ok, why = w.owner_requested(agent(), self.it(PR, "review_requests"))
         self.assertFalse(ok)
         self.assertIn("review requested by peer", why)
+        self.use({r"/repos/o/r/issues/8/events.*": events(req("boss"))})
+        self.assertTrue(w.owner_requested(agent(), self.it(PR, "review_requests"))[0])
 
     def test_mentions_must_be_written_by_owner(self):
         comment = lambda who, body, ts="2026-11-05T09:30:00Z": {"user": {"login": who}, "body": body, "created_at": ts}
@@ -158,7 +163,8 @@ class CheckItemsTest(Patched):
     def test_owner_work_becomes_task_and_others_are_logged_once(self):
         mine = dict(ISSUE)
         theirs = dict(ISSUE, number=9, title="Other")
-        assigned = lambda actor: {"event": "assigned", "assignee": {"login": "bot"}, "actor": {"login": actor}}
+        assigned = lambda who: {"event": "assigned", "assignee": {"login": "bot"},
+                                "actor": {"login": "bot"}, "assigner": {"login": who}}
         self.use({
             r"/search/issues\?.*": search_route({("assignee", "is:issue"): [mine, theirs]}),
             r"/repos/o/r/issues/7/events.*": events(assigned("boss")),

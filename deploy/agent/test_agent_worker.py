@@ -211,6 +211,65 @@ class SourceTest(unittest.TestCase):
                          "bot/10-ci-checks-for-migrations")
 
 
+class RunTaskMgr(MgrStub):
+    def __init__(self):
+        super().__init__()
+        self.finished = []
+
+    def finish(self, task_id, status, output="", error=""):
+        self.finished.append((task_id, status, error))
+
+
+class RetryTest(unittest.TestCase):
+    def setUp(self):
+        orig = w.llm_call
+        self.addCleanup(setattr, w, "llm_call", orig)
+        self.path = os.path.join(WS_DIR, "retry-state.json")
+
+    def run_with(self, reply):
+        w.llm_call = reply
+        mgr = RunTaskMgr()
+        out = w.run_task(mgr, agent(maxTurns=1), "sys", {"id": "t1", "title": "x", "input": "hi"})
+        return out, mgr
+
+    def test_run_task_outcomes(self):
+        def broken(*a):
+            raise RuntimeError("HTTP 401 from https://llm/v1/chat/completions")
+        self.assertEqual(self.run_with(broken)[0], "error")
+        self.assertEqual(self.run_with(lambda *a: '```json\n{"tool":"read_file","path":"x"}\n```')[0], "failed")
+        out, mgr = self.run_with(lambda *a: "all good")
+        self.assertEqual((out, mgr.finished[-1][1]), ("done", "done"))
+
+    def test_errors_are_retried_then_given_up_until_restart(self):
+        src = "github:o/r#pull_requests:20@abc"
+        state = {"handled": [src, "other"]}
+        mgr = MgrStub()
+        t = {"id": "t1", "source": src}
+        for attempt in range(1, w.MAX_TASK_ATTEMPTS):
+            state["handled"].append(src)  # the next check re-created it
+            w.after_git_task(mgr, state, self.path, t, "error")
+            self.assertNotIn(src, state["handled"], f"attempt {attempt} should be retried")
+        state["handled"].append(src)
+        w.after_git_task(mgr, state, self.path, t, "error")
+        self.assertIn(src, state["handled"])  # given up
+        self.assertIn("giving up", mgr.events[-1][1])
+        # A restart grants another round.
+        self.assertEqual(w.reset_given_up(state), [src])
+        self.assertNotIn(src, state["handled"])
+        self.assertIn("other", state["handled"])
+        # Success clears the count.
+        w.after_git_task(mgr, state, self.path, t, "done")
+        self.assertNotIn(src, state["retries"])
+
+    def test_tasks_that_ran_and_failed_or_manual_tasks_are_not_retried(self):
+        src = "github:o/r#issues:7@assigned"
+        state = {"handled": [src]}
+        w.after_git_task(MgrStub(), state, self.path, {"id": "t1", "source": src}, "failed")
+        self.assertIn(src, state["handled"])
+        w.after_git_task(MgrStub(), state, self.path, {"id": "t2"}, "error")  # manual: no source
+        self.assertEqual(state.get("retries", {}), {})
+
+
 def sh(*args, cwd=None):
     subprocess.run(args, cwd=cwd, check=True, capture_output=True, text=True)
 

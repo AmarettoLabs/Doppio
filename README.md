@@ -72,6 +72,12 @@ files for the model to read as needed. New owner feedback (a comment or a
 review) on assigned work starts a new pass, so an agent that asked a question
 picks the work up again once you answer.
 
+If a task breaks because of something around it (the model API, the network,
+the workspace), the agent retries it at the next git check, up to 3 attempts.
+After that it gives up until the agent is restarted, which usually follows
+fixing the cause (a token, the model URL). Tasks that ran and failed (turn
+limit, unusable replies) are not retried.
+
 To split the work, create several agents with the same git account and token,
 one per trigger, each with the model that suits the job.
 

@@ -1006,6 +1006,10 @@ def execute_tool(agent, name, args):
 
 
 def run_task(mgr, agent, system, t):
+    """Run one task through the model's tool loop. Returns "done", "failed"
+    (the task ran but did not succeed: turn limit, unusable replies) or
+    "error" (something around it broke: the model API, the network, the
+    workspace), which is worth retrying."""
     tid = t["id"]
     mgr.emit("status", f"running task: {t['title']}", task_id=tid)
     prompt = t["input"]
@@ -1015,7 +1019,7 @@ def run_task(mgr, agent, system, t):
         except Exception as e:
             mgr.emit("error", f"could not prepare the workspace: {type(e).__name__}: {e}", task_id=tid)
             mgr.finish(tid, "failed", error=f"workspace preparation failed: {e}")
-            return
+            return "error"
     mgr.emit("user", prompt, task_id=tid)
     messages = [{"role": "user", "content": prompt}]
     final = ""
@@ -1029,7 +1033,7 @@ def run_task(mgr, agent, system, t):
             if not unlimited and turn > max_turns:
                 mgr.emit("error", f"max turns ({max_turns}) reached", task_id=tid)
                 mgr.finish(tid, "failed", error=f"max turns ({max_turns}) reached")
-                return
+                return "failed"
             reply = llm_call(agent, system, messages)
             mgr.emit("assistant", reply, task_id=tid)
             call = parse_tool_call(reply)
@@ -1042,7 +1046,7 @@ def run_task(mgr, agent, system, t):
                 if bad_json >= 3:
                     mgr.emit("error", "3 empty/invalid replies in a row", task_id=tid)
                     mgr.finish(tid, "failed", error="model kept returning empty replies")
-                    return
+                    return "failed"
                 messages.append({"role": "assistant", "content": reply})
                 messages.append({"role": "user", "content":
                                  "Your last reply was empty. Give a plain-text final answer now."})
@@ -1055,7 +1059,7 @@ def run_task(mgr, agent, system, t):
                 if bad_json >= 3:
                     mgr.emit("error", f"3 invalid tool calls in a row: {args}", task_id=tid)
                     mgr.finish(tid, "failed", error=f"invalid tool call JSON: {args}")
-                    return
+                    return "failed"
                 messages.append({"role": "assistant", "content": reply})
                 messages.append({"role": "user", "content":
                                  f"Your tool call JSON was invalid ({args}). Reply with exactly one valid "
@@ -1080,9 +1084,52 @@ def run_task(mgr, agent, system, t):
             else:
                 mgr.emit("error", f"model returned an empty reply; nothing posted on {t['source']}", task_id=tid)
         mgr.finish(tid, "done", output=final)
+        return "done"
     except Exception as e:
         mgr.emit("error", f"{type(e).__name__}: {e}", task_id=tid)
         mgr.finish(tid, "failed", error=str(e))
+        return "error"
+
+
+MAX_TASK_ATTEMPTS = 3
+
+
+def after_git_task(mgr, state, state_path, t, outcome):
+    """Retry policy for tasks created from git activity. A task that broke
+    because of the model API, the network or the workspace ("error") is
+    forgotten so the next git check creates it again, up to
+    MAX_TASK_ATTEMPTS attempts; restarting the agent grants another round
+    (see reset_given_up). Tasks that ran and failed are not retried."""
+    src = t.get("source")
+    if not src:
+        return
+    retries = state.setdefault("retries", {})
+    if outcome != "error":
+        if retries.pop(src, None) is not None:
+            save_state(state_path, state)
+        return
+    n = retries.get(src, 0) + 1
+    retries[src] = n
+    if n < MAX_TASK_ATTEMPTS:
+        state["handled"] = [h for h in state.get("handled", []) if h != src]
+        mgr.emit("log", f"will retry {src} at the next git check (attempt {n + 1} of {MAX_TASK_ATTEMPTS})",
+                 task_id=t["id"])
+    else:
+        mgr.emit("error", f"giving up on {src} after {n} attempts; restart the agent to try again",
+                 task_id=t["id"])
+    save_state(state_path, state)
+
+
+def reset_given_up(state):
+    """On startup, give work abandoned after MAX_TASK_ATTEMPTS another round:
+    a restart usually follows fixing what broke (a token, the model URL).
+    Returns the refs that will be retried."""
+    retries = state.get("retries", {})
+    again = [ref for ref, n in retries.items() if n >= MAX_TASK_ATTEMPTS]
+    for ref in again:
+        retries[ref] = 0
+    state["handled"] = [h for h in state.get("handled", []) if h not in again]
+    return again
 
 
 def main():
@@ -1103,13 +1150,17 @@ def main():
     setup_git(agent)
     log("worker starting:", agent["name"], f"({agent['provider']}/{agent['model']})")
     mgr.emit("status", f"worker started: {agent['name']} ({agent['provider']}/{agent['model']})")
+    again = reset_given_up(state)
+    if again:
+        save_state(state_path, state)
+        mgr.emit("log", f"retrying work given up before the restart: {', '.join(again)}")
     last_git = 0.0
     poll_every = agent.get("pollSeconds", 1800)
     while True:
         try:
             t = mgr.next_task()
             if t:
-                run_task(mgr, agent, system, t)
+                after_git_task(mgr, state, state_path, t, run_task(mgr, agent, system, t))
             if time.time() - last_git >= poll_every:
                 last_git = time.time()
                 poll_git(mgr, agent, state, state_path)

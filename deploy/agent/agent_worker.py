@@ -185,10 +185,33 @@ def llm_call(agent, system, messages):
     out = http_json("POST", url, headers, body, timeout=180)
     if provider == "anthropic":
         return "".join(b.get("text", "") for b in out.get("content", []) if b.get("type") == "text")
-    content = out["choices"][0]["message"].get("content")
+    message = out["choices"][0]["message"]
+    content = message.get("content")
     if isinstance(content, list):  # some servers return content blocks
         content = "".join(b.get("text", "") for b in content if isinstance(b, dict))
-    return content or ""
+    content = content or ""
+    call = native_tool_call(message.get("tool_calls"))
+    if call and parse_tool_call(content) is None:
+        # Some models (seen with Mistral) answer with the API's built-in
+        # tool_calls even though no tools were declared. Turn the first one
+        # into the text format, so the conversation stays in one format.
+        content = (content.strip() + "\n\n" if content.strip() else "") + "```json\n" + json.dumps(call) + "\n```"
+    return content
+
+
+def native_tool_call(tool_calls):
+    """The first OpenAI-style tool call as {"tool": name, **args}, or None."""
+    for tc in tool_calls or []:
+        fn = (tc or {}).get("function") or {}
+        args = fn.get("arguments") or {}
+        if isinstance(args, str):
+            try:
+                args = json.loads(args) if args.strip() else {}
+            except json.JSONDecodeError:
+                continue
+        if fn.get("name") and isinstance(args, dict):
+            return {"tool": fn["name"], **args}
+    return None
 
 
 # ---------- git providers ----------
@@ -1078,9 +1101,10 @@ def run_task(mgr, agent, system, t):
                     mgr.emit("error", "3 empty/invalid replies in a row", task_id=tid)
                     mgr.finish(tid, "failed", error="model kept returning empty replies")
                     return "failed"
-                messages.append({"role": "assistant", "content": reply})
+                # Providers reject empty assistant messages: keep a placeholder.
+                messages.append({"role": "assistant", "content": "(empty reply)"})
                 messages.append({"role": "user", "content":
-                                 "Your last reply was empty. Give a plain-text final answer now."})
+                                 "Your last reply was empty. Call a tool, or give your plain-text final answer."})
                 continue
             name, args = call
             if name == "__invalid__":

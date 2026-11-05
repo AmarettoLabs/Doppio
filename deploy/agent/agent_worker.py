@@ -921,16 +921,24 @@ Rules: one tool call per turn, wait for its result, keep going until the work is
 
 def parse_tool_call(text):
     """Return (name, args) of the first valid JSON tool call, or None.
-    Returns ('__invalid__', None) if a json fence is present but unparseable."""
-    for m in re.finditer(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL):
+    Returns ('__invalid__', reason) if a json fence is present but holds no
+    usable object. The object is decoded from right after the opening
+    fence, so a missing closing fence (some models stop right before it)
+    or braces inside the command don't matter."""
+    decoder = json.JSONDecoder()
+    first_error = None
+    for m in re.finditer(r"```json[ \t]*\n?", text):
+        rest = text[m.end():].lstrip()
         try:
-            obj = json.loads(m.group(1))
-        except Exception as e:
-            return "__invalid__", str(e)
+            obj, _ = decoder.raw_decode(rest)
+        except json.JSONDecodeError as e:
+            first_error = first_error or str(e)
+            continue
         if isinstance(obj, dict) and obj.get("tool"):
             return obj["tool"], obj
-    if "```json" in text:
-        return "__invalid__", "no parseable object in the json fence"
+        first_error = first_error or "the json block has no \"tool\" field"
+    if first_error:
+        return "__invalid__", first_error
     return None
 
 

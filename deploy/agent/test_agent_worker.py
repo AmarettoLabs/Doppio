@@ -195,6 +195,25 @@ class CheckItemsTest(Patched):
         self.assertEqual(w.work_ref(agent(), it), "github:o/r#pull_requests:8@abcdef123456")
 
 
+class ParseToolCallTest(unittest.TestCase):
+    def test_closed_and_unclosed_fences(self):
+        call = ("shell", {"tool": "shell", "command": "ls"})
+        self.assertEqual(w.parse_tool_call('```json\n{"tool":"shell","command":"ls"}\n```'), call)
+        # Some models stop right before the closing fence.
+        self.assertEqual(w.parse_tool_call('```json\n{"tool":"shell","command":"ls"}'), call)
+
+    def test_braces_in_the_command_and_several_calls(self):
+        name, args = w.parse_tool_call('```json\n{"tool":"shell","command":"awk \'{print $1}\' f"}\n```')
+        self.assertEqual(args["command"], "awk '{print $1}' f")
+        # Several calls glued together: the first one wins.
+        self.assertEqual(w.parse_tool_call('```json\n{"tool":"a"}\n``````json\n{"tool":"b"}\n```')[0], "a")
+
+    def test_invalid_and_plain_answers(self):
+        self.assertEqual(w.parse_tool_call('```json\n{broken\n```')[0], "__invalid__")
+        self.assertEqual(w.parse_tool_call('```json\n{"no":"tool"}\n```')[0], "__invalid__")
+        self.assertIsNone(w.parse_tool_call("The PR looks good."))
+
+
 class SourceTest(unittest.TestCase):
     def test_parse_source_keeps_colons_in_suffix(self):
         self.assertEqual(w.parse_source("github:o/r#issues:12@2026-11-05T11:00:00Z"),

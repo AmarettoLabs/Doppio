@@ -25,10 +25,12 @@ containers and therefore control the host. Consequently:
 
 ### Agents run untrusted input through a shell
 
-An agent acts on mentions, assignments and review requests in the repos it
-watches. **Anyone who can comment on, open or assign issues/PRs in those repos
-can steer the model**, and the model has a `shell` tool inside its container.
-Assume that such a person can:
+An agent only starts work when its owner asks (assigns it, requests its
+review or mentions it), but the model then reads the whole discussion, the
+item's description and the repository's files, which other people can write.
+**Anyone who can comment on, open or edit issues/PRs, or push to those repos,
+can steer the model through that content**, and the model has a `shell` tool
+inside its container. Assume that such a person can:
 
 - read everything in the agent container, including its config
   (`/agent/state/config.json`: model API token, git token, internal token)

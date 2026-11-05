@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { api, splitList, type AgentPayload, type AgentView, type GitProviderInfo, type ProviderInfo } from './api';
+	import { api, splitList, TRIGGERS, type AgentPayload, type AgentView, type GitProviderInfo, type ProviderInfo } from './api';
 
 	let {
 		initial = null,
@@ -29,6 +29,7 @@
 	let gitRepos = $state((initial?.gitRepos ?? []).join(', '));
 	let ownerLogin = $state(initial?.ownerLogin ?? '');
 	let peerLogins = $state((initial?.peerLogins ?? []).join(', '));
+	let triggers = $state<string[]>(initial?.triggers ?? TRIGGERS.map((t) => t.id));
 	let pollSeconds = $state(initial?.pollSeconds ?? 1800);
 	let maxTurns = $state(initial?.maxTurns ?? 25);
 
@@ -55,6 +56,10 @@
 
 	async function submit() {
 		error = '';
+		if (gitProvider !== 'none' && triggers.length === 0) {
+			error = 'Pick at least one trigger.';
+			return;
+		}
 		saving = true;
 		try {
 			await onsubmit({
@@ -73,6 +78,7 @@
 				gitRepos: splitList(gitRepos),
 				ownerLogin,
 				peerLogins: splitList(peerLogins),
+				triggers: TRIGGERS.map((t) => t.id).filter((id) => triggers.includes(id)),
 				pollSeconds: Number(pollSeconds) || 1800,
 				maxTurns: Number(maxTurns) || 25
 			});
@@ -150,7 +156,7 @@
 			</select>
 		</div>
 		<div class="field" style="flex:1">
-			<label for="f-gitlogin">Agent's git login (mentions of @login trigger it)</label>
+			<label for="f-gitlogin">Agent's git login</label>
 			<input id="f-gitlogin" type="text" bind:value={gitLogin} placeholder="my-agent-bot" />
 		</div>
 	</div>
@@ -169,16 +175,26 @@
 		</div>
 		<div class="row">
 			<div class="field" style="flex:1">
-				<label for="f-owner">Owner login (only the owner's mentions trigger work)</label>
-				<input id="f-owner" type="text" bind:value={ownerLogin} placeholder="your-username" />
+				<label for="f-owner">Owner login (the agent only acts on the owner's requests)</label>
+				<input id="f-owner" type="text" bind:value={ownerLogin} placeholder="your-username" required />
 			</div>
 			<div class="field" style="flex:1">
 				<label for="f-peers">Peer agent logins (context only, comma-separated)</label>
 				<input id="f-peers" type="text" bind:value={peerLogins} placeholder="teammate, other-agent-bot" />
 			</div>
 		</div>
+		<fieldset class="field triggers">
+			<legend>Responds to (only when the owner asks)</legend>
+			{#each TRIGGERS as t}
+				<label class="trigger">
+					<input type="checkbox" value={t.id} bind:group={triggers} />
+					<span>{t.label}</span>
+					<span class="muted">— {t.hint}</span>
+				</label>
+			{/each}
+		</fieldset>
 		<div class="field">
-			<label for="f-poll">Poll interval for git mentions (seconds)</label>
+			<label for="f-poll">Poll interval for git checks (seconds)</label>
 			<input id="f-poll" type="number" min="5" bind:value={pollSeconds} />
 		</div>
 	{/if}
@@ -193,3 +209,27 @@
 		<a class="btn ghost" href="/">Cancel</a>
 	</div>
 </form>
+
+<style>
+	.triggers {
+		border: 1px solid var(--border);
+		border-radius: 6px;
+		padding: 0.5rem 0.8rem 0.7rem;
+	}
+	.triggers legend {
+		padding: 0 0.3rem;
+		color: var(--muted);
+		font-size: 0.85rem;
+	}
+	.trigger {
+		display: flex;
+		align-items: center;
+		gap: 0.45rem;
+		margin: 0.3rem 0;
+		font-weight: normal;
+	}
+	.trigger input {
+		width: auto;
+		margin: 0;
+	}
+</style>

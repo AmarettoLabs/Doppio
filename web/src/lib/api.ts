@@ -15,6 +15,7 @@ export interface AgentView {
 	gitRepos: string[];
 	ownerLogin?: string;
 	peerLogins: string[];
+	triggers: string[];
 	pollSeconds: number;
 	maxTurns: number;
 	status: string;
@@ -44,9 +45,18 @@ export interface AgentPayload {
 	gitRepos: string[];
 	ownerLogin: string;
 	peerLogins: string[];
+	triggers: string[];
 	pollSeconds: number;
 	maxTurns: number;
 }
+
+/** Git activity an agent can respond to, in display order. */
+export const TRIGGERS: { id: string; label: string; hint: string }[] = [
+	{ id: 'review_requests', label: 'Review requests', hint: 'review the PR and comment with a verdict' },
+	{ id: 'mentions', label: 'Mentions', hint: 'answer in a comment, no code changes' },
+	{ id: 'assigned_issues', label: 'Assigned issues', hint: 'implement the issue and open a PR' },
+	{ id: 'assigned_prs', label: 'Assigned PRs', hint: 'address the review feedback and push' }
+];
 
 export interface Task {
 	id: string;

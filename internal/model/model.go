@@ -21,6 +21,31 @@ const (
 	GitGitLab GitProvider = "gitlab"
 )
 
+// Trigger is a kind of git activity an agent responds to.
+type Trigger string
+
+const (
+	TrigReviewRequests Trigger = "review_requests" // review a PR/MR the owner asked it to review
+	TrigMentions       Trigger = "mentions"        // answer the owner's mentions
+	TrigAssignedIssues Trigger = "assigned_issues" // implement issues the owner assigned to it
+	TrigAssignedPRs    Trigger = "assigned_prs"    // follow up on PRs/MRs the owner assigned to it
+)
+
+// AllTriggers lists every trigger, in display order.
+func AllTriggers() []Trigger {
+	return []Trigger{TrigReviewRequests, TrigMentions, TrigAssignedIssues, TrigAssignedPRs}
+}
+
+// ValidTrigger reports whether t is a known trigger.
+func ValidTrigger(t Trigger) bool {
+	for _, k := range AllTriggers() {
+		if k == t {
+			return true
+		}
+	}
+	return false
+}
+
 // Agent is a configured coding agent. Deploying it starts one Docker
 // container running the generic worker with this configuration.
 type Agent struct {
@@ -36,12 +61,15 @@ type Agent struct {
 	GitProvider GitProvider `json:"gitProvider,omitempty"`
 	GitBaseURL  string      `json:"gitBaseURL,omitempty"` // e.g. self-hosted GitLab
 	GitToken    string      `json:"gitToken,omitempty"`
-	GitLogin    string      `json:"gitLogin,omitempty"` // the agent's own account on the git host
-	GitRepos    []string    `json:"gitRepos,omitempty"` // e.g. "AmarettoLabs/Palazzo"
-	OwnerLogin  string      `json:"ownerLogin,omitempty"`
+	GitLogin    string      `json:"gitLogin,omitempty"`   // the agent's own account on the git host
+	GitRepos    []string    `json:"gitRepos,omitempty"`   // e.g. "AmarettoLabs/Palazzo"
+	OwnerLogin  string      `json:"ownerLogin,omitempty"` // the only account whose requests the agent acts on
 	PeerLogins  []string    `json:"peerLogins,omitempty"`
-	PollSeconds int         `json:"pollSeconds"`
-	MaxTurns    int         `json:"maxTurns"` // tool-loop turns per task; -1 = unlimited (until the model's context limit)
+	// Triggers are the kinds of git activity the agent responds to. Empty
+	// (agents created before triggers existed) means all of them.
+	Triggers    []Trigger `json:"triggers,omitempty"`
+	PollSeconds int       `json:"pollSeconds"`
+	MaxTurns    int       `json:"maxTurns"` // tool-loop turns per task; -1 = unlimited (until the model's context limit)
 
 	Status      string `json:"status"` // created, running, stopped, error
 	ContainerID string `json:"containerId,omitempty"`
@@ -52,6 +80,14 @@ type Agent struct {
 	NextPollAt *time.Time `json:"nextPollAt,omitempty"`
 	CreatedAt  time.Time  `json:"createdAt"`
 	UpdatedAt  time.Time  `json:"updatedAt"`
+}
+
+// EffectiveTriggers returns the agent's triggers, all of them when unset.
+func (a *Agent) EffectiveTriggers() []Trigger {
+	if len(a.Triggers) == 0 {
+		return AllTriggers()
+	}
+	return a.Triggers
 }
 
 // Task is one unit of work for an agent: a manual task from the portal, a

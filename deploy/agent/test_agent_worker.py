@@ -242,6 +242,39 @@ class ParseToolCallTest(unittest.TestCase):
         self.assertIsNone(w.parse_tool_call("The PR looks good."))
 
 
+class LlmCallTest(unittest.TestCase):
+    def reply(self, message):
+        orig = w.http_json
+        self.addCleanup(setattr, w, "http_json", orig)
+        w.http_json = lambda *a, **k: {"choices": [{"message": message}]}
+        return w.llm_call(agent(provider="mistral", model="m", apiToken="k"), "sys", [{"role": "user", "content": "hi"}])
+
+    def test_builtin_tool_calls_become_text_calls(self):
+        text = self.reply({"content": [{"type": "thinking", "thinking": [{"type": "text", "text": "hmm"}]}],
+                           "tool_calls": [{"type": "function", "function": {"name": "shell", "arguments": '{"command": "ls"}'}},
+                                          {"type": "function", "function": {"name": "shell", "arguments": '{"command": "pwd"}'}}]})
+        self.assertEqual(w.parse_tool_call(text), ("shell", {"tool": "shell", "command": "ls"}))
+
+    def test_text_calls_win_and_plain_answers_stay(self):
+        text = self.reply({"content": '```json\n{"tool":"read_file","path":"a"}\n```',
+                           "tool_calls": [{"function": {"name": "shell", "arguments": {"command": "ls"}}}]})
+        self.assertEqual(w.parse_tool_call(text)[0], "read_file")
+        self.assertEqual(self.reply({"content": "Done.", "tool_calls": None}), "Done.")
+
+    def test_empty_replies_are_never_sent_back_empty(self):
+        replies = iter(["", "All done."])
+        sent = []
+        orig = w.llm_call
+        self.addCleanup(setattr, w, "llm_call", orig)
+        def fake(agent_, system, messages):
+            sent.append([dict(m) for m in messages])
+            return next(replies)
+        w.llm_call = fake
+        mgr = RunTaskMgr()
+        self.assertEqual(w.run_task(mgr, agent(), "sys", {"id": "t", "title": "x", "input": "hi"}), "done")
+        self.assertTrue(all(m["content"] for m in sent[-1]))
+
+
 class SourceTest(unittest.TestCase):
     def test_parse_source_keeps_colons_in_suffix(self):
         self.assertEqual(w.parse_source("github:o/r#issues:12@2026-11-05T11:00:00Z"),

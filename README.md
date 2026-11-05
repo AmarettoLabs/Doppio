@@ -70,7 +70,8 @@ puts its guidance in the prompt: every `AGENTS.md`, `CLAUDE.md` and
 `CONTRIBUTING.md` plus the root `README.md`, and a list of the other Markdown
 files for the model to read as needed. New owner feedback (a comment or a
 review) on assigned work starts a new pass, so an agent that asked a question
-picks the work up again once you answer.
+picks the work up again once you answer. Each new mention is new work too,
+even on an item the agent already answered.
 
 If a task breaks because of something around it (the model API, the network,
 the workspace), the agent retries it at the next git check, up to 3 attempts.

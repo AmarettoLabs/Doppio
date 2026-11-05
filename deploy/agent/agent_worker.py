@@ -455,7 +455,13 @@ def item_author(it):
 
 def owner_activity(agent, it):
     """The owner's comments (and, on PRs, reviews and review comments) on
-    the item, as (created_at, body) pairs."""
+    the item, as (created_at, body) pairs. Cached on the item for the pass."""
+    if "_owner_activity" not in it:
+        it["_owner_activity"] = _fetch_owner_activity(agent, it)
+    return it["_owner_activity"]
+
+
+def _fetch_owner_activity(agent, it):
     owner = normalize_login(agent.get("ownerLogin"))
     repo, num = it["_repo"], item_number(it)
     out = []
@@ -525,20 +531,26 @@ def owner_requested(agent, it, since=""):
         return False, "the agent has no owner set"
     trigger = it.get("_trigger")
     if trigger == "mentions":
-        login = normalize_login(agent.get("gitLogin"))
-        created = it.get("created_at") or ""
-        if same_login(item_author(it), owner) and mentions_login(it.get("body") or it.get("description"), login) \
-                and created > since:
+        if latest_owner_mention(agent, it) > since:
             return True, ""
-        for ts, body in owner_activity(agent, it):
-            if ts > since and mentions_login(body, login):
-                return True, ""
         return False, f"not mentioned by {owner}"
     actor = last_request_actor(agent, it)
     what = "review requested" if trigger == "review_requests" else "assigned"
     if same_login(actor, owner):
         return True, ""
     return False, f"{what} by {actor or 'someone else'}, not {owner}"
+
+
+def latest_owner_mention(agent, it):
+    """Time of the owner's latest mention of the agent on the item (in its
+    description or a comment/review), "" if none. Mentions are keyed by it,
+    so each new mention is new work."""
+    owner = normalize_login(agent.get("ownerLogin"))
+    login = normalize_login(agent.get("gitLogin"))
+    times = [ts for ts, body in owner_activity(agent, it) if mentions_login(body, login)]
+    if same_login(item_author(it), owner) and mentions_login(it.get("body") or it.get("description"), login):
+        times.append(it.get("created_at") or "")
+    return max(times, default="")
 
 
 def feedback_marker(agent, it):
@@ -621,7 +633,8 @@ def poll_git(mgr, agent, state, state_path):
 def work_ref(agent, it):
     """Dedupe key of one unit of work. Review requests are keyed by head SHA
     (a new push is new work), assigned work by the owner's latest feedback
-    (a new comment or review is new work), mentions by the item."""
+    (a new comment or review is new work), mentions by the owner's latest
+    mention (a new mention is new work)."""
     ref = item_ref(agent, it["_repo"], it)
     trigger = it.get("_trigger")
     if trigger == "review_requests":
@@ -629,6 +642,9 @@ def work_ref(agent, it):
         return ref + "@" + sha[:12] if sha else ref
     if trigger in ("assigned_issues", "assigned_prs"):
         return ref + "@" + (feedback_marker(agent, it) or "assigned")
+    if trigger == "mentions":
+        ts = latest_owner_mention(agent, it)
+        return ref + "@" + ts if ts else ref
     return ref
 
 
@@ -642,6 +658,7 @@ def check_git_items(mgr, agent, state, state_path, now):
         # answered. Review requests are state, not history: they are left
         # unhandled so a pending review is picked up on the next pass.
         state["baseline"] = now
+        state["mentions_keyed_by_time"] = True
         n = 0
         for it in items:
             if it.get("_trigger") == "review_requests":
@@ -664,6 +681,11 @@ def check_git_items(mgr, agent, state, state_path, now):
         base = item_ref(agent, repo, it)
         if ref in handled or (ref == base + "@assigned" and base in handled):
             continue  # (the second test: handled before assigned work was keyed by feedback)
+        if trigger == "mentions" and base in handled and not state.get("mentions_keyed_by_time"):
+            # Handled when mentions were keyed by item only: count the
+            # current mention as handled, later ones are new work.
+            handled.add(ref)
+            continue
         if trigger != "review_requests" and item_updated(it) and item_updated(it) <= state["baseline"]:
             handled.add(ref)
             continue
@@ -688,6 +710,7 @@ def check_git_items(mgr, agent, state, state_path, now):
         except Exception as e:
             mgr.emit("error", f"could not create task for {ref}: {e}")
     state["handled"] = sorted(handled)
+    state["mentions_keyed_by_time"] = True
     state["ignored"] = {r: why for r, why in ignored.items() if r in seen}  # forget items that went away
     save_state(state_path, state)
 

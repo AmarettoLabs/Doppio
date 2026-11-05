@@ -183,6 +183,34 @@ class CheckItemsTest(Patched):
         self.assertEqual(len(ignored), 1)
         self.assertIn("#issues:9", ignored[0])
 
+    def mention_pass(self, state, comments):
+        self.use({
+            r"/search/issues\?.*": search_route({("mentions", "is:issue"): [dict(ISSUE, body="")]}),
+            r"/repos/o/r/issues/7/comments.*": events(*comments),
+        })
+        mgr = MgrStub()
+        w.check_git_items(mgr, agent(triggers=["mentions"]), state, os.path.join(WS_DIR, "m.json"), "now")
+        return [t["source"] for t in mgr.tasks]
+
+    def test_each_new_owner_mention_is_new_work(self):
+        c = lambda ts, body="@bot look": {"user": {"login": "boss"}, "body": body, "created_at": ts}
+        state = {"baseline": "2026-11-01T00:00:00Z", "mentions_keyed_by_time": True}
+        first = [c("2026-11-05T09:30:00Z")]
+        self.assertEqual(self.mention_pass(state, first), ["github:o/r#issues:7@2026-11-05T09:30:00Z"])
+        self.assertEqual(self.mention_pass(state, first), [])  # same mention: nothing new
+        # A comment without a mention isn't a new request; a new mention is.
+        self.assertEqual(self.mention_pass(state, first + [c("2026-11-05T10:00:00Z", "thanks")]), [])
+        self.assertEqual(self.mention_pass(state, first + [c("2026-11-05T11:00:00Z")]),
+                         ["github:o/r#issues:7@2026-11-05T11:00:00Z"])
+
+    def test_mentions_handled_before_the_upgrade_are_not_redone(self):
+        c = lambda ts: {"user": {"login": "boss"}, "body": "@bot look", "created_at": ts}
+        state = {"baseline": "2026-11-01T00:00:00Z", "handled": ["github:o/r#issues:7"]}
+        self.assertEqual(self.mention_pass(state, [c("2026-11-05T09:30:00Z")]), [])
+        self.assertTrue(state["mentions_keyed_by_time"])
+        self.assertEqual(self.mention_pass(state, [c("2026-11-05T09:30:00Z"), c("2026-11-05T12:00:00Z")]),
+                         ["github:o/r#issues:7@2026-11-05T12:00:00Z"])
+
     def test_new_owner_feedback_on_assigned_work_is_new_work(self):
         it = dict(ISSUE, _repo=REPO, _kind="issues", _trigger="assigned_issues")
         self.use({r"/repos/o/r/issues/7/comments.*": events(

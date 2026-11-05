@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { page } from '$app/state';
-	import { api, type AgentEvent, type AgentView, type Task } from '#lib/api';
+	import { api, TRIGGERS, type AgentEvent, type AgentView, type Task } from '#lib/api';
 	import PollTimer from '#lib/PollTimer.svelte';
 
 	let agent = $state<AgentView | null>(null);
@@ -139,6 +139,9 @@
 			<dt>Model</dt><dd>{agent.provider}/{agent.model}{agent.apiBase ? ` (${agent.apiBase})` : ''} · token {agent.hasApiToken ? 'set' : 'missing'}</dd>
 			<dt>Emails</dt><dd>{agent.emails?.join(', ') || '—'}</dd>
 			<dt>Git</dt><dd>{agent.gitProvider && agent.gitProvider !== 'none' ? `${agent.gitProvider} @${agent.gitLogin ?? ''} · token ${agent.hasGitToken ? 'set' : 'missing'} · repos ${(agent.gitRepos ?? []).join(', ') || '—'}${agent.ownerLogin ? ` · owner @${agent.ownerLogin}` : ''}` : '—'}</dd>
+			{#if agent.gitProvider && agent.gitProvider !== 'none'}
+				<dt>Responds to</dt><dd>{TRIGGERS.filter((t) => agent?.triggers?.includes(t.id)).map((t) => t.label).join(', ') || '—'}</dd>
+			{/if}
 			<dt>Poll</dt><dd>every {agent.pollSeconds}s</dd>
 			<dt>Next git check</dt><dd>
 				{#if agent.gitProvider && agent.gitProvider !== 'none'}

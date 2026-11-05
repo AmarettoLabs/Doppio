@@ -20,9 +20,10 @@ Doppio is a web portal to create, deploy, track and manage those agents. Each
 agent gets a name, a persona, a standing task, a model (OpenAI / Anthropic /
 Mistral or any custom `provider/model` + token), email addresses, and its own
 GitHub/GitLab account (login + token + repos to watch). One click deploys it as
-a Docker container; the worker polls GitHub/GitLab for mentions, assignments
-and review requests, answers through its model (with a tool loop: shell,
-file edits, opening PRs), and streams everything live to the portal.
+a Docker container; the worker polls GitHub/GitLab for the work its owner
+hands it (review requests, mentions, assigned issues and PRs), does it through
+its model (with a tool loop: shell, file edits, opening PRs), and streams
+everything live to the portal.
 
 > **Security:** the manager drives the host Docker daemon and agents run a
 > shell steered by whoever can comment in their repos. Read
@@ -49,6 +50,37 @@ PORTAL_PASSWORD='a-long-random-secret' BIND_ADDR=0.0.0.0 ./deploy/up.sh
 
 Stop with `./deploy/down.sh` (agent containers keep running until stopped
 from the portal).
+
+## What agents respond to
+
+Each agent has an **owner** (a git login) and a set of **triggers**. It only
+acts when the owner asks: the owner must have assigned it, requested its
+review, or written the mention. Requests from anyone else, peers included, are
+ignored and logged in the agent's event stream.
+
+| Trigger | What the agent does |
+| --- | --- |
+| Review requests | Checks out the PR, reviews it against the repo's guidance and comments with a verdict. Never pushes. |
+| Mentions | Answers in a comment. Never changes code. |
+| Assigned issues | Works on a `<login>/<number>-<slug>` branch, implements and tests the change, pushes and opens a PR with `Closes #<number>`, then comments with the link. If the issue is blocked or unclear, it asks instead. |
+| Assigned PRs | Checks out the PR's branch, addresses the owner's review comments and pushes. |
+
+Before reviews and assigned work, the worker clones or updates the repo and
+puts its guidance in the prompt: every `AGENTS.md`, `CLAUDE.md` and
+`CONTRIBUTING.md` plus the root `README.md`, and a list of the other Markdown
+files for the model to read as needed. New owner feedback (a comment or a
+review) on assigned work starts a new pass, so an agent that asked a question
+picks the work up again once you answer. Each new mention is new work too,
+even on an item the agent already answered.
+
+If a task breaks because of something around it (the model API, the network,
+the workspace), the agent retries it at the next git check, up to 3 attempts.
+After that it gives up until the agent is restarted, which usually follows
+fixing the cause (a token, the model URL). Tasks that ran and failed (turn
+limit, unusable replies) are not retried.
+
+To split the work, create several agents with the same git account and token,
+one per trigger, each with the model that suits the job.
 
 ## Configuration
 

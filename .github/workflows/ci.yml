@@ -45,6 +45,7 @@ jobs:
         with:
           python-version: "3.14"
       - run: python -m py_compile deploy/agent/agent_worker.py
+      - run: python -m unittest discover -s deploy/agent -v
 
   docker:
     runs-on: ubuntu-latest

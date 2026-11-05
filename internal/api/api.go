@@ -122,6 +122,7 @@ type AgentView struct {
 	GitRepos    []string   `json:"gitRepos"`
 	OwnerLogin  string     `json:"ownerLogin,omitempty"`
 	PeerLogins  []string   `json:"peerLogins"`
+	Triggers    []string   `json:"triggers"`
 	PollSeconds int        `json:"pollSeconds"`
 	MaxTurns    int        `json:"maxTurns"`
 	Status      string     `json:"status"`
@@ -143,9 +144,10 @@ func toView(a *model.Agent) AgentView {
 		HasAPIToken: a.APIToken != "", Emails: a.Emails,
 		GitProvider: string(a.GitProvider), GitBaseURL: a.GitBaseURL,
 		HasGitToken: a.GitToken != "", GitLogin: a.GitLogin, GitRepos: a.GitRepos,
-		OwnerLogin: a.OwnerLogin, PeerLogins: a.PeerLogins, PollSeconds: a.PollSeconds,
-		MaxTurns: maxTurnsOrDefault(a.MaxTurns),
-		Status:   a.Status, ContainerID: a.ContainerID, Error: a.Error,
+		OwnerLogin: a.OwnerLogin, PeerLogins: a.PeerLogins, Triggers: triggerStrings(a.EffectiveTriggers()),
+		PollSeconds: a.PollSeconds,
+		MaxTurns:    maxTurnsOrDefault(a.MaxTurns),
+		Status:      a.Status, ContainerID: a.ContainerID, Error: a.Error,
 		LastPollAt: a.LastPollAt, NextPollAt: a.NextPollAt,
 		CreatedAt: a.CreatedAt, UpdatedAt: a.UpdatedAt,
 	}
@@ -169,8 +171,35 @@ type agentInput struct {
 	GitRepos    []string `json:"gitRepos"`
 	OwnerLogin  string   `json:"ownerLogin"`
 	PeerLogins  []string `json:"peerLogins"`
+	// Triggers: nil keeps the stored ones on update (all of them on create).
+	Triggers    []string `json:"triggers"`
 	PollSeconds int      `json:"pollSeconds"`
 	MaxTurns    int      `json:"maxTurns"`
+}
+
+func triggerStrings(ts []model.Trigger) []string {
+	out := make([]string, len(ts))
+	for i, t := range ts {
+		out[i] = string(t)
+	}
+	return out
+}
+
+// parseTriggers dedupes the input triggers; nil stays nil.
+func parseTriggers(in []string) []model.Trigger {
+	if in == nil {
+		return nil
+	}
+	seen := map[model.Trigger]bool{}
+	out := []model.Trigger{}
+	for _, s := range in {
+		t := model.Trigger(strings.TrimSpace(s))
+		if !seen[t] {
+			seen[t] = true
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 // maxTurnsOrDefault maps the stored 0 (unset) to the default of 25; -1 means
@@ -249,6 +278,20 @@ func (in *agentInput) validate() string {
 	}
 	if gp != string(model.GitNone) && (in.GitToken == "" || in.GitLogin == "") {
 		return "gitToken and gitLogin are required when a git provider is set"
+	}
+	if gp != string(model.GitNone) && normalizeLogin(in.OwnerLogin) == "" {
+		return "ownerLogin is required when a git provider is set: the agent only acts on its owner's requests"
+	}
+	if in.Triggers != nil {
+		ts := parseTriggers(in.Triggers)
+		if len(ts) == 0 {
+			return "pick at least one trigger"
+		}
+		for _, t := range ts {
+			if !model.ValidTrigger(t) {
+				return fmt.Sprintf("unknown trigger %q (want review_requests, mentions, assigned_issues or assigned_prs)", t)
+			}
+		}
 	}
 	if in.PollSeconds == 0 {
 		in.PollSeconds = 1800
@@ -397,6 +440,7 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		GitRepos:    cleanList(in.GitRepos),
 		OwnerLogin:  strings.TrimSpace(in.OwnerLogin),
 		PeerLogins:  cleanList(in.PeerLogins),
+		Triggers:    parseTriggers(in.Triggers),
 		PollSeconds: in.PollSeconds,
 		MaxTurns:    in.MaxTurns,
 		Status:      "created",
@@ -448,6 +492,9 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	a.GitRepos = cleanList(in.GitRepos)
 	a.OwnerLogin = strings.TrimSpace(in.OwnerLogin)
 	a.PeerLogins = cleanList(in.PeerLogins)
+	if in.Triggers != nil {
+		a.Triggers = parseTriggers(in.Triggers)
+	}
 	a.PollSeconds = in.PollSeconds
 	a.MaxTurns = in.MaxTurns
 	a.UpdatedAt = time.Now().UTC()

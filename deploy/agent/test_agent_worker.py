@@ -613,6 +613,14 @@ class ExtraCaTest(unittest.TestCase):
     its shell tool run, including the Node-based CLIs."""
 
     def test_sets_the_ca_env_for_python_git_curl_and_node(self):
+        # The bundle lives at a fixed path the worker itself uses, so snapshot
+        # it first: in a deployed agent the file is live, and the test must
+        # leave it exactly as it found it (restored, not deleted).
+        bundle = "/tmp/doppio-ca-bundle.pem"
+        before = None
+        if os.path.exists(bundle):
+            with open(bundle, "rb") as f:
+                before = f.read()
         with tempfile.TemporaryDirectory() as tmp:
             extra = os.path.join(tmp, "extra-ca.pem")
             subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
@@ -626,14 +634,23 @@ class ExtraCaTest(unittest.TestCase):
                 try:
                     for k in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
                               "GIT_SSL_CAINFO", "NODE_EXTRA_CA_CERTS"):
-                        self.assertEqual(os.environ[k], "/tmp/doppio-ca-bundle.pem", k)
+                        self.assertEqual(os.environ[k], bundle, k)
                     self.assertIsNotNone(w._ssl_ctx)
-                    self.assertTrue(os.path.exists("/tmp/doppio-ca-bundle.pem"))
+                    self.assertTrue(os.path.exists(bundle))
                 finally:
                     w._ssl_ctx = None
-                    os.remove("/tmp/doppio-ca-bundle.pem")
+                    if before is None:
+                        if os.path.exists(bundle):
+                            os.remove(bundle)
+                    else:
+                        with open(bundle, "wb") as f:
+                            f.write(before)
             self.assertIsNone(w._ssl_ctx)
-            self.assertFalse(os.path.exists("/tmp/doppio-ca-bundle.pem"))
+            if before is None:
+                self.assertFalse(os.path.exists(bundle))
+            else:
+                with open(bundle, "rb") as f:
+                    self.assertEqual(f.read(), before)
 
 
 class ToolsTest(unittest.TestCase):

@@ -212,6 +212,39 @@ class CheckItemsTest(Patched):
         self.assertEqual(self.mention_pass(state, [c("2026-11-05T09:30:00Z"), c("2026-11-05T12:00:00Z")]),
                          ["github:o/r#issues:7@2026-11-05T12:00:00Z"])
 
+    def mention_on_assigned_pr_pass(self, state, assigner, comments):
+        pr = dict(PR, body="", assignees=[{"login": "bot"}], requested_reviewers=[])
+        self.use({
+            r"/search/issues\?.*": search_route({("mentions", "is:pull-request"): [pr]}),
+            r"/repos/o/r/pulls\?.*": [pr],
+            r"/repos/o/r/issues/8/events.*": events({"event": "assigned", "assignee": {"login": "bot"},
+                                                     "actor": {"login": "bot"}, "assigner": {"login": assigner}}),
+            r"/repos/o/r/issues/8/comments.*": events(*comments),
+            r"/repos/o/r/pulls/8/(reviews|comments).*": [],
+        })
+        mgr = MgrStub()
+        w.check_git_items(mgr, agent(), state, os.path.join(WS_DIR, "a.json"), "now")
+        return [(t["kind"], t["source"]) for t in mgr.tasks]
+
+    def test_owner_mention_on_assigned_pr_is_assigned_work(self):
+        # The mention and the assignment share the owner's comment as key:
+        # the assigned task (which may change code) must win.
+        c = lambda ts: {"user": {"login": "boss"}, "body": "@bot please fix the review", "created_at": ts}
+        state = {"baseline": "2026-11-01T00:00:00Z", "mentions_keyed_by_time": True}
+        first = [c("2026-11-05T11:00:00Z")]
+        self.assertEqual(self.mention_on_assigned_pr_pass(state, "boss", first),
+                         [("assigned", "github:o/r#pull_requests:8@2026-11-05T11:00:00Z")])
+        self.assertEqual(self.mention_on_assigned_pr_pass(state, "boss", first), [])
+        # A later mention is new feedback: assigned work again, never a mention task.
+        self.assertEqual(self.mention_on_assigned_pr_pass(state, "boss", first + [c("2026-11-05T12:00:00Z")]),
+                         [("assigned", "github:o/r#pull_requests:8@2026-11-05T12:00:00Z")])
+
+    def test_owner_mention_on_pr_assigned_by_someone_else_is_answered(self):
+        c = {"user": {"login": "boss"}, "body": "@bot what do you think?", "created_at": "2026-11-05T11:00:00Z"}
+        state = {"baseline": "2026-11-01T00:00:00Z", "mentions_keyed_by_time": True}
+        self.assertEqual(self.mention_on_assigned_pr_pass(state, "peer", [c]),
+                         [("mention", "github:o/r#pull_requests:8@2026-11-05T11:00:00Z")])
+
     def test_new_owner_feedback_on_assigned_work_is_new_work(self):
         it = dict(ISSUE, _repo=REPO, _kind="issues", _trigger="assigned_issues")
         self.use({r"/repos/o/r/issues/7/comments.*": events(

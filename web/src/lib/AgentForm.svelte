@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { api, splitList, TRIGGERS, type AgentPayload, type AgentView, type GitProviderInfo, type ProviderInfo } from './api';
+	import { api, splitList, TRIGGERS, type AgentPayload, type AgentView, type EngineInfo, type GitProviderInfo, type ProviderInfo } from './api';
 
 	let {
 		initial = null,
@@ -12,6 +12,7 @@
 
 	let providers = $state<ProviderInfo[]>([]);
 	let gitProviders = $state<GitProviderInfo[]>([]);
+	let engines = $state<EngineInfo[]>([{ id: 'doppio', label: 'Doppio loop', available: true }]);
 
 	let name = $state(initial?.name ?? '');
 	let provider = $state(initial?.provider ?? 'openai');
@@ -32,6 +33,8 @@
 	let triggers = $state<string[]>(initial?.triggers ?? TRIGGERS.map((t) => t.id));
 	let pollSeconds = $state(initial?.pollSeconds ?? 1800);
 	let maxTurns = $state(initial?.maxTurns ?? 25);
+	let engine = $state(initial?.engine ?? 'doppio');
+	let taskMinutes = $state(initial?.taskMinutes ?? 30);
 
 	let error = $state('');
 	let saving = $state(false);
@@ -40,6 +43,7 @@
 		const p = await api.providers();
 		providers = p.llm;
 		gitProviders = p.git;
+		if (p.engines?.length) engines = p.engines;
 		if (!initial) {
 			model = providers.find((x) => x.id === provider)?.models[0] ?? '';
 			apiBase = providers.find((x) => x.id === provider)?.apiBase ?? '';
@@ -80,7 +84,9 @@
 				peerLogins: splitList(peerLogins),
 				triggers: TRIGGERS.map((t) => t.id).filter((id) => triggers.includes(id)),
 				pollSeconds: Number(pollSeconds) || 1800,
-				maxTurns: Number(maxTurns) || 25
+				maxTurns: Number(maxTurns) || 25,
+				engine,
+				taskMinutes: Number(taskMinutes) || 30
 			});
 		} catch (e) {
 			error = String(e instanceof Error ? e.message : e);
@@ -97,6 +103,15 @@
 	</div>
 
 	<h2>Model</h2>
+	<div class="field">
+		<label for="f-engine">Engine</label>
+		<select id="f-engine" bind:value={engine}>
+			{#each engines as e}
+				<option value={e.id} disabled={!e.available}>{e.label}{e.available ? '' : ' (coming soon)'}</option>
+			{/each}
+		</select>
+		<p class="hint">What runs the agent's tasks: Doppio's own tool loop over the model below, or a coding CLI.</p>
+	</div>
 	<div class="row">
 		<div class="field" style="flex:1">
 			<label for="f-provider">Company</label>
@@ -201,6 +216,11 @@
 	<div class="field">
 		<label for="f-turns">Max tool turns per task (-1 = unlimited, until the model's context limit)</label>
 		<input id="f-turns" type="number" min="-1" bind:value={maxTurns} />
+	</div>
+	<div class="field">
+		<label for="f-minutes">Time limit per task (minutes)</label>
+		<input id="f-minutes" type="number" min="1" max="1440" bind:value={taskMinutes} />
+		<p class="hint">A task still running then is stopped and retried at a later git check.</p>
 	</div>
 
 	{#if error}<p class="err">{error}</p>{/if}

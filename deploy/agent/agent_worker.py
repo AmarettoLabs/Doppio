@@ -1059,13 +1059,181 @@ def execute_tool(agent, name, args):
     raise RuntimeError(f"unknown tool: {name}")
 
 
+# ---------- engines ----------
+#
+# An engine runs one task: it gets a TaskRun (prompt, repository, limits) and
+# returns an EngineResult. The git side stays in run_task for every engine:
+# workspace preparation before, posting the answer and the retry policy after.
+
+DEFAULT_TASK_MINUTES = 30
+
+# Task outcomes: "done"; "failed" (it ran but didn't succeed: turn limit,
+# unusable replies); "error" (something around it broke: the model API, the
+# network, the workspace, the time limit) and "limit" (the account's usage
+# limit), both retried at a later git check (see after_git_task).
+RETRIED_OUTCOMES = ("error", "limit")
+
+
+class TaskTimeout(Exception):
+    pass
+
+
+class EngineResult:
+    def __init__(self, outcome, answer="", error=""):
+        self.outcome = outcome
+        self.answer = answer
+        self.error = error
+
+    def __repr__(self):
+        return f"EngineResult({self.outcome!r}, answer={self.answer[:40]!r}, error={self.error!r})"
+
+
+class TaskRun:
+    """What an engine gets for one task."""
+
+    def __init__(self, mgr, agent, system, task, prompt, workdir, minutes=None):
+        self.mgr = mgr
+        self.agent = agent
+        self.system = system  # persona + standing task (+ tool spec for the Doppio loop)
+        self.task = task
+        self.prompt = prompt  # playbook, workspace, guidance and item context
+        self.workdir = workdir  # the task's repository, or the workspace
+        self.minutes = minutes or agent.get("taskMinutes") or DEFAULT_TASK_MINUTES
+        self.deadline = time.monotonic() + self.minutes * 60
+        max_turns = agent.get("maxTurns") or DEFAULT_MAX_TURNS
+        self.max_turns = None if max_turns < 0 else max_turns  # None: until the context limit
+
+    def emit(self, type_, content):
+        self.mgr.emit(type_, content, task_id=self.task["id"])
+
+    def remaining(self):
+        return self.deadline - time.monotonic()
+
+    def check_time(self):
+        if self.remaining() <= 0:
+            raise TaskTimeout(f"time limit ({self.minutes} min) reached")
+
+
+def run_process(run, argv, stdin_text="", env=None, on_line=None):
+    """Run an engine's process in the task's directory, feeding stdin_text and
+    handing each stdout line to on_line. The process (and its children) is
+    killed at the task's time limit, raising TaskTimeout. Returns
+    (exit code, last lines of stderr)."""
+    import signal
+    import threading
+    proc = subprocess.Popen(argv, cwd=run.workdir, env=env, text=True, start_new_session=True,
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    err_tail = []
+
+    def read_err():
+        for line in proc.stderr:
+            err_tail.append(line.rstrip("\n"))
+            del err_tail[:-20]
+
+    def read_out():
+        for line in proc.stdout:
+            if on_line:
+                on_line(line.rstrip("\n"))
+
+    readers = [threading.Thread(target=f, daemon=True) for f in (read_out, read_err)]
+    for r in readers:
+        r.start()
+    try:
+        proc.stdin.write(stdin_text)
+        proc.stdin.close()
+    except BrokenPipeError:
+        pass
+    try:
+        code = proc.wait(timeout=max(0.1, run.remaining()))
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+        raise TaskTimeout(f"time limit ({run.minutes} min) reached; {argv[0]} killed")
+    for r in readers:
+        r.join(timeout=5)
+    return code, "\n".join(err_tail)
+
+
+def doppio_engine(run):
+    """Doppio's own tool loop over the agent's model API."""
+    messages = [{"role": "user", "content": run.prompt}]
+    turn = 0
+    bad_json = 0
+    while True:
+        run.check_time()
+        turn += 1
+        if run.max_turns is not None and turn > run.max_turns:
+            return EngineResult("failed", error=f"max turns ({run.max_turns}) reached")
+        reply = llm_call(run.agent, run.system, messages)
+        run.emit("assistant", reply)
+        call = parse_tool_call(reply)
+        if call is None and reply.strip():
+            return EngineResult("done", answer=reply)
+        if call is None:
+            # An empty reply is not a final answer: ask the model to answer.
+            bad_json += 1
+            if bad_json >= 3:
+                return EngineResult("failed", error="model kept returning empty replies")
+            # Providers reject empty assistant messages: keep a placeholder.
+            messages.append({"role": "assistant", "content": "(empty reply)"})
+            messages.append({"role": "user", "content":
+                             "Your last reply was empty. Call a tool, or give your plain-text final answer."})
+            continue
+        name, args = call
+        if name == "__invalid__":
+            # The model tried a tool call but the JSON was malformed: do not
+            # treat it as a final answer; ask for a retry.
+            bad_json += 1
+            if bad_json >= 3:
+                return EngineResult("failed", error=f"3 invalid tool calls in a row: {args}")
+            messages.append({"role": "assistant", "content": reply})
+            messages.append({"role": "user", "content":
+                             f"Your tool call JSON was invalid ({args}). Reply with exactly one valid "
+                             "```json fenced tool call, or a plain-text final answer if done."})
+            continue
+        bad_json = 0
+        run.emit("action", f"$ {name} {json.dumps(args)[:300]}")
+        try:
+            result = execute_tool(run.agent, name, args)
+        except Exception as e:
+            result = f"tool error: {type(e).__name__}: {e}"
+        run.emit("log", f"→ {result[:1500]}")
+        messages.append({"role": "assistant", "content": reply})
+        messages.append({"role": "user", "content": f"TOOL RESULT ({name}):\n{result}"})
+
+
+ENGINES = {"doppio": doppio_engine}
+
+
+def task_workdir(t):
+    """The task's repository directory (see prepare_task), or the workspace."""
+    if t.get("source") and task_trigger(t):
+        try:
+            repo = parse_source(t["source"])[1]
+            d = os.path.join(WS, "repos", repo.split("/")[-1])
+            if os.path.isdir(d):
+                return d
+        except Exception:
+            pass
+    return WS
+
+
 def run_task(mgr, agent, system, t):
-    """Run one task through the model's tool loop. Returns "done", "failed"
-    (the task ran but did not succeed: turn limit, unusable replies) or
-    "error" (something around it broke: the model API, the network, the
-    workspace), which is worth retrying."""
+    """Run one task with the agent's engine, then post its answer on the
+    git item it came from. Returns the outcome: "done", "failed", "error"
+    or "limit" (see RETRIED_OUTCOMES)."""
     tid = t["id"]
     mgr.emit("status", f"running task: {t['title']}", task_id=tid)
+    engine_name = agent.get("engine") or "doppio"
+    engine = ENGINES.get(engine_name)
+    if engine is None:
+        msg = f"engine {engine_name!r} is not available in this worker"
+        mgr.emit("error", msg, task_id=tid)
+        mgr.finish(tid, "failed", error=msg)
+        return "failed"
     prompt = t["input"]
     if t.get("source") and task_trigger(t):
         try:
@@ -1075,75 +1243,28 @@ def run_task(mgr, agent, system, t):
             mgr.finish(tid, "failed", error=f"workspace preparation failed: {e}")
             return "error"
     mgr.emit("user", prompt, task_id=tid)
-    messages = [{"role": "user", "content": prompt}]
-    final = ""
-    max_turns = agent.get("maxTurns") or DEFAULT_MAX_TURNS
-    unlimited = max_turns < 0  # -1: run until the model's context limit
-    turn = 0
-    bad_json = 0
+    run = TaskRun(mgr, agent, system, t, prompt, task_workdir(t))
     try:
-        while True:
-            turn += 1
-            if not unlimited and turn > max_turns:
-                mgr.emit("error", f"max turns ({max_turns}) reached", task_id=tid)
-                mgr.finish(tid, "failed", error=f"max turns ({max_turns}) reached")
-                return "failed"
-            reply = llm_call(agent, system, messages)
-            mgr.emit("assistant", reply, task_id=tid)
-            call = parse_tool_call(reply)
-            if call is None and reply.strip():
-                final = reply
-                break
-            if call is None and not reply.strip():
-                # An empty reply is not a final answer: ask the model to answer.
-                bad_json += 1
-                if bad_json >= 3:
-                    mgr.emit("error", "3 empty/invalid replies in a row", task_id=tid)
-                    mgr.finish(tid, "failed", error="model kept returning empty replies")
-                    return "failed"
-                # Providers reject empty assistant messages: keep a placeholder.
-                messages.append({"role": "assistant", "content": "(empty reply)"})
-                messages.append({"role": "user", "content":
-                                 "Your last reply was empty. Call a tool, or give your plain-text final answer."})
-                continue
-            name, args = call
-            if name == "__invalid__":
-                # The model tried a tool call but the JSON was malformed: do not
-                # treat it as a final answer; ask for a retry.
-                bad_json += 1
-                if bad_json >= 3:
-                    mgr.emit("error", f"3 invalid tool calls in a row: {args}", task_id=tid)
-                    mgr.finish(tid, "failed", error=f"invalid tool call JSON: {args}")
-                    return "failed"
-                messages.append({"role": "assistant", "content": reply})
-                messages.append({"role": "user", "content":
-                                 f"Your tool call JSON was invalid ({args}). Reply with exactly one valid "
-                                 "```json fenced tool call, or a plain-text final answer if done."})
-                continue
-            bad_json = 0
-            mgr.emit("action", f"$ {name} {json.dumps(args)[:300]}", task_id=tid)
-            try:
-                result = execute_tool(agent, name, args)
-            except Exception as e:
-                result = f"tool error: {type(e).__name__}: {e}"
-            mgr.emit("log", f"→ {result[:1500]}", task_id=tid)
-            messages.append({"role": "assistant", "content": reply})
-            messages.append({"role": "user", "content": f"TOOL RESULT ({name}):\n{result}"})
-        if t.get("source"):
-            if final.strip():
-                try:
-                    post_comment(agent, t["source"], final)
-                    mgr.emit("action", f"posted reply on {t['source']}", task_id=tid)
-                except Exception as e:
-                    mgr.emit("error", f"could not post reply on {t['source']}: {e}", task_id=tid)
-            else:
-                mgr.emit("error", f"model returned an empty reply; nothing posted on {t['source']}", task_id=tid)
-        mgr.finish(tid, "done", output=final)
-        return "done"
+        res = engine(run)
+    except TaskTimeout as e:
+        res = EngineResult("error", error=str(e))
     except Exception as e:
-        mgr.emit("error", f"{type(e).__name__}: {e}", task_id=tid)
-        mgr.finish(tid, "failed", error=str(e))
-        return "error"
+        res = EngineResult("error", error=f"{type(e).__name__}: {e}")
+    if res.outcome != "done":
+        mgr.emit("error", res.error or f"task {res.outcome}", task_id=tid)
+        mgr.finish(tid, "failed", error=res.error or res.outcome)
+        return res.outcome
+    if t.get("source"):
+        if res.answer.strip():
+            try:
+                post_comment(agent, t["source"], res.answer)
+                mgr.emit("action", f"posted reply on {t['source']}", task_id=tid)
+            except Exception as e:
+                mgr.emit("error", f"could not post reply on {t['source']}: {e}", task_id=tid)
+        else:
+            mgr.emit("error", f"empty answer; nothing posted on {t['source']}", task_id=tid)
+    mgr.finish(tid, "done", output=res.answer)
+    return "done"
 
 
 MAX_TASK_ATTEMPTS = 3
@@ -1151,7 +1272,8 @@ MAX_TASK_ATTEMPTS = 3
 
 def after_git_task(mgr, state, state_path, t, outcome):
     """Retry policy for tasks created from git activity. A task that broke
-    because of the model API, the network or the workspace ("error") is
+    because of the model API, the network, the workspace or a usage limit
+    ("error", "limit") is
     forgotten so the next git check creates it again, up to
     MAX_TASK_ATTEMPTS attempts; restarting the agent grants another round
     (see reset_given_up). Tasks that ran and failed are not retried."""
@@ -1159,7 +1281,7 @@ def after_git_task(mgr, state, state_path, t, outcome):
     if not src:
         return
     retries = state.setdefault("retries", {})
-    if outcome != "error":
+    if outcome not in RETRIED_OUTCOMES:
         if retries.pop(src, None) is not None:
             save_state(state_path, state)
         return
@@ -1203,8 +1325,10 @@ def main():
     system = (agent["persona"] + "\n\nStanding task: " + (agent.get("task") or "")
               + "\n\n" + TOOL_SPEC.replace("{repos}", repos))
     setup_git(agent)
-    log("worker starting:", agent["name"], f"({agent['provider']}/{agent['model']})")
-    mgr.emit("status", f"worker started: {agent['name']} ({agent['provider']}/{agent['model']})")
+    engine = agent.get("engine") or "doppio"
+    via = f"{agent['provider']}/{agent['model']}" + ("" if engine == "doppio" else f" via {engine}")
+    log("worker starting:", agent["name"], f"({via})")
+    mgr.emit("status", f"worker started: {agent['name']} ({via})")
     again = reset_given_up(state)
     if again:
         save_state(state_path, state)

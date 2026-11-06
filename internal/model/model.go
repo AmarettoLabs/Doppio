@@ -46,6 +46,51 @@ func ValidTrigger(t Trigger) bool {
 	return false
 }
 
+// Engine runs an agent's tasks: Doppio's own tool loop over a model API, or
+// a coding CLI logged in with an account.
+type Engine string
+
+const (
+	EngineDoppio     Engine = "doppio"
+	EngineClaudeCode Engine = "claude-code"
+	EngineCodex      Engine = "codex"
+	EngineVibe       Engine = "vibe"
+	EngineQwenCode   Engine = "qwen-code"
+)
+
+// EngineInfo describes an engine for the UI.
+type EngineInfo struct {
+	ID    Engine `json:"id"`
+	Label string `json:"label"`
+	// Available: the worker can run it. The CLI engines are being added one
+	// by one; until then they are listed but can't be picked.
+	Available bool `json:"available"`
+}
+
+// Engines lists every engine, the default (Doppio loop) first.
+func Engines() []EngineInfo {
+	return []EngineInfo{
+		{EngineDoppio, "Doppio loop", true},
+		{EngineClaudeCode, "Claude Code", false},
+		{EngineCodex, "Codex CLI", false},
+		{EngineVibe, "Mistral Vibe", false},
+		{EngineQwenCode, "Qwen Code", false},
+	}
+}
+
+// LookupEngine returns the engine's info, ok=false if unknown.
+func LookupEngine(e Engine) (EngineInfo, bool) {
+	for _, info := range Engines() {
+		if info.ID == e {
+			return info, true
+		}
+	}
+	return EngineInfo{}, false
+}
+
+// DefaultTaskMinutes is the time limit of one task when the agent has none.
+const DefaultTaskMinutes = 30
+
 // Agent is a configured coding agent. Deploying it starts one Docker
 // container running the generic worker with this configuration.
 type Agent struct {
@@ -70,6 +115,11 @@ type Agent struct {
 	Triggers    []Trigger `json:"triggers,omitempty"`
 	PollSeconds int       `json:"pollSeconds"`
 	MaxTurns    int       `json:"maxTurns"` // tool-loop turns per task; -1 = unlimited (until the model's context limit)
+	// Engine runs the agent's tasks; empty (agents created before engines
+	// existed) means the Doppio loop.
+	Engine Engine `json:"engine,omitempty"`
+	// TaskMinutes caps one task's run time; 0 means DefaultTaskMinutes.
+	TaskMinutes int `json:"taskMinutes,omitempty"`
 
 	Status      string `json:"status"` // created, running, stopped, error
 	ContainerID string `json:"containerId,omitempty"`
@@ -80,6 +130,22 @@ type Agent struct {
 	NextPollAt *time.Time `json:"nextPollAt,omitempty"`
 	CreatedAt  time.Time  `json:"createdAt"`
 	UpdatedAt  time.Time  `json:"updatedAt"`
+}
+
+// EffectiveEngine returns the agent's engine, the Doppio loop when unset.
+func (a *Agent) EffectiveEngine() Engine {
+	if a.Engine == "" {
+		return EngineDoppio
+	}
+	return a.Engine
+}
+
+// EffectiveTaskMinutes returns the agent's task time limit in minutes.
+func (a *Agent) EffectiveTaskMinutes() int {
+	if a.TaskMinutes <= 0 {
+		return DefaultTaskMinutes
+	}
+	return a.TaskMinutes
 }
 
 // EffectiveTriggers returns the agent's triggers, all of them when unset.

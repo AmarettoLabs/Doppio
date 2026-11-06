@@ -125,6 +125,8 @@ type AgentView struct {
 	Triggers    []string   `json:"triggers"`
 	PollSeconds int        `json:"pollSeconds"`
 	MaxTurns    int        `json:"maxTurns"`
+	Engine      string     `json:"engine"`
+	TaskMinutes int        `json:"taskMinutes"`
 	Status      string     `json:"status"`
 	ContainerID string     `json:"containerId,omitempty"`
 	Error       string     `json:"error,omitempty"`
@@ -147,7 +149,8 @@ func toView(a *model.Agent) AgentView {
 		OwnerLogin: a.OwnerLogin, PeerLogins: a.PeerLogins, Triggers: triggerStrings(a.EffectiveTriggers()),
 		PollSeconds: a.PollSeconds,
 		MaxTurns:    maxTurnsOrDefault(a.MaxTurns),
-		Status:      a.Status, ContainerID: a.ContainerID, Error: a.Error,
+		Engine:      string(a.EffectiveEngine()), TaskMinutes: a.EffectiveTaskMinutes(),
+		Status: a.Status, ContainerID: a.ContainerID, Error: a.Error,
 		LastPollAt: a.LastPollAt, NextPollAt: a.NextPollAt,
 		CreatedAt: a.CreatedAt, UpdatedAt: a.UpdatedAt,
 	}
@@ -175,6 +178,10 @@ type agentInput struct {
 	Triggers    []string `json:"triggers"`
 	PollSeconds int      `json:"pollSeconds"`
 	MaxTurns    int      `json:"maxTurns"`
+	// Engine: empty keeps the stored one on update (Doppio loop on create).
+	Engine string `json:"engine"`
+	// TaskMinutes: 0 keeps the stored limit on update (default on create).
+	TaskMinutes int `json:"taskMinutes"`
 }
 
 func triggerStrings(ts []model.Trigger) []string {
@@ -305,6 +312,18 @@ func (in *agentInput) validate() string {
 	if in.MaxTurns < -1 {
 		return "maxTurns must be -1 (unlimited) or >= 1"
 	}
+	if in.Engine != "" {
+		info, ok := model.LookupEngine(model.Engine(in.Engine))
+		if !ok {
+			return fmt.Sprintf("unknown engine %q", in.Engine)
+		}
+		if !info.Available {
+			return info.Label + " is not available yet"
+		}
+	}
+	if in.TaskMinutes < 0 || in.TaskMinutes > 24*60 {
+		return "taskMinutes must be between 1 and 1440 (0 = default)"
+	}
 	return ""
 }
 
@@ -366,8 +385,9 @@ func (s *Server) handleAuthInfo(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) handleProviders(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
-		"llm": model.Providers(),
-		"git": model.GitProviders(),
+		"llm":     model.Providers(),
+		"git":     model.GitProviders(),
+		"engines": model.Engines(),
 	})
 }
 
@@ -443,6 +463,8 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		Triggers:    parseTriggers(in.Triggers),
 		PollSeconds: in.PollSeconds,
 		MaxTurns:    in.MaxTurns,
+		Engine:      model.Engine(orDefault(in.Engine, string(model.EngineDoppio))),
+		TaskMinutes: in.TaskMinutes,
 		Status:      "created",
 		CreatedAt:   now,
 		UpdatedAt:   now,
@@ -497,6 +519,12 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	a.PollSeconds = in.PollSeconds
 	a.MaxTurns = in.MaxTurns
+	if in.Engine != "" {
+		a.Engine = model.Engine(in.Engine)
+	}
+	if in.TaskMinutes != 0 {
+		a.TaskMinutes = in.TaskMinutes
+	}
 	a.UpdatedAt = time.Now().UTC()
 	if err := s.store.UpsertAgent(a); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())

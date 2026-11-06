@@ -136,6 +136,7 @@
 	<h2>Configuration</h2>
 	<div class="panel">
 		<dl class="summary">
+			<dt>Engine</dt><dd>{agent.engine === 'doppio' ? 'Doppio loop' : agent.engine} · {agent.taskMinutes} min per task</dd>
 			<dt>Model</dt><dd>{agent.provider}/{agent.model}{agent.apiBase ? ` (${agent.apiBase})` : ''} · token {agent.hasApiToken ? 'set' : 'missing'}</dd>
 			<dt>Emails</dt><dd>{agent.emails?.join(', ') || '—'}</dd>
 			<dt>Git</dt><dd>{agent.gitProvider && agent.gitProvider !== 'none' ? `${agent.gitProvider} @${agent.gitLogin ?? ''} · token ${agent.hasGitToken ? 'set' : 'missing'} · repos ${(agent.gitRepos ?? []).join(', ') || '—'}${agent.ownerLogin ? ` · owner @${agent.ownerLogin}` : ''}` : '—'}</dd>

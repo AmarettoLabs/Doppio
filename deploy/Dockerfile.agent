@@ -10,12 +10,17 @@
 # stays in the build stages, the final image only has the runtimes and CLIs.
 # The result is about 2 GB unpacked (see "Agent image" in the README).
 #
-# Every version is a build arg, so a bump is a one-line change:
+# Every version is a build arg, so a bump is a one-line change; the download
+# checksums sit next to them and must be bumped with the version:
 #   docker build -f deploy/Dockerfile.agent --build-arg CLAUDE_CODE_VERSION=2.1.320 .
+#
+# The build targets the host architecture: assets and checksums are picked per
+# Docker's TARGETARCH (amd64 or arm64), declared in each stage that uses it.
 
 # --- Node.js and the Node-based coding CLIs --------------------------------
 # Node 22, as in CI and Dockerfile.manager. The CLIs are installed into the
-# image's global node_modules; their npm cache stays in this stage.
+# image's global node_modules; their npm cache stays in this stage. npm picks
+# the right binaries for the architecture on its own.
 FROM node:22-bookworm-slim AS node-clis
 ARG CLAUDE_CODE_VERSION=2.1.318
 ARG QWEN_CODE_VERSION=0.25.1
@@ -26,41 +31,60 @@ RUN npm install -g --omit=dev \
  && npm cache clean --force
 
 # --- codex CLI -------------------------------------------------------------
-# A native binary from its GitHub release (no Node involved).
+# A native binary from its GitHub release (no Node involved). The tarball
+# holds one file named after the target triple, hence the mv. Both
+# architectures are downloaded (each with its checksum) and the one for
+# TARGETARCH is kept.
 FROM python:3.14-slim AS codex-cli
+ARG TARGETARCH
 ARG CODEX_VERSION=0.166.0
-ADD https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/codex-x86_64-unknown-linux-musl.tar.gz /tmp/codex.tar.gz
-RUN tar -xzf /tmp/codex.tar.gz -C /tmp \
- && mv /tmp/codex-x86_64-unknown-linux-musl /usr/local/bin/codex \
- && rm -f /tmp/codex.tar.gz
+ARG CODEX_SHA256_AMD64=a0bf572d2f93f056c6712a6da348e96078dc84f3885fd7be67807ef389cb3978
+ARG CODEX_SHA256_ARM64=94eb707605ec2646b2e05b7edf7c4e7b3ccf02b16237c34ae9beb8cfb7f810a9
+ADD --checksum=sha256:${CODEX_SHA256_AMD64} https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/codex-x86_64-unknown-linux-musl.tar.gz /tmp/codex-amd64.tar.gz
+ADD --checksum=sha256:${CODEX_SHA256_ARM64} https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/codex-aarch64-unknown-linux-musl.tar.gz /tmp/codex-arm64.tar.gz
+RUN tar -xzf /tmp/codex-${TARGETARCH}.tar.gz -C /tmp \
+ && mv /tmp/codex-*-unknown-linux-musl /usr/local/bin/codex \
+ && rm -f /tmp/codex-*.tar.gz
 
 # --- vibe (Mistral Vibe) ----------------------------------------------------
-# A Python package, installed against the same Python as the final image.
+# A Python package, installed against the same Python as the final image. pip
+# picks the wheel for the architecture on its own.
 FROM python:3.14-slim AS vibe-cli
 ARG VIBE_VERSION=3.0.4
 RUN pip install --no-cache-dir mistral-vibe==${VIBE_VERSION}
 
 # --- Final image -----------------------------------------------------------
 FROM python:3.14-slim
+ARG TARGETARCH
 ARG GO_VERSION=1.26.7
 ARG GH_VERSION=2.76.2
 ARG GLAB_VERSION=1.128.0
+ARG GO_SHA256_AMD64=ffb5f8de10c62550dfddab66b36b57030721e0a44a3218e9e1181d7b59f121ca
+ARG GO_SHA256_ARM64=5a4ec883379d51ee9ce1040d5e87f8d35e20387574dd8c947feb01eabc3c1b37
+ARG GH_SHA256_AMD64=2958aa0cf0a2a82790913058667bf5a8b67fe0ecdd0d13d5ffe78d90adb04602
+ARG GH_SHA256_ARM64=8a4728b3619fc4b21ad74334a9642776a45afe3a473364141d31c09b0452e40d
+ARG GLAB_SHA256_AMD64=b42db1c339cb66df2dbdaf190b8c4e359cb2ea3f7ac53e46302b04777f2cf405
+ARG GLAB_SHA256_ARM64=88e68a179fc25c3751e7950aa4b1b47b184cade590b70d9ca4aafff6648c655e
 # ca-certificates: the worker and the CLIs talk HTTPS to the manager, the git
 # host and the model API. git: the workspace is a git checkout.
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 # gh / glab: the CLI engines don't have Doppio's create_pr tool, they open
-# pull/merge requests with these.
-ADD https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.deb /tmp/gh.deb
-ADD https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads/glab_${GLAB_VERSION}_linux_amd64.deb /tmp/glab.deb
-RUN dpkg -i /tmp/gh.deb /tmp/glab.deb && rm -f /tmp/gh.deb /tmp/glab.deb
+# pull/merge requests with these. TARGETARCH (amd64/arm64) matches the debs'
+# asset names.
+ADD --checksum=sha256:${GH_SHA256_AMD64} https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.deb /tmp/gh-amd64.deb
+ADD --checksum=sha256:${GH_SHA256_ARM64} https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_arm64.deb /tmp/gh-arm64.deb
+ADD --checksum=sha256:${GLAB_SHA256_AMD64} https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads/glab_${GLAB_VERSION}_linux_amd64.deb /tmp/glab-amd64.deb
+ADD --checksum=sha256:${GLAB_SHA256_ARM64} https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads/glab_${GLAB_VERSION}_linux_arm64.deb /tmp/glab-arm64.deb
+RUN dpkg -i /tmp/gh-${TARGETARCH}.deb /tmp/glab-${TARGETARCH}.deb && rm -f /tmp/gh-*.deb /tmp/glab-*.deb
 # Node, npm and the Node-based CLIs (agents run `npm ci && npm run check` on
 # a checkout).
 COPY --from=node-clis /usr/local/bin /usr/local/bin
 COPY --from=node-clis /usr/local/lib/node_modules /usr/local/lib/node_modules
 # The Go toolchain (agents run `go test ./...` on a checkout).
-ADD https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz /tmp/go.tgz
-RUN tar -C /usr/local -xzf /tmp/go.tgz && rm -f /tmp/go.tgz
+ADD --checksum=sha256:${GO_SHA256_AMD64} https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz /tmp/go-amd64.tgz
+ADD --checksum=sha256:${GO_SHA256_ARM64} https://go.dev/dl/go${GO_VERSION}.linux-arm64.tar.gz /tmp/go-arm64.tgz
+RUN tar -C /usr/local -xzf /tmp/go-${TARGETARCH}.tgz && rm -f /tmp/go-*.tgz
 ENV PATH=/usr/local/go/bin:$PATH
 # codex and vibe (all three vibe entry points: the launcher points the Rust
 # CLI at the vibe-app-server script next to itself).

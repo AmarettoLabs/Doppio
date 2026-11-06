@@ -25,10 +25,11 @@ func TestAgentImageShipsTools(t *testing.T) {
 			t.Errorf("%s is not pinned as a build arg in deploy/Dockerfile.agent", arg)
 		}
 	}
-	for _, tool := range []string{"claude", "codex", "vibe", "qwen", "gh", "glab", "go", "node"} {
-		if !strings.Contains(f, tool) {
-			t.Errorf("deploy/Dockerfile.agent does not mention %s", tool)
-		}
+	if !regexp.MustCompile(`(?m)^ARG [A-Z_]*SHA256_(AMD64|ARM64)=`).MatchString(f) {
+		t.Error("the download checksums are not pinned as build args in deploy/Dockerfile.agent")
+	}
+	if !regexp.MustCompile(`(?m)^ADD --checksum=sha256:`).MatchString(f) {
+		t.Error("the downloads are not verified with ADD --checksum in deploy/Dockerfile.agent")
 	}
 	if !strings.Contains(f, "COPY deploy/agent/agent_worker.py /agent/agent_worker.py") {
 		t.Error("the agent worker is not copied into the image")

@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 import urllib.parse
 
 WS_DIR = tempfile.mkdtemp(prefix="doppio-ws-")
@@ -618,19 +619,21 @@ class ExtraCaTest(unittest.TestCase):
                             "-keyout", os.devnull, "-out", extra, "-days", "1",
                             "-subj", "/CN=doppio-test"],
                            check=True, capture_output=True)
-            old = os.environ.get("DOPPIO_EXTRA_CA")
-            os.environ["DOPPIO_EXTRA_CA"] = extra
-            try:
+            # patch.dict restores the environment (DOPPIO_EXTRA_CA included) on
+            # exit; the bundle file and _ssl_ctx are reset by hand.
+            with unittest.mock.patch.dict(os.environ, {"DOPPIO_EXTRA_CA": extra}):
                 w.setup_extra_ca()
-            finally:
-                if old is None:
-                    os.environ.pop("DOPPIO_EXTRA_CA", None)
-                else:
-                    os.environ["DOPPIO_EXTRA_CA"] = old
-            for k in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
-                      "GIT_SSL_CAINFO", "NODE_EXTRA_CA_CERTS"):
-                self.assertEqual(os.environ[k], "/tmp/doppio-ca-bundle.pem", k)
-            self.assertIsNotNone(w._ssl_ctx)
+                try:
+                    for k in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+                              "GIT_SSL_CAINFO", "NODE_EXTRA_CA_CERTS"):
+                        self.assertEqual(os.environ[k], "/tmp/doppio-ca-bundle.pem", k)
+                    self.assertIsNotNone(w._ssl_ctx)
+                    self.assertTrue(os.path.exists("/tmp/doppio-ca-bundle.pem"))
+                finally:
+                    w._ssl_ctx = None
+                    os.remove("/tmp/doppio-ca-bundle.pem")
+            self.assertIsNone(w._ssl_ctx)
+            self.assertFalse(os.path.exists("/tmp/doppio-ca-bundle.pem"))
 
 
 class ToolsTest(unittest.TestCase):

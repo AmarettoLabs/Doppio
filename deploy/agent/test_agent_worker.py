@@ -605,6 +605,8 @@ class RunProcessTest(unittest.TestCase):
         with self.assertRaises(w.TaskTimeout):
             w.run_process(run, ["sh", "-c", "sleep 30 & sleep 30"])
         self.assertLess(time.monotonic() - started, 10)
+
+
 class ExtraCaTest(unittest.TestCase):
     """setup_extra_ca: the extra bundle is trusted by everything the worker and
     its shell tool run, including the Node-based CLIs."""

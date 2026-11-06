@@ -66,6 +66,9 @@ ENV PATH=/usr/local/go/bin:$PATH
 # CLI at the vibe-app-server script next to itself).
 COPY --from=codex-cli /usr/local/bin/codex /usr/local/bin/codex
 COPY --from=vibe-cli /usr/local/bin/vibe* /usr/local/bin/
+# vibe's Python package and its dependencies: the entry points above import
+# them (same Python 3.14 as this stage, so the path matches).
+COPY --from=vibe-cli /usr/local/lib/python3.14/site-packages /usr/local/lib/python3.14/site-packages
 WORKDIR /agent
 COPY deploy/agent/agent_worker.py /agent/agent_worker.py
 ENTRYPOINT ["python3", "-u", "/agent/agent_worker.py"]

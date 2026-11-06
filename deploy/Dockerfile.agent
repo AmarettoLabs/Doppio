@@ -10,6 +10,10 @@
 # stays in the build stages, the final image only has the runtimes and CLIs.
 # The result is about 2 GB unpacked (see "Agent image" in the README).
 #
+# The CLIs never update themselves: their built-in update checks are turned
+# off in the image (the ENV and config files below), so a version pin is what
+# actually runs.
+#
 # Every version is a build arg, so a bump is a one-line change; the download
 # checksums sit next to them and must be bumped with the version:
 #   docker build -f deploy/Dockerfile.agent --build-arg CLAUDE_CODE_VERSION=2.1.320 .
@@ -93,6 +97,19 @@ COPY --from=vibe-cli /usr/local/bin/vibe* /usr/local/bin/
 # vibe's Python package and its dependencies: the entry points above import
 # them (same Python 3.14 as this stage, so the path matches).
 COPY --from=vibe-cli /usr/local/lib/python3.14/site-packages /usr/local/lib/python3.14/site-packages
+# No self-updates. Containers run as root (HOME=/root), so each CLI reads its
+# own home config; qwen's system-wide file lives in /etc and wins over any
+# user settings.
+#   claude: DISABLE_AUTOUPDATER (its own env var).
+#   codex:  check_for_update_on_startup in ~/.codex/config.toml.
+#   vibe:   enable_update_checks / enable_auto_update in ~/.vibe/config.toml.
+#   qwen:   general.enableAutoUpdate in /etc/qwen-code/settings.json.
+ENV DISABLE_AUTOUPDATER=1
+RUN mkdir -p /root/.codex /root/.vibe /etc/qwen-code \
+ && printf 'check_for_update_on_startup = false\n' > /root/.codex/config.toml \
+ && printf 'enable_update_checks = false\nenable_auto_update = false\n' > /root/.vibe/config.toml \
+ && printf '{ "general": { "enableAutoUpdate": false } }\n' > /etc/qwen-code/settings.json \
+ && chmod 0644 /root/.codex/config.toml /root/.vibe/config.toml /etc/qwen-code/settings.json
 WORKDIR /agent
 COPY deploy/agent/agent_worker.py /agent/agent_worker.py
 ENTRYPOINT ["python3", "-u", "/agent/agent_worker.py"]

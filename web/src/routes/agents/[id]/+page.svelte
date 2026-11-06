@@ -177,7 +177,8 @@
 	{#if tasks.length === 0}
 		<p class="muted">No tasks yet.</p>
 	{:else}
-		<table>
+		<div class="table-wrap">
+		<table class="tasks">
 			<thead><tr><th>Status</th><th>Kind</th><th>Title</th><th>Created</th><th>Output / error</th></tr></thead>
 			<tbody>
 				{#each tasks as t (t.id)}
@@ -185,12 +186,13 @@
 						<td><span class="badge {t.status}">{t.status}</span></td>
 						<td>{t.kind}{t.source ? ` · ${t.source}` : ''}</td>
 						<td>{t.title}</td>
-						<td class="muted">{new Date(t.createdAt).toLocaleString()}</td>
+						<td class="muted nowrap">{new Date(t.createdAt).toLocaleString()}</td>
 						<td class="muted">{t.error ? `⚠ ${t.error}` : (t.output ?? '').slice(0, 200)}</td>
 					</tr>
 				{/each}
 			</tbody>
 		</table>
+		</div>
 	{/if}
 
 	<h2>Live stream</h2>

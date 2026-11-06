@@ -961,7 +961,7 @@ You can act with tools. Each turn, reply with EITHER:
 - a final plain-text answer (no JSON block), or
 - exactly one tool call in a ```json fenced block:
   {"tool":"shell","command":"..."}                     run a shell command in /agent/workspace (git is preconfigured with your credentials; for git tasks the repository is already cloned and checked out under repos/<name>, see the task — do NOT clone again)
-  {"tool":"read_file","path":"..."}                    read a file under /agent/workspace
+  {"tool":"read_file","path":"...","start_line":1,"end_line":400}   read a file under /agent/workspace (lines optional; long files are shown in parts)
   {"tool":"write_file","path":"...","content":"..."}   write a file under /agent/workspace
   {"tool":"create_pr","repo":"owner/repo","head":"your-branch","base":"main","title":"...","body":"..."}
 Rules: one tool call per turn, wait for its result, keep going until the work is done, then give a short plain-text summary. Work on your own branch; never push to main/master. Repos you watch: {repos}.
@@ -986,6 +986,15 @@ def parse_tool_call(text):
         if isinstance(obj, dict) and obj.get("tool"):
             return obj["tool"], obj
         first_error = first_error or "the json block has no \"tool\" field"
+    # No usable fenced call: accept a bare {"tool": ...} object anywhere
+    # (models sometimes lose the opening fence, e.g. "…ranges.json\n{...}").
+    for m in re.finditer(r'\{\s*"tool"\s*:', text):
+        try:
+            obj, _ = decoder.raw_decode(text[m.start():])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and obj.get("tool"):
+            return obj["tool"], obj
     if first_error:
         return "__invalid__", first_error
     return None
@@ -1024,7 +1033,43 @@ def ws_path(p):
     return full
 
 
+READ_FILE_CHARS = 8000
+
+# Tool names models invent for the ones we have.
+TOOL_ALIASES = {"bash": "shell", "sh": "shell", "run": "shell", "cat": "read_file"}
+
+
+def read_file_part(path, start=None, end=None):
+    """Lines start..end (1-based, inclusive) of the file, cut to
+    READ_FILE_CHARS, with a note saying what was left out and how to get it."""
+    with open(path, errors="replace") as f:
+        lines = f.read().splitlines(keepends=True)
+    total = len(lines)
+    try:
+        first = max(1, int(start or 1))
+        last = min(total, int(end)) if end else total
+    except (TypeError, ValueError):
+        return "start_line and end_line must be numbers"
+    if total == 0:
+        return "(empty file)"
+    if first > total:
+        return f"start_line {first} is past the end of the file ({total} lines)"
+    out, size, shown = [], 0, first - 1
+    for line in lines[first - 1:last]:
+        if out and size + len(line) > READ_FILE_CHARS:
+            break
+        out.append(line)
+        size += len(line)
+        shown += 1
+    text = "".join(out)
+    if first > 1 or shown < total:
+        more = f" Read more with start_line={shown + 1}." if shown < total else ""
+        text += f"\n[lines {first}-{shown} of {total}.{more}]"
+    return text
+
+
 def execute_tool(agent, name, args):
+    name = TOOL_ALIASES.get(name, name)
     if name == "shell":
         cmd = args.get("command", "")
         if not cmd.strip():
@@ -1039,8 +1084,7 @@ def execute_tool(agent, name, args):
         except subprocess.TimeoutExpired:
             return f"timeout after {SHELL_TIMEOUT}s"
     if name == "read_file":
-        with open(ws_path(args.get("path", ""))) as f:
-            return f.read()[:8000]
+        return read_file_part(ws_path(args.get("path", "")), args.get("start_line"), args.get("end_line"))
     if name == "write_file":
         p = ws_path(args.get("path", ""))
         os.makedirs(os.path.dirname(p), exist_ok=True)

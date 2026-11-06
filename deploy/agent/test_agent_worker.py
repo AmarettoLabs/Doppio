@@ -237,6 +237,10 @@ class ParseToolCallTest(unittest.TestCase):
         # Several calls glued together: the first one wins.
         self.assertEqual(w.parse_tool_call('```json\n{"tool":"a"}\n``````json\n{"tool":"b"}\n```')[0], "a")
 
+    def test_bare_call_without_fence(self):
+        text = 'let me use shell to view specific ranges.json\n{"tool":"shell","command":"sed -n \'1,5p\' a.go"}\n```'
+        self.assertEqual(w.parse_tool_call(text), ("shell", {"tool": "shell", "command": "sed -n '1,5p' a.go"}))
+
     def test_invalid_and_plain_answers(self):
         self.assertEqual(w.parse_tool_call('```json\n{broken\n```')[0], "__invalid__")
         self.assertEqual(w.parse_tool_call('```json\n{"no":"tool"}\n```')[0], "__invalid__")
@@ -343,6 +347,31 @@ class RunProcessTest(unittest.TestCase):
         with self.assertRaises(w.TaskTimeout):
             w.run_process(run, ["sh", "-c", "sleep 30 & sleep 30"])
         self.assertLess(time.monotonic() - started, 10)
+class ToolsTest(unittest.TestCase):
+    def setUp(self):
+        self.path = os.path.join(WS_DIR, "long.txt")
+        with open(self.path, "w") as f:
+            f.write("".join(f"line {i:04d} " + "x" * 40 + "\n" for i in range(1, 501)))
+
+    def test_read_file_in_parts(self):
+        out = w.execute_tool(agent(), "read_file", {"path": "long.txt"})
+        self.assertIn("line 0001", out)
+        self.assertRegex(out, r"\[lines 1-(\d+) of 500\. Read more with start_line=\d+\.\]$")
+        nxt = int(re.search(r"start_line=(\d+)", out).group(1))
+        out2 = w.execute_tool(agent(), "read_file", {"path": "long.txt", "start_line": nxt})
+        self.assertTrue(out2.startswith(f"line {nxt:04d}"))
+        tail = w.execute_tool(agent(), "read_file", {"path": "long.txt", "start_line": 495, "end_line": 600})
+        self.assertIn("line 0500", tail)
+        self.assertTrue(tail.endswith("[lines 495-500 of 500.]"))
+
+    def test_short_file_is_returned_as_is(self):
+        p = os.path.join(WS_DIR, "short.txt")
+        with open(p, "w") as f:
+            f.write("a\nb\n")
+        self.assertEqual(w.execute_tool(agent(), "read_file", {"path": "short.txt"}), "a\nb\n")
+
+    def test_bash_is_an_alias_of_shell(self):
+        self.assertIn("hi", w.execute_tool(agent(), "bash", {"command": "echo hi"}))
 
 
 class SourceTest(unittest.TestCase):

@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -21,18 +22,33 @@ import (
 	"github.com/AmarettoLabs/Doppio/internal/store"
 )
 
+// Containers runs agent containers; *runtime.Runtime in production, a fake
+// in tests.
+type Containers interface {
+	EnsureNetwork() error
+	Start(a *model.Agent) (string, error)
+	Stop(agentID string) error
+	Status(agentID string) string
+	RemoveState(agentID string) error
+}
+
 // Server wires the store, runtime and routes together.
 type Server struct {
 	store          *store.Store
-	rt             *runtime.Runtime
+	rt             Containers
 	portalPassword string // empty = portal is open
 	staticDir      string
 	managerToken   string
 	broker         *broker
+
+	// restartMu serializes restarts that apply saved settings; restarts
+	// tracks the ones running in the background (tests wait on it).
+	restartMu sync.Mutex
+	restarts  sync.WaitGroup
 }
 
 // NewServer builds the API server.
-func NewServer(st *store.Store, rt *runtime.Runtime, portalPassword, staticDir, managerToken string) *Server {
+func NewServer(st *store.Store, rt Containers, portalPassword, staticDir, managerToken string) *Server {
 	return &Server{
 		store:          st,
 		rt:             rt,
@@ -134,9 +150,11 @@ type AgentView struct {
 	NextPollAt  *time.Time `json:"nextPollAt,omitempty"`
 	// Working is true while one of the agent's tasks is running or pending.
 	// Only set by the list/get endpoints.
-	Working   bool      `json:"working"`
-	CreatedAt time.Time `json:"createdAt"`
-	UpdatedAt time.Time `json:"updatedAt"`
+	Working bool `json:"working"`
+	// RestartPending: saved settings wait for the current work to finish.
+	RestartPending bool      `json:"restartPending"`
+	CreatedAt      time.Time `json:"createdAt"`
+	UpdatedAt      time.Time `json:"updatedAt"`
 }
 
 func toView(a *model.Agent) AgentView {
@@ -152,7 +170,8 @@ func toView(a *model.Agent) AgentView {
 		Engine:      string(a.EffectiveEngine()), TaskMinutes: a.EffectiveTaskMinutes(),
 		Status: a.Status, ContainerID: a.ContainerID, Error: a.Error,
 		LastPollAt: a.LastPollAt, NextPollAt: a.NextPollAt,
-		CreatedAt: a.CreatedAt, UpdatedAt: a.UpdatedAt,
+		RestartPending: a.RestartPending,
+		CreatedAt:      a.CreatedAt, UpdatedAt: a.UpdatedAt,
 	}
 }
 
@@ -418,7 +437,7 @@ func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
 
 // liveStatus resolves the container state, mapping "not-found" to the stored
 // status (created) or stopped.
-func liveStatus(rt *runtime.Runtime, a *model.Agent) string {
+func liveStatus(rt Containers, a *model.Agent) string {
 	st := rt.Status(a.ID)
 	if st == "not-found" {
 		if a.Status == "created" || a.Status == "running" || a.Status == "error" {
@@ -531,7 +550,72 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.store.AppendEvents(a.ID, "", []model.Event{{Type: "status", Content: "agent updated"}})
-	writeJSON(w, http.StatusOK, toView(a))
+	writeJSON(w, http.StatusOK, s.applySettings(a))
+}
+
+// busy reports whether the agent's worker is in the middle of something a
+// restart would break: a task running or waiting to be claimed, or a git
+// check (the worker clears nextPollAt while it checks).
+func (s *Server) busy(a *model.Agent) bool {
+	return s.store.WorkingAgents()[a.ID] || (a.LastPollAt != nil && a.NextPollAt == nil)
+}
+
+// applySettings gets saved settings to a running agent, whose container only
+// reads its config at start: an idle agent is restarted now; a busy one is
+// marked and restarted when its worker next asks for work (see
+// handleInternalNextTask). A stopped agent uses them at its next start.
+func (s *Server) applySettings(a *model.Agent) AgentView {
+	if liveStatus(s.rt, a) != "running" {
+		return s.view(a)
+	}
+	s.restartMu.Lock()
+	defer s.restartMu.Unlock()
+	if s.busy(a) {
+		if !a.RestartPending {
+			a.RestartPending = true
+			_ = s.store.UpsertAgent(a)
+			s.event(a.ID, "status", "restart pending: the new settings apply after the current work")
+		}
+		return s.view(a)
+	}
+	if started, _, err := s.restart(a.ID, "restarting to apply the new settings"); err == nil {
+		a = started
+	} else if fresh := s.store.GetAgent(a.ID); fresh != nil {
+		a = fresh
+	}
+	return s.view(a)
+}
+
+// applyPendingRestart restarts an agent whose settings changed while it was
+// busy, once it's idle. Runs in the background: the request that triggers
+// it comes from the container being restarted.
+func (s *Server) applyPendingRestart(id string) {
+	s.restarts.Add(1)
+	go func() {
+		defer s.restarts.Done()
+		s.restartMu.Lock()
+		defer s.restartMu.Unlock()
+		a := s.store.GetAgent(id)
+		if a == nil || !a.RestartPending {
+			return // already applied by another start/stop
+		}
+		_, _, _ = s.restart(id, "restarting to apply the new settings")
+	}()
+}
+
+// view is toView plus the fields resolved from the runtime and tasks.
+func (s *Server) view(a *model.Agent) AgentView {
+	a.Status = liveStatus(s.rt, a)
+	v := toView(a)
+	v.Working = s.store.WorkingAgents()[a.ID]
+	return v
+}
+
+// event records and broadcasts one agent-level event.
+func (s *Server) event(id, typ, content string) {
+	for _, ev := range s.store.AppendEvents(id, "", []model.Event{{Type: typ, Content: content}}) {
+		s.broker.publish(id, ev)
+	}
 }
 
 func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
@@ -558,37 +642,59 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
+	a, code, err := s.restart(r.PathValue("id"), "")
+	if err != nil {
+		writeErr(w, code, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, toView(a))
+}
+
+// restart stops the agent's container and starts a new one, with an event
+// saying why when reason is set.
+func (s *Server) restart(id, reason string) (*model.Agent, int, error) {
+	if reason != "" && s.store.GetAgent(id) != nil {
+		s.event(id, "status", reason)
+	}
 	_ = s.rt.Stop(id)
-	s.startAgent(w, id)
+	return s.start(id)
 }
 
 func (s *Server) startAgent(w http.ResponseWriter, id string) {
+	a, code, err := s.start(id)
+	if err != nil {
+		writeErr(w, code, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, toView(a))
+}
+
+// start starts the agent's container with its saved settings. On failure it
+// returns the HTTP status to report.
+func (s *Server) start(id string) (*model.Agent, int, error) {
 	a := s.store.GetAgent(id)
 	if a == nil {
-		writeErr(w, http.StatusNotFound, "agent not found")
-		return
+		return nil, http.StatusNotFound, errors.New("agent not found")
 	}
 	if st := s.rt.Status(id); st == "running" {
-		writeErr(w, http.StatusConflict, "agent container is already running")
-		return
+		return nil, http.StatusConflict, errors.New("agent container is already running")
 	}
 	if err := s.rt.EnsureNetwork(); err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
+		return nil, http.StatusInternalServerError, err
 	}
 	cid, err := s.rt.Start(a)
 	if err != nil {
 		a.Status = "error"
 		a.Error = err.Error()
+		a.RestartPending = false
 		_ = s.store.UpsertAgent(a)
-		s.store.AppendEvents(id, "", []model.Event{{Type: "error", Content: "start failed: " + err.Error()}})
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
+		s.event(id, "error", "start failed: "+err.Error())
+		return nil, http.StatusInternalServerError, err
 	}
 	a.Status = "running"
 	a.ContainerID = cid
 	a.Error = ""
+	a.RestartPending = false
 	a.UpdatedAt = time.Now().UTC()
 	_ = s.store.UpsertAgent(a)
 	s.store.AppendEvents(id, "", []model.Event{{Type: "status", Content: "container started: " + cid[:12]}})
@@ -600,7 +706,7 @@ func (s *Server) startAgent(w http.ResponseWriter, id string) {
 		}
 	}
 	s.broker.publish(id, model.Event{AgentID: id, Type: "status", Content: "container started"})
-	writeJSON(w, http.StatusOK, toView(a))
+	return a, http.StatusOK, nil
 }
 
 func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
@@ -616,6 +722,7 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	}
 	a.Status = "stopped"
 	a.ContainerID = ""
+	a.RestartPending = false // the next start uses the saved settings
 	a.UpdatedAt = time.Now().UTC()
 	_ = s.store.UpsertAgent(a)
 	s.store.AppendEvents(id, "", []model.Event{{Type: "status", Content: "container stopped"}})
@@ -764,7 +871,17 @@ func (s *Server) handleInternalNextTask(w http.ResponseWriter, r *http.Request) 
 	if !s.checkInternal(w, r, r.PathValue("id")) {
 		return
 	}
-	t := s.store.ClaimNextTask(r.PathValue("id"))
+	id := r.PathValue("id")
+	// The worker only asks for work when it's idle: the moment to apply
+	// settings saved while it was busy. No task now; the new container
+	// picks up whatever is pending.
+	if a := s.store.GetAgent(id); a != nil && a.RestartPending {
+		writeJSON(w, http.StatusOK, nil)
+		_ = http.NewResponseController(w).Flush()
+		s.applyPendingRestart(id)
+		return
+	}
+	t := s.store.ClaimNextTask(id)
 	if t == nil {
 		writeJSON(w, http.StatusOK, nil)
 		return

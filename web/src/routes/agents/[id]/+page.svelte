@@ -132,6 +132,9 @@
 	{#if notice}<p class="muted">{notice}</p>{/if}
 	{#if error}<p class="err">{error}</p>{/if}
 	{#if agent.error}<p class="err">{agent.error}</p>{/if}
+	{#if agent.restartPending}
+		<p class="pending">Restart pending: the saved settings apply after the current work.</p>
+	{/if}
 
 	<h2>Configuration</h2>
 	<div class="panel">

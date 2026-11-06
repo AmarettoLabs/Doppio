@@ -739,9 +739,12 @@ def check_git_items(mgr, agent, state, state_path, now):
 
 
 def save_state(state_path, state):
+    # Write then rename, so a restart mid-save can't leave a truncated file.
     try:
-        with open(state_path, "w") as f:
+        tmp = state_path + ".tmp"
+        with open(tmp, "w") as f:
             json.dump(state, f)
+        os.replace(tmp, state_path)
     except Exception as e:
         log("state save failed:", e)
 

@@ -82,6 +82,10 @@ limit, unusable replies) are not retried.
 To split the work, create several agents with the same git account and token,
 one per trigger, each with the model that suits the job.
 
+Saving a running agent's settings restarts its container so they take effect.
+If the agent is busy (a task, or a git check), the restart waits until it's
+done and the agent page shows "Restart pending" meanwhile.
+
 ## Engines
 
 An agent's **engine** runs its tasks. The default, and for now the only one

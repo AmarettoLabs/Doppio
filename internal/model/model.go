@@ -121,9 +121,13 @@ type Agent struct {
 	// TaskMinutes caps one task's run time; 0 means DefaultTaskMinutes.
 	TaskMinutes int `json:"taskMinutes,omitempty"`
 
-	Status      string `json:"status"` // created, running, stopped, error
-	ContainerID string `json:"containerId,omitempty"`
-	Error       string `json:"error,omitempty"`
+	Status string `json:"status"` // created, running, stopped, error
+	// RestartPending: the agent's settings were saved while it was busy; its
+	// container is restarted with them once it's idle. Cleared by any start
+	// or stop.
+	RestartPending bool   `json:"restartPending,omitempty"`
+	ContainerID    string `json:"containerId,omitempty"`
+	Error          string `json:"error,omitempty"`
 	// Git poll scheduling, reported by the worker so the UI can show a
 	// countdown to the next check.
 	LastPollAt *time.Time `json:"lastPollAt,omitempty"`

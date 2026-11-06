@@ -605,6 +605,32 @@ class RunProcessTest(unittest.TestCase):
         with self.assertRaises(w.TaskTimeout):
             w.run_process(run, ["sh", "-c", "sleep 30 & sleep 30"])
         self.assertLess(time.monotonic() - started, 10)
+class ExtraCaTest(unittest.TestCase):
+    """setup_extra_ca: the extra bundle is trusted by everything the worker and
+    its shell tool run, including the Node-based CLIs."""
+
+    def test_sets_the_ca_env_for_python_git_curl_and_node(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            extra = os.path.join(tmp, "extra-ca.pem")
+            subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                            "-keyout", os.devnull, "-out", extra, "-days", "1",
+                            "-subj", "/CN=doppio-test"],
+                           check=True, capture_output=True)
+            old = os.environ.get("DOPPIO_EXTRA_CA")
+            os.environ["DOPPIO_EXTRA_CA"] = extra
+            try:
+                w.setup_extra_ca()
+            finally:
+                if old is None:
+                    os.environ.pop("DOPPIO_EXTRA_CA", None)
+                else:
+                    os.environ["DOPPIO_EXTRA_CA"] = old
+            for k in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+                      "GIT_SSL_CAINFO", "NODE_EXTRA_CA_CERTS"):
+                self.assertEqual(os.environ[k], "/tmp/doppio-ca-bundle.pem", k)
+            self.assertIsNotNone(w._ssl_ctx)
+
+
 class ToolsTest(unittest.TestCase):
     def setUp(self):
         self.path = os.path.join(WS_DIR, "long.txt")

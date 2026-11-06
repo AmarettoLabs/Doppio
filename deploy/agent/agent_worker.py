@@ -65,7 +65,8 @@ _ssl_ctx = None
 def setup_extra_ca():
     """Trust the extra CAs the manager mounted (DOPPIO_EXTRA_CA) on top of the
     system ones, for this worker and for the commands its shell tool runs
-    (git, curl, python requests...)."""
+    (git, curl, python requests...). NODE_EXTRA_CA_CERTS covers the Node-based
+    CLIs (claude, qwen) and npm, which ignore SSL_CERT_FILE."""
     global _ssl_ctx
     extra = os.environ.get("DOPPIO_EXTRA_CA")
     if not extra:
@@ -77,7 +78,8 @@ def setup_extra_ca():
                 out.write(f.read().rstrip("\n") + "\n")
         with open(extra) as f:
             out.write(f.read())
-    for k in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO"):
+    for k in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+              "GIT_SSL_CAINFO", "NODE_EXTRA_CA_CERTS"):
         os.environ[k] = bundle
     _ssl_ctx = ssl.create_default_context(cafile=bundle)
     log("trusting extra CA certificates from", extra)

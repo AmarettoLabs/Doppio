@@ -59,8 +59,12 @@ func TestAgentImageShipsTools(t *testing.T) {
 		t.Error("the agent worker is not copied into the image")
 	}
 	// vibe's entry points are thin scripts that import its Python package, so
-	// site-packages must come along or `vibe` exits with ModuleNotFoundError.
-	if !strings.Contains(f, "COPY --from=vibe-cli /usr/local/lib/python3.14/site-packages /usr/local/lib/python3.14/site-packages") {
-		t.Error("vibe's Python package is not copied into the image")
+	// its venv must come along or `vibe` exits with ModuleNotFoundError; the
+	// system site-packages must not be overwritten with vibe's dependencies.
+	if !strings.Contains(f, "COPY --from=vibe-cli /opt/vibe /opt/vibe") {
+		t.Error("vibe's virtual environment is not copied into the image")
+	}
+	if strings.Contains(f, "/usr/local/lib/python3.14/site-packages") {
+		t.Error("vibe must stay in its venv, not in the system site-packages")
 	}
 }

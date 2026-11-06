@@ -260,6 +260,43 @@ class LlmCallTest(unittest.TestCase):
                                           {"type": "function", "function": {"name": "shell", "arguments": '{"command": "pwd"}'}}]})
         self.assertEqual(w.parse_tool_call(text), ("shell", {"tool": "shell", "command": "ls"}))
 
+    def test_reply_length_is_capped(self):
+        bodies = []
+        orig = w.http_json
+        self.addCleanup(setattr, w, "http_json", orig)
+
+        def fake(method, url, headers, body=None, timeout=30):
+            bodies.append(body)
+            return {"choices": [{"message": {"content": "same same same"}, "finish_reason": "length"}]}
+        w.http_json = fake
+        for provider, field in (("openai", "max_completion_tokens"), ("mistral", "max_tokens"), ("custom", "max_tokens")):
+            with self.assertRaises(w.ReplyTruncated):
+                w.llm_call(agent(provider=provider, model="m", apiToken="k", apiBase="http://x/v1"), "sys", [])
+            self.assertEqual(bodies[-1][field], w.MAX_REPLY_TOKENS)
+
+    def test_truncated_replies_are_retried_then_fail(self):
+        orig = w.llm_call
+        self.addCleanup(setattr, w, "llm_call", orig)
+        replies = iter([w.ReplyTruncated("cut"), "Done, concisely."])
+        sent = []
+
+        def fake(agent_, system, messages):
+            sent.append([dict(m) for m in messages])
+            r = next(replies)
+            if isinstance(r, Exception):
+                raise r
+            return r
+        w.llm_call = fake
+        self.assertEqual(w.run_task(RunTaskMgr(), agent(), "sys", {"id": "t", "title": "x", "input": "hi"}), "done")
+        self.assertIn("cut off", sent[-1][-1]["content"])
+
+        def always(*a):
+            raise w.ReplyTruncated("cut")
+        w.llm_call = always
+        mgr = RunTaskMgr()
+        self.assertEqual(w.run_task(mgr, agent(maxTurns=10), "sys", {"id": "t", "title": "x", "input": "hi"}), "failed")
+        self.assertIn("length limit", mgr.finished[-1][2])
+
     def test_text_calls_win_and_plain_answers_stay(self):
         text = self.reply({"content": '```json\n{"tool":"read_file","path":"a"}\n```',
                            "tool_calls": [{"function": {"name": "shell", "arguments": {"command": "ls"}}}]})

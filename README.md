@@ -186,7 +186,10 @@ their own, at pinned versions (build args at the top of the file):
 Every download is verified with a SHA-256 checksum (a build arg next to its
 version, so a bump changes both), and the CLIs' own update checks are off in
 the image, so a pinned version is what actually runs. The build picks the
-assets for the host architecture: amd64 and arm64 are supported.
+assets for the host architecture: amd64 and arm64 are supported. Mistral
+Vibe lives in its own virtual environment (`/opt/vibe`, its commands linked
+onto `PATH`), so its dependencies stay out of the system Python that the
+worker and the agents' shell use.
 
 The build is multi-stage: every download happens in a build stage (codex,
 gh/glab, Go, npm, pip), so the caches and the leftovers never reach the final

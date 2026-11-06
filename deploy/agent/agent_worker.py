@@ -59,19 +59,21 @@ def normalize_repo(r):
 
 
 SYSTEM_CA = "/etc/ssl/certs/ca-certificates.crt"
+CA_BUNDLE = "/tmp/doppio-ca-bundle.pem"  # the live bundle of a running worker
 _ssl_ctx = None
 
 
-def setup_extra_ca():
+def setup_extra_ca(bundle=CA_BUNDLE):
     """Trust the extra CAs the manager mounted (DOPPIO_EXTRA_CA) on top of the
     system ones, for this worker and for the commands its shell tool runs
     (git, curl, python requests...). NODE_EXTRA_CA_CERTS covers the Node-based
-    CLIs (claude, qwen) and npm, which ignore SSL_CERT_FILE."""
+    CLIs (claude, qwen) and npm, which ignore SSL_CERT_FILE. bundle is where
+    the combined file goes; tests pass their own path, so running the suite
+    inside an agent never touches the live one."""
     global _ssl_ctx
     extra = os.environ.get("DOPPIO_EXTRA_CA")
     if not extra:
         return
-    bundle = "/tmp/doppio-ca-bundle.pem"
     with open(bundle, "w") as out:
         if os.path.exists(SYSTEM_CA):
             with open(SYSTEM_CA) as f:

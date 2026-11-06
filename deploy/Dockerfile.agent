@@ -89,11 +89,16 @@ RUN tar -C /usr/local -xzf /tmp/go-${TARGETARCH}.tar.gz \
  && rm -f /tmp/go-*.tar.gz
 
 # --- vibe (Mistral Vibe) ----------------------------------------------------
-# A Python package, installed against the same Python as the final image. pip
-# picks the wheel for the architecture on its own.
+# A Python package, installed in its own virtual environment (/opt/vibe) so
+# its ~70 dependencies stay out of the system Python the worker and the
+# agents' shell use: an agent's `pip install` can't break vibe, and vibe can't
+# shadow what an agent installs. The venv points at /usr/local/bin/python3.14,
+# which the final image has too. pip picks the wheel for the architecture.
 FROM python:3.14-slim AS vibe-cli
 ARG VIBE_VERSION=3.0.4
-RUN pip install --no-cache-dir mistral-vibe==${VIBE_VERSION}
+RUN python3 -m venv /opt/vibe \
+ && /opt/vibe/bin/pip install --no-cache-dir mistral-vibe==${VIBE_VERSION} \
+ && /opt/vibe/bin/pip uninstall -y pip
 
 # --- Final image -----------------------------------------------------------
 FROM python:3.14-slim
@@ -111,13 +116,13 @@ COPY --from=git-host-clis /usr/local/bin/glab /usr/local/bin/glab
 # The Go toolchain (agents run `go test ./...` on a checkout).
 COPY --from=go-toolchain /usr/local/go /usr/local/go
 ENV PATH=/usr/local/go/bin:$PATH
-# codex and vibe (all three vibe entry points: the launcher points the Rust
-# CLI at the vibe-app-server script next to itself).
+# codex, and vibe's venv with its three entry points linked onto PATH (the
+# launcher points the Rust CLI at the vibe-app-server script next to itself,
+# which the venv's bin has). Only the entry points are linked: the venv's own
+# python stays off PATH.
 COPY --from=codex-cli /usr/local/bin/codex /usr/local/bin/codex
-COPY --from=vibe-cli /usr/local/bin/vibe* /usr/local/bin/
-# vibe's Python package and its dependencies: the entry points above import
-# them (same Python 3.14 as this stage, so the path matches).
-COPY --from=vibe-cli /usr/local/lib/python3.14/site-packages /usr/local/lib/python3.14/site-packages
+COPY --from=vibe-cli /opt/vibe /opt/vibe
+RUN for f in /opt/vibe/bin/vibe*; do ln -s "$f" /usr/local/bin/; done
 # No self-updates. Containers run as root (HOME=/root), so each CLI reads its
 # own home config; qwen's system-wide file lives in /etc and wins over any
 # user settings.

@@ -188,11 +188,12 @@ version, so a bump changes both), and the CLIs' own update checks are off in
 the image, so a pinned version is what actually runs. The build picks the
 assets for the host architecture: amd64 and arm64 are supported.
 
-The build is multi-stage: npm and pip caches and the download leftovers stay
-in the build stages, so the final image is about **2 GB** (unpacked), dominated
-by the CLIs themselves (Claude Code ~340 MB, codex ~320 MB, Mistral Vibe
-~400 MB, Qwen Code ~120 MB) and the Go toolchain (~250 MB). CI prints the real
-size (`docker image ls doppio-agent:ci`) on every build.
+The build is multi-stage: every download happens in a build stage (codex,
+gh/glab, Go, npm, pip), so the caches and the leftovers never reach the final
+image, which is **2.67 GB** on disk. It is dominated by the CLIs themselves
+(Claude Code ~340 MB, codex ~320 MB, Mistral Vibe ~400 MB, Qwen Code
+~120 MB) and the Go toolchain (~250 MB). CI prints the real size
+(`docker image ls doppio-agent:ci`) on every build.
 
 ## Contributing
 

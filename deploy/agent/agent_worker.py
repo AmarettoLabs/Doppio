@@ -416,6 +416,7 @@ def _tag(data, repo):
 
 
 TRIGGERS = ("review_requests", "mentions", "assigned_issues", "assigned_prs")
+ASSIGNED_TRIGGERS = ("assigned_issues", "assigned_prs")
 
 # Task kind recorded for each trigger (assigned issues and PRs are told apart
 # by the task source, e.g. "github:o/r#issues:3" vs "...#pull_requests:4").
@@ -848,6 +849,12 @@ def check_git_items(mgr, agent, state, state_path, now):
         mgr.emit("log", f"baseline recorded: {n} existing item(s) will not be answered")
         return
     seen = set()
+    # Assigned work goes first. An owner's mention on an item the owner
+    # assigned to the agent is feedback on that work: the assigned task (keyed
+    # by the owner's latest feedback, the mention included) handles it, and
+    # an answer-only mention task must not take its place.
+    items.sort(key=lambda it: it.get("_trigger") not in ASSIGNED_TRIGGERS)
+    assigned = set()  # items whose owner-assigned work is queued or done
     for it in items:
         repo, trigger = it["_repo"], it["_trigger"]
         try:
@@ -858,7 +865,14 @@ def check_git_items(mgr, agent, state, state_path, now):
             continue
         base = item_ref(agent, repo, it)
         if ref in handled or (ref == base + "@assigned" and base in handled):
+            if trigger in ASSIGNED_TRIGGERS:
+                assigned.add(base)
             continue  # (the second test: handled before assigned work was keyed by feedback)
+        if trigger == "mentions" and base in assigned:
+            # Covered by the assigned task; marked handled so the mention
+            # isn't answered later if the agent is unassigned.
+            handled.add(ref)
+            continue
         if trigger == "mentions" and base in handled and not state.get("mentions_keyed_by_time"):
             # Handled when mentions were keyed by item only: count the
             # current mention as handled, later ones are new work.
@@ -885,6 +899,8 @@ def check_git_items(mgr, agent, state, state_path, now):
             title = f"[{trigger.replace('_', ' ')}] {item_title(it) or ref} ({repo})"
             mgr.create_task(kind, title, render_task_input(agent, repo, it), ref)
             mgr.emit("action", f"new work picked up: {ref}")
+            if trigger in ASSIGNED_TRIGGERS:
+                assigned.add(base)
         except Exception as e:
             mgr.emit("error", f"could not create task for {ref}: {e}")
     state["handled"] = sorted(handled)

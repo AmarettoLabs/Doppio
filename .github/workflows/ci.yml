@@ -53,6 +53,8 @@ jobs:
       - uses: actions/checkout@v4
       - run: docker build -f deploy/Dockerfile.agent -t doppio-agent:ci .
       - run: docker build -f deploy/Dockerfile.manager -t doppio-manager:ci .
+      # The real size, for the README's "Agent image" section.
+      - run: docker image ls doppio-agent:ci
       # Every CLI and toolchain the image ships must answer --version. The
       # image's entrypoint is the worker, so override it with a shell.
       - run: >

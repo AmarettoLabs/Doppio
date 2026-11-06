@@ -183,10 +183,16 @@ their own, at pinned versions (build args at the top of the file):
 | `go` | Running `go test ./...` on a checkout (the version `go.mod` builds with). |
 | `node` + `npm` | Running `npm ci` and `npm run check` in `web/` (Node 22, as in CI and `Dockerfile.manager`). |
 
+Every download is verified with a SHA-256 checksum (a build arg next to its
+version, so a bump changes both), and the CLIs' own update checks are off in
+the image, so a pinned version is what actually runs. The build picks the
+assets for the host architecture: amd64 and arm64 are supported.
+
 The build is multi-stage: npm and pip caches and the download leftovers stay
 in the build stages, so the final image is about **2 GB** (unpacked), dominated
 by the CLIs themselves (Claude Code ~340 MB, codex ~320 MB, Mistral Vibe
-~400 MB, Qwen Code ~120 MB) and the Go toolchain (~250 MB).
+~400 MB, Qwen Code ~120 MB) and the Go toolchain (~250 MB). CI prints the real
+size (`docker image ls doppio-agent:ci`) on every build.
 
 ## Contributing
 

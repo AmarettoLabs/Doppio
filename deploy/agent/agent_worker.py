@@ -155,17 +155,43 @@ class Manager:
             log("set_poll failed:", e)
 
 
+# Cap on one reply, unless the agent sets maxReplyTokens. Without one, a
+# model that starts repeating itself keeps generating until the context is
+# full; a local server keeps going after we time out (an hour of blocked GPU
+# once). Hosted APIs stop when we give up, and reasoning models count their
+# thinking in the cap, so they get more room. Keep in sync with
+# model.HostedMaxReplyTokens / LocalMaxReplyTokens.
+HOSTED_MAX_REPLY_TOKENS = 32768
+LOCAL_MAX_REPLY_TOKENS = 8192
+LLM_TIMEOUT = 300
+
+
+def reply_token_cap(agent):
+    if (agent.get("maxReplyTokens") or 0) > 0:
+        return agent["maxReplyTokens"]
+    default = DEFAULT_BASE.get(agent.get("provider"))
+    base = (agent.get("apiBase") or "").strip().rstrip("/")
+    hosted = default is not None and base in ("", default.rstrip("/"))
+    return HOSTED_MAX_REPLY_TOKENS if hosted else LOCAL_MAX_REPLY_TOKENS
+
+
+class ReplyTruncated(Exception):
+    """The reply hit the agent's reply cap: usually a model looping."""
+
+
 def llm_call(agent, system, messages):
-    """One chat call to the agent's provider. Returns the assistant text."""
+    """One chat call to the agent's provider. Returns the assistant text;
+    raises ReplyTruncated when the reply was cut off at the length cap."""
     provider = agent["provider"]
     model = agent["model"]
     key = agent.get("apiToken") or ""
     base = (agent.get("apiBase") or DEFAULT_BASE.get(provider, "")).rstrip("/")
+    cap = reply_token_cap(agent)
     if provider == "anthropic":
         url = base + "/v1/messages"
         body = {
             "model": model,
-            "max_tokens": 4096,
+            "max_tokens": cap,
             "system": system,
             "messages": [{"role": m["role"], "content": m["content"]} for m in messages],
         }
@@ -181,10 +207,17 @@ def llm_call(agent, system, messages):
             "messages": [{"role": "system", "content": system}]
             + [{"role": m["role"], "content": m["content"]} for m in messages],
         }
+        # OpenAI's newer models reject max_tokens; others (Mistral, vLLM, ...)
+        # all take it.
+        body["max_completion_tokens" if provider == "openai" else "max_tokens"] = cap
         headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
-    out = http_json("POST", url, headers, body, timeout=180)
+    out = http_json("POST", url, headers, body, timeout=LLM_TIMEOUT)
     if provider == "anthropic":
+        if out.get("stop_reason") == "max_tokens":
+            raise ReplyTruncated(f"reply cut off at {cap} tokens")
         return "".join(b.get("text", "") for b in out.get("content", []) if b.get("type") == "text")
+    if out["choices"][0].get("finish_reason") == "length":
+        raise ReplyTruncated(f"reply cut off at {cap} tokens")
     message = out["choices"][0]["message"]
     content = message.get("content")
     if isinstance(content, list):  # some servers return content blocks
@@ -1214,7 +1247,20 @@ def doppio_engine(run):
         turn += 1
         if run.max_turns is not None and turn > run.max_turns:
             return EngineResult("failed", error=f"max turns ({run.max_turns}) reached")
-        reply = llm_call(run.agent, run.system, messages)
+        try:
+            reply = llm_call(run.agent, run.system, messages)
+        except ReplyTruncated as e:
+            # Don't post or resend the cut-off text: it's usually a loop.
+            run.emit("log", f"{e}; asking for a shorter reply")
+            bad_json += 1
+            if bad_json >= 3:
+                return EngineResult("failed", error=f"3 replies in a row hit the length limit ({reply_token_cap(run.agent)} "
+                                                    "tokens); the model may be looping, or needs a higher max reply tokens")
+            messages.append({"role": "assistant", "content": "(reply cut off: too long)"})
+            messages.append({"role": "user", "content":
+                             "Your last reply was cut off because it was too long, and was discarded. "
+                             "Reply again, shorter: one tool call, or a concise final answer."})
+            continue
         run.emit("assistant", reply)
         call = parse_tool_call(reply)
         if call is None and reply.strip():

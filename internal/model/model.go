@@ -1,7 +1,10 @@
 // Package model defines the domain types of Doppio.
 package model
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // LLMProvider is a supported model company.
 type LLMProvider string
@@ -120,6 +123,9 @@ type Agent struct {
 	Engine Engine `json:"engine,omitempty"`
 	// TaskMinutes caps one task's run time; 0 means DefaultTaskMinutes.
 	TaskMinutes int `json:"taskMinutes,omitempty"`
+	// MaxReplyTokens caps one model reply; 0 means the default for the
+	// agent's server (see DefaultMaxReplyTokens).
+	MaxReplyTokens int `json:"maxReplyTokens,omitempty"`
 
 	Status string `json:"status"` // created, running, stopped, error
 	// RestartPending: the agent's settings were saved while it was busy; its
@@ -150,6 +156,43 @@ func (a *Agent) EffectiveTaskMinutes() int {
 		return DefaultTaskMinutes
 	}
 	return a.TaskMinutes
+}
+
+// Reply caps. Hosted APIs stop generating when the client gives up, and
+// reasoning models count their thinking in the cap, so they get room. A
+// local server keeps generating a looping reply after a timeout and blocks
+// the GPU meanwhile, so it gets a tighter cap.
+const (
+	HostedMaxReplyTokens = 32768
+	LocalMaxReplyTokens  = 8192
+)
+
+// HostedAPI reports whether the agent talks to its provider's own API
+// rather than a custom or local server.
+func (a *Agent) HostedAPI() bool {
+	for _, p := range Providers() {
+		if p.ID == string(a.Provider) {
+			base := strings.TrimRight(strings.TrimSpace(a.APIBase), "/")
+			return base == "" || base == strings.TrimRight(p.APIBase, "/")
+		}
+	}
+	return false
+}
+
+// DefaultMaxReplyTokens is the reply cap used when the agent sets none.
+func (a *Agent) DefaultMaxReplyTokens() int {
+	if a.HostedAPI() {
+		return HostedMaxReplyTokens
+	}
+	return LocalMaxReplyTokens
+}
+
+// EffectiveMaxReplyTokens returns the agent's reply cap.
+func (a *Agent) EffectiveMaxReplyTokens() int {
+	if a.MaxReplyTokens > 0 {
+		return a.MaxReplyTokens
+	}
+	return a.DefaultMaxReplyTokens()
 }
 
 // EffectiveTriggers returns the agent's triggers, all of them when unset.

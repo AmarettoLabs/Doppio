@@ -106,3 +106,42 @@ func TestAgentEngine(t *testing.T) {
 		t.Fatalf("providers: %s", rec.Body)
 	}
 }
+
+func TestMaxReplyTokens(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	h := srv.Handler()
+	create := func(extra string) AgentView {
+		t.Helper()
+		rec := do(h, "POST", "/api/agents", "", agentJSON(`"ownerLogin":"me"`+extra))
+		var v AgentView
+		if rec.Code != http.StatusCreated || json.Unmarshal(rec.Body.Bytes(), &v) != nil {
+			t.Fatalf("create %s: %d %s", extra, rec.Code, rec.Body)
+		}
+		return v
+	}
+	for extra, want := range map[string]int{
+		``: 32768, // openai, its own API
+		`,"apiBase":"https://api.openai.com/v1/"`: 32768,
+		`,"apiBase":"https://llm-server:8443/v1"`: 8192,
+		`,"provider":"custom"`:                    8192,
+	} {
+		if v := create(extra); v.DefaultMaxReplyTokens != want || v.MaxReplyTokens != 0 {
+			t.Errorf("%s: default %d (want %d), set %d", extra, v.DefaultMaxReplyTokens, want, v.MaxReplyTokens)
+		}
+	}
+	v := create(`,"maxReplyTokens":16000`)
+	if v.MaxReplyTokens != 16000 {
+		t.Fatalf("set: %d", v.MaxReplyTokens)
+	}
+	for _, bad := range []string{`,"maxReplyTokens":-5`, `,"maxReplyTokens":100`} {
+		if rec := do(h, "POST", "/api/agents", "", agentJSON(`"ownerLogin":"me"`+bad)); rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: got %d", bad, rec.Code)
+		}
+	}
+	// 0 on update goes back to the default.
+	rec := do(h, "PATCH", "/api/agents/"+v.ID, "", agentJSON(`"ownerLogin":"me","maxReplyTokens":0`))
+	_ = json.Unmarshal(rec.Body.Bytes(), &v)
+	if v.MaxReplyTokens != 0 {
+		t.Fatalf("reset: %d", v.MaxReplyTokens)
+	}
+}

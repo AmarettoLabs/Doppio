@@ -154,6 +154,7 @@
 					<span class="muted">git not configured</span>
 				{/if}
 			</dd>
+			<dt>Max reply tokens</dt><dd>{agent.maxReplyTokens || `${agent.defaultMaxReplyTokens} (default)`}</dd>
 			<dt>Max turns</dt><dd>{agent.maxTurns === -1 ? 'unlimited (context limit)' : agent.maxTurns}</dd>
 			<dt>Persona</dt><dd class="muted">{agent.persona.slice(0, 300)}{agent.persona.length > 300 ? '…' : ''}</dd>
 			<dt>Task</dt><dd class="muted">{agent.task.slice(0, 300)}{agent.task.length > 300 ? '…' : ''}</dd>

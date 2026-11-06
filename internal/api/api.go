@@ -122,32 +122,36 @@ func decode(w http.ResponseWriter, r *http.Request, v any) bool {
 // AgentView is the agent as exposed to the UI: secrets are never sent, only
 // whether they are set.
 type AgentView struct {
-	ID          string     `json:"id"`
-	Name        string     `json:"name"`
-	Persona     string     `json:"persona"`
-	Task        string     `json:"task"`
-	Provider    string     `json:"provider"`
-	Model       string     `json:"model"`
-	APIBase     string     `json:"apiBase,omitempty"`
-	HasAPIToken bool       `json:"hasApiToken"`
-	Emails      []string   `json:"emails"`
-	GitProvider string     `json:"gitProvider,omitempty"`
-	GitBaseURL  string     `json:"gitBaseURL,omitempty"`
-	HasGitToken bool       `json:"hasGitToken"`
-	GitLogin    string     `json:"gitLogin,omitempty"`
-	GitRepos    []string   `json:"gitRepos"`
-	OwnerLogin  string     `json:"ownerLogin,omitempty"`
-	PeerLogins  []string   `json:"peerLogins"`
-	Triggers    []string   `json:"triggers"`
-	PollSeconds int        `json:"pollSeconds"`
-	MaxTurns    int        `json:"maxTurns"`
-	Engine      string     `json:"engine"`
-	TaskMinutes int        `json:"taskMinutes"`
-	Status      string     `json:"status"`
-	ContainerID string     `json:"containerId,omitempty"`
-	Error       string     `json:"error,omitempty"`
-	LastPollAt  *time.Time `json:"lastPollAt,omitempty"`
-	NextPollAt  *time.Time `json:"nextPollAt,omitempty"`
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Persona     string   `json:"persona"`
+	Task        string   `json:"task"`
+	Provider    string   `json:"provider"`
+	Model       string   `json:"model"`
+	APIBase     string   `json:"apiBase,omitempty"`
+	HasAPIToken bool     `json:"hasApiToken"`
+	Emails      []string `json:"emails"`
+	GitProvider string   `json:"gitProvider,omitempty"`
+	GitBaseURL  string   `json:"gitBaseURL,omitempty"`
+	HasGitToken bool     `json:"hasGitToken"`
+	GitLogin    string   `json:"gitLogin,omitempty"`
+	GitRepos    []string `json:"gitRepos"`
+	OwnerLogin  string   `json:"ownerLogin,omitempty"`
+	PeerLogins  []string `json:"peerLogins"`
+	Triggers    []string `json:"triggers"`
+	PollSeconds int      `json:"pollSeconds"`
+	MaxTurns    int      `json:"maxTurns"`
+	Engine      string   `json:"engine"`
+	TaskMinutes int      `json:"taskMinutes"`
+	// MaxReplyTokens: 0 = the default for the agent's server, which
+	// DefaultMaxReplyTokens gives.
+	MaxReplyTokens        int        `json:"maxReplyTokens"`
+	DefaultMaxReplyTokens int        `json:"defaultMaxReplyTokens"`
+	Status                string     `json:"status"`
+	ContainerID           string     `json:"containerId,omitempty"`
+	Error                 string     `json:"error,omitempty"`
+	LastPollAt            *time.Time `json:"lastPollAt,omitempty"`
+	NextPollAt            *time.Time `json:"nextPollAt,omitempty"`
 	// Working is true while one of the agent's tasks is running or pending.
 	// Only set by the list/get endpoints.
 	Working bool `json:"working"`
@@ -168,6 +172,7 @@ func toView(a *model.Agent) AgentView {
 		PollSeconds: a.PollSeconds,
 		MaxTurns:    maxTurnsOrDefault(a.MaxTurns),
 		Engine:      string(a.EffectiveEngine()), TaskMinutes: a.EffectiveTaskMinutes(),
+		MaxReplyTokens: a.MaxReplyTokens, DefaultMaxReplyTokens: a.DefaultMaxReplyTokens(),
 		Status: a.Status, ContainerID: a.ContainerID, Error: a.Error,
 		LastPollAt: a.LastPollAt, NextPollAt: a.NextPollAt,
 		RestartPending: a.RestartPending,
@@ -201,6 +206,8 @@ type agentInput struct {
 	Engine string `json:"engine"`
 	// TaskMinutes: 0 keeps the stored limit on update (default on create).
 	TaskMinutes int `json:"taskMinutes"`
+	// MaxReplyTokens: 0 = the default for the agent's server.
+	MaxReplyTokens int `json:"maxReplyTokens"`
 }
 
 func triggerStrings(ts []model.Trigger) []string {
@@ -340,6 +347,9 @@ func (in *agentInput) validate() string {
 			return info.Label + " is not available yet"
 		}
 	}
+	if in.MaxReplyTokens != 0 && (in.MaxReplyTokens < 256 || in.MaxReplyTokens > 1_000_000) {
+		return "maxReplyTokens must be between 256 and 1000000 (0 = default for the server)"
+	}
 	if in.TaskMinutes < 0 || in.TaskMinutes > 24*60 {
 		return "taskMinutes must be between 1 and 1440 (0 = default)"
 	}
@@ -463,30 +473,31 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 	normalizeAgentInput(&in)
 	now := time.Now().UTC()
 	a := &model.Agent{
-		ID:          newAgentID(),
-		Name:        strings.TrimSpace(in.Name),
-		Persona:     in.Persona,
-		Task:        in.Task,
-		Provider:    model.LLMProvider(in.Provider),
-		Model:       strings.TrimSpace(in.Model),
-		APIBase:     strings.TrimSpace(in.APIBase),
-		APIToken:    in.APIToken,
-		Emails:      cleanList(in.Emails),
-		GitProvider: model.GitProvider(orDefault(in.GitProvider, string(model.GitNone))),
-		GitBaseURL:  strings.TrimSpace(in.GitBaseURL),
-		GitToken:    in.GitToken,
-		GitLogin:    strings.TrimSpace(in.GitLogin),
-		GitRepos:    cleanList(in.GitRepos),
-		OwnerLogin:  strings.TrimSpace(in.OwnerLogin),
-		PeerLogins:  cleanList(in.PeerLogins),
-		Triggers:    parseTriggers(in.Triggers),
-		PollSeconds: in.PollSeconds,
-		MaxTurns:    in.MaxTurns,
-		Engine:      model.Engine(orDefault(in.Engine, string(model.EngineDoppio))),
-		TaskMinutes: in.TaskMinutes,
-		Status:      "created",
-		CreatedAt:   now,
-		UpdatedAt:   now,
+		ID:             newAgentID(),
+		Name:           strings.TrimSpace(in.Name),
+		Persona:        in.Persona,
+		Task:           in.Task,
+		Provider:       model.LLMProvider(in.Provider),
+		Model:          strings.TrimSpace(in.Model),
+		APIBase:        strings.TrimSpace(in.APIBase),
+		APIToken:       in.APIToken,
+		Emails:         cleanList(in.Emails),
+		GitProvider:    model.GitProvider(orDefault(in.GitProvider, string(model.GitNone))),
+		GitBaseURL:     strings.TrimSpace(in.GitBaseURL),
+		GitToken:       in.GitToken,
+		GitLogin:       strings.TrimSpace(in.GitLogin),
+		GitRepos:       cleanList(in.GitRepos),
+		OwnerLogin:     strings.TrimSpace(in.OwnerLogin),
+		PeerLogins:     cleanList(in.PeerLogins),
+		Triggers:       parseTriggers(in.Triggers),
+		PollSeconds:    in.PollSeconds,
+		MaxTurns:       in.MaxTurns,
+		Engine:         model.Engine(orDefault(in.Engine, string(model.EngineDoppio))),
+		TaskMinutes:    in.TaskMinutes,
+		MaxReplyTokens: in.MaxReplyTokens,
+		Status:         "created",
+		CreatedAt:      now,
+		UpdatedAt:      now,
 	}
 	if err := s.store.UpsertAgent(a); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
@@ -544,6 +555,7 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	if in.TaskMinutes != 0 {
 		a.TaskMinutes = in.TaskMinutes
 	}
+	a.MaxReplyTokens = in.MaxReplyTokens
 	a.UpdatedAt = time.Now().UTC()
 	if err := s.store.UpsertAgent(a); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())

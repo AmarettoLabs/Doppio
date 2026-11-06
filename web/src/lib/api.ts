@@ -28,6 +28,8 @@ export interface AgentView {
 	restartPending: boolean;
 	engine: string;
 	taskMinutes: number;
+	maxReplyTokens: number;
+	defaultMaxReplyTokens: number;
 	createdAt: string;
 	updatedAt: string;
 }
@@ -53,7 +55,13 @@ export interface AgentPayload {
 	maxTurns: number;
 	engine: string;
 	taskMinutes: number;
+	/** 0 = the default for the agent's server */
+	maxReplyTokens: number;
 }
+
+/** Reply caps when an agent sets none (keep in sync with the Go model). */
+export const HOSTED_MAX_REPLY_TOKENS = 32768;
+export const LOCAL_MAX_REPLY_TOKENS = 8192;
 
 /** An engine that runs an agent's tasks; unavailable ones are listed but can't be picked yet. */
 export interface EngineInfo {

@@ -96,6 +96,16 @@ def http_json(method, url, headers, body=None, timeout=30):
     return json.loads(raw) if raw else None
 
 
+def looks_like_no_tool_support(msg):
+    """Whether an API error means the server cannot handle tool definitions
+    (unknown field, unsupported parameter, not implemented...)."""
+    low = (msg or "").lower()
+    return any(k in low for k in (
+        "tool", "function", "tools is not supported", "not supported",
+        "extra_forbidden", "unrecognized request argument",
+    ))
+
+
 class Manager:
     """Client for the manager's internal API."""
 
@@ -179,22 +189,142 @@ class ReplyTruncated(Exception):
     """The reply hit the agent's reply cap: usually a model looping."""
 
 
-def llm_call(agent, system, messages):
-    """One chat call to the agent's provider. Returns the assistant text;
-    raises ReplyTruncated when the reply was cut off at the length cap."""
+class NoToolSupport(Exception):
+    """The server rejected the tool definitions or cannot return structured
+    tool calls; the caller should fall back to the text format."""
+
+
+class Reply:
+    """One assistant reply: its text and its tool calls as (id, name, args)
+    in order. A reply without tool calls is a final answer."""
+
+    def __init__(self, text="", calls=None):
+        self.text = text
+        self.calls = calls or []  # [(id, name, args)]
+
+    def __repr__(self):
+        return f"Reply({self.text[:40]!r}, {[(n, a) for _, n, a in self.calls]!r})"
+
+    @classmethod
+    def from_openai(cls, out):
+        """Parse a chat-completions reply."""
+        message = (out.get("choices") or [{}])[0].get("message") or {}
+        content = message.get("content")
+        if isinstance(content, list):  # some servers return content blocks
+            content = "".join(b.get("text", "") for b in content if isinstance(b, dict))
+        calls = []
+        for i, tc in enumerate(message.get("tool_calls") or []):
+            fn = (tc or {}).get("function") or {}
+            args = fn.get("arguments") or {}
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args) if args.strip() else {}
+                except json.JSONDecodeError:
+                    args = None
+            if fn.get("name") and isinstance(args, dict):
+                calls.append((tc.get("id") or f"call_{i}", fn["name"], dict(args)))
+        return cls(content or "", calls)
+
+    @classmethod
+    def from_anthropic(cls, out):
+        """Parse an Anthropic messages reply."""
+        text, calls = [], []
+        for i, b in enumerate(out.get("content") or []):
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "text":
+                text.append(b.get("text", ""))
+            elif b.get("type") == "tool_use":
+                calls.append((b.get("id") or f"call_{i}", b.get("name"), dict(b.get("input") or {})))
+        return cls("".join(text), calls)
+
+    def to_openai(self):
+        """The reply as assistant message(s) for the next request."""
+        msg = {"role": "assistant", "content": self.text or None}
+        if self.calls:
+            msg["tool_calls"] = [
+                {"id": cid, "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}
+                for cid, name, args in self.calls]
+        return [msg]
+
+    def to_anthropic(self):
+        """The reply as assistant message(s) for the next request."""
+        blocks = [{"type": "text", "text": self.text}] if self.text else []
+        blocks += [{"type": "tool_use", "id": cid, "name": name, "input": args}
+                   for cid, name, args in self.calls]
+        return [{"role": "assistant", "content": blocks}]
+
+
+class ToolResults:
+    """The outcomes of one reply's tool calls, sent back to the model in the
+    next request. OpenAI wants one tool message per call; Anthropic wants
+    them all in one user message."""
+
+    def __init__(self, results):
+        self.results = results  # [(call_id, output)]
+
+    def to_openai(self):
+        return [{"role": "tool", "tool_call_id": cid, "content": out} for cid, out in self.results]
+
+    def to_anthropic(self):
+        return [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": cid, "content": out} for cid, out in self.results]}]
+
+
+class UserMessage:
+    """A plain user message: the task prompt or a nudge."""
+
+    def __init__(self, content):
+        self.content = content
+
+    def to_openai(self):
+        return [{"role": "user", "content": self.content}]
+
+    def to_anthropic(self):
+        return [{"role": "user", "content": self.content}]
+
+
+def openai_tools():
+    """The Doppio tools as OpenAI tool definitions."""
+    return [{"type": "function", "function": spec} for spec in TOOL_DEFS.values()]
+
+
+def anthropic_tools():
+    """The Doppio tools as Anthropic tool definitions."""
+    return [{"name": spec["name"], "description": spec["description"],
+             "input_schema": spec["parameters"]} for spec in TOOL_DEFS.values()]
+
+
+def tool_spec(agent, native):
+    """The tool instructions that go with the system prompt: the provider's
+    built-in tool calling, or tool calls as JSON in the reply."""
+    repos = ", ".join(normalize_repo(r) for r in (agent.get("gitRepos") or [])) or "(none configured)"
+    if native:
+        return TOOL_SPEC_NATIVE
+    return TOOL_SPEC.replace("{repos}", repos)
+
+
+def llm_call(agent, system, messages, tools=False):
+    """One chat call to the agent's provider. Returns the assistant reply as
+    a Reply; raises ReplyTruncated when it was cut off at the reply cap, and
+    NoToolSupport when the server rejects the tool definitions. tools=False
+    sends no tool definitions (the text format)."""
     provider = agent["provider"]
     model = agent["model"]
     key = agent.get("apiToken") or ""
     base = (agent.get("apiBase") or DEFAULT_BASE.get(provider, "")).rstrip("/")
     cap = reply_token_cap(agent)
+    spec = tool_spec(agent, tools)
     if provider == "anthropic":
         url = base + "/v1/messages"
         body = {
             "model": model,
             "max_tokens": cap,
-            "system": system,
-            "messages": [{"role": m["role"], "content": m["content"]} for m in messages],
+            "system": system + spec,
+            "messages": [b for m in messages for b in m.to_anthropic()],
         }
+        if tools:
+            body["tools"] = anthropic_tools()
         headers = {
             "x-api-key": key,
             "anthropic-version": "2023-06-01",
@@ -204,47 +334,28 @@ def llm_call(agent, system, messages):
         url = base + "/chat/completions"
         body = {
             "model": model,
-            "messages": [{"role": "system", "content": system}]
-            + [{"role": m["role"], "content": m["content"]} for m in messages],
+            "messages": [{"role": "system", "content": system + spec}]
+            + [b for m in messages for b in m.to_openai()],
         }
+        if tools:
+            body["tools"] = openai_tools()
         # OpenAI's newer models reject max_tokens; others (Mistral, vLLM, ...)
         # all take it.
         body["max_completion_tokens" if provider == "openai" else "max_tokens"] = cap
         headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
-    out = http_json("POST", url, headers, body, timeout=LLM_TIMEOUT)
+    try:
+        out = http_json("POST", url, headers, body, timeout=LLM_TIMEOUT)
+    except RuntimeError as e:
+        if tools and looks_like_no_tool_support(str(e)):
+            raise NoToolSupport(str(e)) from e
+        raise
     if provider == "anthropic":
         if out.get("stop_reason") == "max_tokens":
             raise ReplyTruncated(f"reply cut off at {cap} tokens")
-        return "".join(b.get("text", "") for b in out.get("content", []) if b.get("type") == "text")
+        return Reply.from_anthropic(out)
     if out["choices"][0].get("finish_reason") == "length":
         raise ReplyTruncated(f"reply cut off at {cap} tokens")
-    message = out["choices"][0]["message"]
-    content = message.get("content")
-    if isinstance(content, list):  # some servers return content blocks
-        content = "".join(b.get("text", "") for b in content if isinstance(b, dict))
-    content = content or ""
-    call = native_tool_call(message.get("tool_calls"))
-    if call and parse_tool_call(content) is None:
-        # Some models (seen with Mistral) answer with the API's built-in
-        # tool_calls even though no tools were declared. Turn the first one
-        # into the text format, so the conversation stays in one format.
-        content = (content.strip() + "\n\n" if content.strip() else "") + "```json\n" + json.dumps(call) + "\n```"
-    return content
-
-
-def native_tool_call(tool_calls):
-    """The first OpenAI-style tool call as {"tool": name, **args}, or None."""
-    for tc in tool_calls or []:
-        fn = (tc or {}).get("function") or {}
-        args = fn.get("arguments") or {}
-        if isinstance(args, str):
-            try:
-                args = json.loads(args) if args.strip() else {}
-            except json.JSONDecodeError:
-                continue
-        if fn.get("name") and isinstance(args, dict):
-            return {"tool": fn["name"], **args}
-    return None
+    return Reply.from_openai(out)
 
 
 # ---------- git providers ----------
@@ -989,15 +1100,81 @@ def prepare_task(agent, t):
 DEFAULT_MAX_TURNS = 25  # used when the agent has no maxTurns set; -1 = unlimited
 SHELL_TIMEOUT = 300
 
-TOOL_SPEC = """
-You can act with tools. Each turn, reply with EITHER:
+# The tools, with the descriptions the model sees. "parameters" is the JSON
+# Schema the providers take as tool definitions.
+TOOL_DEFS = {
+    "shell": {
+        "name": "shell",
+        "description": "Run a shell command in /agent/workspace (git is preconfigured with "
+                       "your credentials; for git tasks the repository is already cloned and "
+                       "checked out under repos/<name>, see the task — do NOT clone again).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "The command to run"},
+            },
+            "required": ["command"],
+        },
+    },
+    "read_file": {
+        "name": "read_file",
+        "description": "Read a file under /agent/workspace (lines optional; long files are shown in parts)",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path, relative to /agent/workspace"},
+                "start_line": {"type": "integer", "description": "First line to read (1-based)"},
+                "end_line": {"type": "integer", "description": "Last line to read (inclusive)"},
+            },
+            "required": ["path"],
+        },
+    },
+    "write_file": {
+        "name": "write_file",
+        "description": "Write a file under /agent/workspace",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path, relative to /agent/workspace"},
+                "content": {"type": "string", "description": "The full file content"},
+            },
+            "required": ["path", "content"],
+        },
+    },
+    "create_pr": {
+        "name": "create_pr",
+        "description": "Open a pull request (GitHub) or merge request (GitLab)",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "owner/repo"},
+                "head": {"type": "string", "description": "The branch with the change"},
+                "base": {"type": "string", "description": "The branch to merge into"},
+                "title": {"type": "string", "description": "PR title"},
+                "body": {"type": "string", "description": "PR description"},
+            },
+            "required": ["repo", "head", "base", "title", "body"],
+        },
+    },
+}
+
+
+TOOL_SPEC = """You can act with tools. Each turn, reply with EITHER:
 - a final plain-text answer (no JSON block), or
 - exactly one tool call in a ```json fenced block:
-  {"tool":"shell","command":"..."}                     run a shell command in /agent/workspace (git is preconfigured with your credentials; for git tasks the repository is already cloned and checked out under repos/<name>, see the task — do NOT clone again)
+  {"tool":"shell","command":"..."}                     run a shell command in /agent/workspace (git is preconfigured with your credentials; for git tasks the repository is already cloned and checked out under repos/<name>, see the task - do NOT clone again)
   {"tool":"read_file","path":"...","start_line":1,"end_line":400}   read a file under /agent/workspace (lines optional; long files are shown in parts)
   {"tool":"write_file","path":"...","content":"..."}   write a file under /agent/workspace
   {"tool":"create_pr","repo":"owner/repo","head":"your-branch","base":"main","title":"...","body":"..."}
 Rules: one tool call per turn, wait for its result, keep going until the work is done, then give a short plain-text summary. Work on your own branch; never push to main/master. Repos you watch: {repos}.
+"""
+
+
+TOOL_SPEC_NATIVE = """
+
+You can act with tools: call them, one or more per turn, and read their results
+in the next message. Keep going until the work is done, then give a short
+plain-text final answer. Work on your own branch; never push to main/master.
 """
 
 
@@ -1237,67 +1414,124 @@ def run_process(run, argv, stdin_text="", env=None, on_line=None):
     return code, "\n".join(err_tail)
 
 
+def tool_call_mode(agent):
+    """The agent's tool-call mode: "native" (the provider's built-in tool
+    calling), "text" (JSON tool calls in the reply) or "" = detect."""
+    return (agent.get("toolCallMode") or "").strip()
+
+
 def doppio_engine(run):
     """Doppio's own tool loop over the agent's model API."""
-    messages = [{"role": "user", "content": run.prompt}]
+    native = tool_call_mode(run.agent) != "text"
+    messages = [UserMessage(run.prompt)]
     turn = 0
-    bad_json = 0
+    bad = 0  # unusable replies in a row (empty, invalid, cut off)
+    textish = 0  # native replies whose text carries a JSON tool call
     while True:
         run.check_time()
         turn += 1
         if run.max_turns is not None and turn > run.max_turns:
             return EngineResult("failed", error=f"max turns ({run.max_turns}) reached")
         try:
-            reply = llm_call(run.agent, run.system, messages)
+            reply = llm_call(run.agent, run.system, messages, tools=native)
+        except NoToolSupport as e:
+            if not native or tool_call_mode(run.agent) == "native":
+                raise  # text mode, or native forced: no fallback
+            # The server rejects tool definitions: fall back to the text
+            # format for this agent.
+            native = False
+            run.emit("log", f"{e}; falling back to tool calls as JSON in the reply")
+            continue
         except ReplyTruncated as e:
             # Don't post or resend the cut-off text: it's usually a loop.
             run.emit("log", f"{e}; asking for a shorter reply")
-            bad_json += 1
-            if bad_json >= 3:
+            bad += 1
+            if bad >= 3:
                 return EngineResult("failed", error=f"3 replies in a row hit the length limit ({reply_token_cap(run.agent)} "
                                                     "tokens); the model may be looping, or needs a higher max reply tokens")
-            messages.append({"role": "assistant", "content": "(reply cut off: too long)"})
-            messages.append({"role": "user", "content":
-                             "Your last reply was cut off because it was too long, and was discarded. "
-                             "Reply again, shorter: one tool call, or a concise final answer."})
+            messages.append(UserMessage("Your last reply was cut off because it was too long, and was discarded. "
+                             "Reply again, shorter: one tool call, or a concise final answer."))
             continue
-        run.emit("assistant", reply)
-        call = parse_tool_call(reply)
-        if call is None and reply.strip():
-            return EngineResult("done", answer=reply)
+        run.emit("assistant", reply.text)
+        if native and not reply.calls:
+            # The server took the tool definitions but the model writes its
+            # tool calls as JSON in the reply text anyway: run them like the
+            # text format does, and switch to it if that keeps happening.
+            call = parse_tool_call(reply.text)
+            if call and call[0] != "__invalid__":
+                textish += 1
+                if textish >= 3 and tool_call_mode(run.agent) != "native":
+                    native = False
+                    run.emit("log", "the model keeps writing tool calls as JSON in its replies; "
+                                    "switching to the text format")
+                    messages.append(reply)
+                    messages.append(UserMessage("Your tool call was understood; keep answering in that format."))
+                    continue
+                name, args = call
+                run.emit("action", f"$ {name} {json.dumps(args)[:300]}")
+                try:
+                    result = execute_tool(run.agent, name, args)
+                except Exception as e:
+                    result = f"tool error: {type(e).__name__}: {e}"
+                run.emit("log", f"→ {result[:1500]}")
+                messages.append(reply)
+                messages.append(UserMessage("TOOL RESULT (" + name + "):\n" + result))
+                continue
+        if native:
+            if not reply.calls and not reply.text.strip():
+                # An empty reply is not a final answer: ask the model to answer.
+                bad += 1
+                if bad >= 3:
+                    return EngineResult("failed", error="model kept returning empty replies")
+                # Providers reject empty assistant messages: keep a placeholder.
+                messages.append(Reply("(empty reply)"))
+                messages.append(UserMessage("Your last reply was empty. Use the tools, or give your plain-text final answer."))
+                continue
+            if not reply.calls:
+                return EngineResult("done", answer=reply.text)
+            bad = 0
+            results = []
+            for cid, name, args in reply.calls:
+                run.emit("action", f"$ {name} {json.dumps(args)[:300]}")
+                try:
+                    out = execute_tool(run.agent, name, args)
+                except Exception as e:
+                    out = f"tool error: {type(e).__name__}: {e}"
+                run.emit("log", f"→ {out[:1500]}")
+                results.append((cid, out))
+            messages.append(reply)
+            messages.append(ToolResults(results))
+            continue
+        # Text format: one JSON tool call in the reply, or a final answer.
+        call = parse_tool_call(reply.text)
+        if call is None and reply.text.strip():
+            return EngineResult("done", answer=reply.text)
         if call is None:
-            # An empty reply is not a final answer: ask the model to answer.
-            bad_json += 1
-            if bad_json >= 3:
+            bad += 1
+            if bad >= 3:
                 return EngineResult("failed", error="model kept returning empty replies")
-            # Providers reject empty assistant messages: keep a placeholder.
-            messages.append({"role": "assistant", "content": "(empty reply)"})
-            messages.append({"role": "user", "content":
-                             "Your last reply was empty. Call a tool, or give your plain-text final answer."})
+            messages.append(Reply("(empty reply)"))
+            messages.append(UserMessage("Your last reply was empty. Call a tool, or give your plain-text final answer."))
             continue
         name, args = call
         if name == "__invalid__":
-            # The model tried a tool call but the JSON was malformed: do not
-            # treat it as a final answer; ask for a retry.
-            bad_json += 1
-            if bad_json >= 3:
+            bad += 1
+            if bad >= 3:
                 return EngineResult("failed", error=f"3 invalid tool calls in a row: {args}")
-            messages.append({"role": "assistant", "content": reply})
-            messages.append({"role": "user", "content":
-                             f"Your tool call JSON was invalid ({args}). Reply with exactly one valid "
-                             "```json fenced tool call, or a plain-text final answer if done."})
+            messages.append(Reply(reply.text))
+            messages.append(UserMessage(
+                f"Your tool call JSON was invalid ({args}). Reply with exactly one valid "
+                "```json fenced tool call, or a plain-text final answer if done."))
             continue
-        bad_json = 0
+        bad = 0
         run.emit("action", f"$ {name} {json.dumps(args)[:300]}")
         try:
             result = execute_tool(run.agent, name, args)
         except Exception as e:
             result = f"tool error: {type(e).__name__}: {e}"
         run.emit("log", f"→ {result[:1500]}")
-        messages.append({"role": "assistant", "content": reply})
-        messages.append({"role": "user", "content": f"TOOL RESULT ({name}):\n{result}"})
-
-
+        messages.append(Reply(reply.text))
+        messages.append(UserMessage(f"TOOL RESULT ({name}):\n{result}"))
 ENGINES = {"doppio": doppio_engine}
 
 
@@ -1415,8 +1649,7 @@ def main():
         with open(state_path) as f:
             state = json.load(f)
     repos = ", ".join(normalize_repo(r) for r in (agent.get("gitRepos") or [])) or "(none configured)"
-    system = (agent["persona"] + "\n\nStanding task: " + (agent.get("task") or "")
-              + "\n\n" + TOOL_SPEC.replace("{repos}", repos))
+    system = agent["persona"] + "\n\nStanding task: " + (agent.get("task") or "")
     setup_git(agent)
     engine = agent.get("engine") or "doppio"
     via = f"{agent['provider']}/{agent['model']}" + ("" if engine == "doppio" else f" via {engine}")

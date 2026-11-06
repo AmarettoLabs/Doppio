@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { api, splitList, TRIGGERS, type AgentPayload, type AgentView, type EngineInfo, type GitProviderInfo, type ProviderInfo } from './api';
+	import { api, splitList, TRIGGERS, HOSTED_MAX_REPLY_TOKENS, LOCAL_MAX_REPLY_TOKENS, type AgentPayload, type AgentView, type EngineInfo, type GitProviderInfo, type ProviderInfo } from './api';
 
 	let {
 		initial = null,
@@ -35,6 +35,14 @@
 	let maxTurns = $state(initial?.maxTurns ?? 25);
 	let engine = $state(initial?.engine ?? 'doppio');
 	let taskMinutes = $state(initial?.taskMinutes ?? 30);
+	// Empty = the default for the server, shown as the placeholder.
+	let maxReplyTokens = $state<number | null>(initial?.maxReplyTokens || null);
+	const defaultReplyTokens = $derived.by(() => {
+		const p = providers.find((x) => x.id === provider);
+		const base = apiBase.trim().replace(/\/+$/, '');
+		const hosted = !!p && (base === '' || base === (p.apiBase ?? '').replace(/\/+$/, ''));
+		return hosted ? HOSTED_MAX_REPLY_TOKENS : LOCAL_MAX_REPLY_TOKENS;
+	});
 
 	let error = $state('');
 	let saving = $state(false);
@@ -86,7 +94,8 @@
 				pollSeconds: Number(pollSeconds) || 1800,
 				maxTurns: Number(maxTurns) || 25,
 				engine,
-				taskMinutes: Number(taskMinutes) || 30
+				taskMinutes: Number(taskMinutes) || 30,
+				maxReplyTokens: Number(maxReplyTokens) || 0
 			});
 		} catch (e) {
 			error = String(e instanceof Error ? e.message : e);
@@ -216,6 +225,11 @@
 	<div class="field">
 		<label for="f-turns">Max tool turns per task (-1 = unlimited, until the model's context limit)</label>
 		<input id="f-turns" type="number" min="-1" bind:value={maxTurns} />
+	</div>
+	<div class="field">
+		<label for="f-reply">Max reply tokens (Doppio loop)</label>
+		<input id="f-reply" type="number" min="256" bind:value={maxReplyTokens} placeholder={`default: ${defaultReplyTokens}`} />
+		<p class="hint">Caps one model reply, thinking included. Leave empty for the default: {HOSTED_MAX_REPLY_TOKENS} on a provider's own API, {LOCAL_MAX_REPLY_TOKENS} on custom and local servers, where a looping reply keeps the GPU busy.</p>
 	</div>
 	<div class="field">
 		<label for="f-minutes">Time limit per task (minutes)</label>

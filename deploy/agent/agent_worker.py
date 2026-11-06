@@ -155,15 +155,28 @@ class Manager:
             log("set_poll failed:", e)
 
 
-# Cap on one reply. Without it, a model that starts repeating itself on an
-# OpenAI-compatible server keeps generating until the context is full (an
-# hour on a local server), and the server keeps going after we time out.
-MAX_REPLY_TOKENS = 8192
+# Cap on one reply, unless the agent sets maxReplyTokens. Without one, a
+# model that starts repeating itself keeps generating until the context is
+# full; a local server keeps going after we time out (an hour of blocked GPU
+# once). Hosted APIs stop when we give up, and reasoning models count their
+# thinking in the cap, so they get more room. Keep in sync with
+# model.HostedMaxReplyTokens / LocalMaxReplyTokens.
+HOSTED_MAX_REPLY_TOKENS = 32768
+LOCAL_MAX_REPLY_TOKENS = 8192
 LLM_TIMEOUT = 300
 
 
+def reply_token_cap(agent):
+    if (agent.get("maxReplyTokens") or 0) > 0:
+        return agent["maxReplyTokens"]
+    default = DEFAULT_BASE.get(agent.get("provider"))
+    base = (agent.get("apiBase") or "").strip().rstrip("/")
+    hosted = default is not None and base in ("", default.rstrip("/"))
+    return HOSTED_MAX_REPLY_TOKENS if hosted else LOCAL_MAX_REPLY_TOKENS
+
+
 class ReplyTruncated(Exception):
-    """The reply hit MAX_REPLY_TOKENS: usually a model looping."""
+    """The reply hit the agent's reply cap: usually a model looping."""
 
 
 def llm_call(agent, system, messages):
@@ -173,11 +186,12 @@ def llm_call(agent, system, messages):
     model = agent["model"]
     key = agent.get("apiToken") or ""
     base = (agent.get("apiBase") or DEFAULT_BASE.get(provider, "")).rstrip("/")
+    cap = reply_token_cap(agent)
     if provider == "anthropic":
         url = base + "/v1/messages"
         body = {
             "model": model,
-            "max_tokens": MAX_REPLY_TOKENS,
+            "max_tokens": cap,
             "system": system,
             "messages": [{"role": m["role"], "content": m["content"]} for m in messages],
         }
@@ -195,15 +209,15 @@ def llm_call(agent, system, messages):
         }
         # OpenAI's newer models reject max_tokens; others (Mistral, vLLM, ...)
         # all take it.
-        body["max_completion_tokens" if provider == "openai" else "max_tokens"] = MAX_REPLY_TOKENS
+        body["max_completion_tokens" if provider == "openai" else "max_tokens"] = cap
         headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
     out = http_json("POST", url, headers, body, timeout=LLM_TIMEOUT)
     if provider == "anthropic":
         if out.get("stop_reason") == "max_tokens":
-            raise ReplyTruncated(f"reply cut off at {MAX_REPLY_TOKENS} tokens")
+            raise ReplyTruncated(f"reply cut off at {cap} tokens")
         return "".join(b.get("text", "") for b in out.get("content", []) if b.get("type") == "text")
     if out["choices"][0].get("finish_reason") == "length":
-        raise ReplyTruncated(f"reply cut off at {MAX_REPLY_TOKENS} tokens")
+        raise ReplyTruncated(f"reply cut off at {cap} tokens")
     message = out["choices"][0]["message"]
     content = message.get("content")
     if isinstance(content, list):  # some servers return content blocks
@@ -1240,7 +1254,8 @@ def doppio_engine(run):
             run.emit("log", f"{e}; asking for a shorter reply")
             bad_json += 1
             if bad_json >= 3:
-                return EngineResult("failed", error=f"3 replies in a row hit the length limit ({MAX_REPLY_TOKENS} tokens); the model may be looping")
+                return EngineResult("failed", error=f"3 replies in a row hit the length limit ({reply_token_cap(run.agent)} "
+                                                    "tokens); the model may be looping, or needs a higher max reply tokens")
             messages.append({"role": "assistant", "content": "(reply cut off: too long)"})
             messages.append({"role": "user", "content":
                              "Your last reply was cut off because it was too long, and was discarded. "

@@ -269,10 +269,18 @@ class LlmCallTest(unittest.TestCase):
             bodies.append(body)
             return {"choices": [{"message": {"content": "same same same"}, "finish_reason": "length"}]}
         w.http_json = fake
-        for provider, field in (("openai", "max_completion_tokens"), ("mistral", "max_tokens"), ("custom", "max_tokens")):
+        cases = [
+            # provider, apiBase, maxReplyTokens, field, cap
+            ("openai", "", 0, "max_completion_tokens", 32768),
+            ("mistral", "https://api.mistral.ai/v1/", 0, "max_tokens", 32768),
+            ("openai", "https://llm-server:8443/v1", 0, "max_completion_tokens", 8192),
+            ("custom", "http://x/v1", 0, "max_tokens", 8192),
+            ("custom", "http://x/v1", 20000, "max_tokens", 20000),
+        ]
+        for provider, base, cap, field, want in cases:
             with self.assertRaises(w.ReplyTruncated):
-                w.llm_call(agent(provider=provider, model="m", apiToken="k", apiBase="http://x/v1"), "sys", [])
-            self.assertEqual(bodies[-1][field], w.MAX_REPLY_TOKENS)
+                w.llm_call(agent(provider=provider, model="m", apiToken="k", apiBase=base, maxReplyTokens=cap), "sys", [])
+            self.assertEqual(bodies[-1][field], want, (provider, base, cap))
 
     def test_truncated_replies_are_retried_then_fail(self):
         orig = w.llm_call

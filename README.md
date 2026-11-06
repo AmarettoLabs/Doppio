@@ -91,9 +91,10 @@ done and the agent page shows "Restart pending" meanwhile.
 An agent's **engine** runs its tasks. The default, and for now the only one
 available, is the **Doppio loop**: Doppio's own tool loop over the agent's
 model API. Coding CLIs (Claude Code, Codex CLI, Mistral Vibe, Qwen Code) are
-listed in the agent form and will become selectable as they're added. Whatever
-the engine, the worker handles the git side: triggers, workspace, guidance and
-posting the answer.
+listed in the agent form and will become selectable as they're added; the
+agent image already ships them, with `gh` and `glab` to open pull/merge
+requests. Whatever the engine, the worker handles the git side: triggers,
+workspace, guidance and posting the answer.
 
 The Doppio loop calls the model's tools with the provider's built-in tool
 calling (OpenAI-compatible `tools`/`tool_calls`, Anthropic
@@ -168,6 +169,24 @@ deploy/         Dockerfiles, docker-compose.yml, up.sh / down.sh
 ```
 
 Agent containers run the generic worker `deploy/agent/agent_worker.py`.
+
+### Agent image
+
+`deploy/Dockerfile.agent` builds the image the agent containers run. Besides
+the worker (Python + git), it ships what agents need to work a checkout on
+their own, at pinned versions (build args at the top of the file):
+
+| Tool | Purpose |
+| --- | --- |
+| `claude`, `codex`, `vibe`, `qwen` | The coding CLIs, for the CLI engines. |
+| `gh`, `glab` | Opening pull/merge requests; CLI engines don't have Doppio's `create_pr` tool. |
+| `go` | Running `go test ./...` on a checkout (the version `go.mod` builds with). |
+| `node` + `npm` | Running `npm ci` and `npm run check` in `web/` (Node 22, as in CI and `Dockerfile.manager`). |
+
+The build is multi-stage: npm and pip caches and the download leftovers stay
+in the build stages, so the final image is about **2 GB** (unpacked), dominated
+by the CLIs themselves (Claude Code ~340 MB, codex ~320 MB, Mistral Vibe
+~400 MB, Qwen Code ~120 MB) and the Go toolchain (~250 MB).
 
 ## Contributing
 

@@ -6,9 +6,10 @@
 #
 # On top of the worker it ships the coding CLIs (claude, codex, vibe, qwen),
 # the git hosts' CLIs (gh, glab) and the toolchains agents need to test their
-# work on a checkout (Go, Node/npm). Multi-stage: what downloads or compiles
-# stays in the build stages, the final image only has the runtimes and CLIs.
-# The result is about 2 GB unpacked (see "Agent image" in the README).
+# work on a checkout (Go, Node/npm). Multi-stage: every download happens in a
+# build stage, so caches and leftovers never reach the final image, which only
+# has the runtimes and CLIs. Its size is in the README's "Agent image" section;
+# CI prints it on every build.
 #
 # The CLIs never update themselves: their built-in update checks are turned
 # off in the image (the ENV and config files below), so a version pin is what
@@ -50,6 +51,43 @@ RUN tar -xzf /tmp/codex-${TARGETARCH}.tar.gz -C /tmp \
  && mv /tmp/codex-*-unknown-linux-musl /usr/local/bin/codex \
  && rm -f /tmp/codex-*.tar.gz
 
+# --- gh / glab --------------------------------------------------------------
+# The git hosts' CLIs as debs from their releases: the CLI engines don't have
+# Doppio's create_pr tool, they open pull/merge requests with these. Both
+# architectures are downloaded (each with its checksum), the deb for
+# TARGETARCH is unpacked, and only the self-contained binary is copied on
+# (they only depend on git, which the final image already ships).
+FROM python:3.14-slim AS git-host-clis
+ARG TARGETARCH
+ARG GH_VERSION=2.76.2
+ARG GLAB_VERSION=1.128.0
+ARG GH_SHA256_AMD64=2958aa0cf0a2a82790913058667bf5a8b67fe0ecdd0d13d5ffe78d90adb04602
+ARG GH_SHA256_ARM64=8a4728b3619fc4b21ad74334a9642776a45afe3a473364141d31c09b0452e40d
+ARG GLAB_SHA256_AMD64=b42db1c339cb66df2dbdaf190b8c4e359cb2ea3f7ac53e46302b04777f2cf405
+ARG GLAB_SHA256_ARM64=88e68a179fc25c3751e7950aa4b1b47b184cade590b70d9ca4aafff6648c655e
+ADD --checksum=sha256:${GH_SHA256_AMD64} https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.deb /tmp/gh-amd64.deb
+ADD --checksum=sha256:${GH_SHA256_ARM64} https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_arm64.deb /tmp/gh-arm64.deb
+ADD --checksum=sha256:${GLAB_SHA256_AMD64} https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads/glab_${GLAB_VERSION}_linux_amd64.deb /tmp/glab-amd64.deb
+ADD --checksum=sha256:${GLAB_SHA256_ARM64} https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads/glab_${GLAB_VERSION}_linux_arm64.deb /tmp/glab-arm64.deb
+RUN dpkg-deb -x /tmp/gh-${TARGETARCH}.deb /tmp/gh \
+ && dpkg-deb -x /tmp/glab-${TARGETARCH}.deb /tmp/glab \
+ && mv /tmp/gh/usr/bin/gh /tmp/glab/usr/bin/glab /usr/local/bin/ \
+ && rm -rf /tmp/gh /tmp/glab /tmp/gh-*.deb /tmp/glab-*.deb
+
+# --- Go toolchain -----------------------------------------------------------
+# The Go toolchain agents run `go test ./...` with (the version go.mod builds
+# with). Both architectures are downloaded (each with its checksum), the one
+# for TARGETARCH is unpacked, and the archives are never copied on.
+FROM python:3.14-slim AS go-toolchain
+ARG TARGETARCH
+ARG GO_VERSION=1.26.7
+ARG GO_SHA256_AMD64=ffb5f8de10c62550dfddab66b36b57030721e0a44a3218e9e1181d7b59f121ca
+ARG GO_SHA256_ARM64=5a4ec883379d51ee9ce1040d5e87f8d35e20387574dd8c947feb01eabc3c1b37
+ADD --checksum=sha256:${GO_SHA256_AMD64} https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz /tmp/go-amd64.tar.gz
+ADD --checksum=sha256:${GO_SHA256_ARM64} https://go.dev/dl/go${GO_VERSION}.linux-arm64.tar.gz /tmp/go-arm64.tar.gz
+RUN tar -C /usr/local -xzf /tmp/go-${TARGETARCH}.tar.gz \
+ && rm -f /tmp/go-*.tar.gz
+
 # --- vibe (Mistral Vibe) ----------------------------------------------------
 # A Python package, installed against the same Python as the final image. pip
 # picks the wheel for the architecture on its own.
@@ -59,36 +97,19 @@ RUN pip install --no-cache-dir mistral-vibe==${VIBE_VERSION}
 
 # --- Final image -----------------------------------------------------------
 FROM python:3.14-slim
-ARG TARGETARCH
-ARG GO_VERSION=1.26.7
-ARG GH_VERSION=2.76.2
-ARG GLAB_VERSION=1.128.0
-ARG GO_SHA256_AMD64=ffb5f8de10c62550dfddab66b36b57030721e0a44a3218e9e1181d7b59f121ca
-ARG GO_SHA256_ARM64=5a4ec883379d51ee9ce1040d5e87f8d35e20387574dd8c947feb01eabc3c1b37
-ARG GH_SHA256_AMD64=2958aa0cf0a2a82790913058667bf5a8b67fe0ecdd0d13d5ffe78d90adb04602
-ARG GH_SHA256_ARM64=8a4728b3619fc4b21ad74334a9642776a45afe3a473364141d31c09b0452e40d
-ARG GLAB_SHA256_AMD64=b42db1c339cb66df2dbdaf190b8c4e359cb2ea3f7ac53e46302b04777f2cf405
-ARG GLAB_SHA256_ARM64=88e68a179fc25c3751e7950aa4b1b47b184cade590b70d9ca4aafff6648c655e
 # ca-certificates: the worker and the CLIs talk HTTPS to the manager, the git
 # host and the model API. git: the workspace is a git checkout.
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
  && rm -rf /var/lib/apt/lists/*
-# gh / glab: the CLI engines don't have Doppio's create_pr tool, they open
-# pull/merge requests with these. TARGETARCH (amd64/arm64) matches the debs'
-# asset names.
-ADD --checksum=sha256:${GH_SHA256_AMD64} https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.deb /tmp/gh-amd64.deb
-ADD --checksum=sha256:${GH_SHA256_ARM64} https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_arm64.deb /tmp/gh-arm64.deb
-ADD --checksum=sha256:${GLAB_SHA256_AMD64} https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads/glab_${GLAB_VERSION}_linux_amd64.deb /tmp/glab-amd64.deb
-ADD --checksum=sha256:${GLAB_SHA256_ARM64} https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads/glab_${GLAB_VERSION}_linux_arm64.deb /tmp/glab-arm64.deb
-RUN dpkg -i /tmp/gh-${TARGETARCH}.deb /tmp/glab-${TARGETARCH}.deb && rm -f /tmp/gh-*.deb /tmp/glab-*.deb
 # Node, npm and the Node-based CLIs (agents run `npm ci && npm run check` on
 # a checkout).
 COPY --from=node-clis /usr/local/bin /usr/local/bin
 COPY --from=node-clis /usr/local/lib/node_modules /usr/local/lib/node_modules
+# gh / glab, unpacked from their debs above.
+COPY --from=git-host-clis /usr/local/bin/gh /usr/local/bin/gh
+COPY --from=git-host-clis /usr/local/bin/glab /usr/local/bin/glab
 # The Go toolchain (agents run `go test ./...` on a checkout).
-ADD --checksum=sha256:${GO_SHA256_AMD64} https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz /tmp/go-amd64.tgz
-ADD --checksum=sha256:${GO_SHA256_ARM64} https://go.dev/dl/go${GO_VERSION}.linux-arm64.tar.gz /tmp/go-arm64.tgz
-RUN tar -C /usr/local -xzf /tmp/go-${TARGETARCH}.tgz && rm -f /tmp/go-*.tgz
+COPY --from=go-toolchain /usr/local/go /usr/local/go
 ENV PATH=/usr/local/go/bin:$PATH
 # codex and vibe (all three vibe entry points: the launcher points the Rust
 # CLI at the vibe-app-server script next to itself).

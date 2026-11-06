@@ -71,9 +71,13 @@ type Agent struct {
 	PollSeconds int       `json:"pollSeconds"`
 	MaxTurns    int       `json:"maxTurns"` // tool-loop turns per task; -1 = unlimited (until the model's context limit)
 
-	Status      string `json:"status"` // created, running, stopped, error
-	ContainerID string `json:"containerId,omitempty"`
-	Error       string `json:"error,omitempty"`
+	Status string `json:"status"` // created, running, stopped, error
+	// RestartPending: the agent's settings were saved while it was busy; its
+	// container is restarted with them once it's idle. Cleared by any start
+	// or stop.
+	RestartPending bool   `json:"restartPending,omitempty"`
+	ContainerID    string `json:"containerId,omitempty"`
+	Error          string `json:"error,omitempty"`
 	// Git poll scheduling, reported by the worker so the UI can show a
 	// countdown to the next check.
 	LastPollAt *time.Time `json:"lastPollAt,omitempty"`

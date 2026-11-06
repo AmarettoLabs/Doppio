@@ -25,6 +25,7 @@ export interface AgentView {
 	nextPollAt?: string;
 	/** a task is running or about to be picked up */
 	working: boolean;
+	restartPending: boolean;
 	createdAt: string;
 	updatedAt: string;
 }

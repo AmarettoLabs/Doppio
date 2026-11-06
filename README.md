@@ -86,6 +86,19 @@ Saving a running agent's settings restarts its container so they take effect.
 If the agent is busy (a task, or a git check), the restart waits until it's
 done and the agent page shows "Restart pending" meanwhile.
 
+## Engines
+
+An agent's **engine** runs its tasks. The default, and for now the only one
+available, is the **Doppio loop**: Doppio's own tool loop over the agent's
+model API. Coding CLIs (Claude Code, Codex CLI, Mistral Vibe, Qwen Code) are
+listed in the agent form and will become selectable as they're added. Whatever
+the engine, the worker handles the git side: triggers, workspace, guidance and
+posting the answer.
+
+Each task has a time limit (30 minutes by default, set per agent). A task
+still running then is stopped and retried at a later git check, like other
+infrastructure failures.
+
 ## Configuration
 
 Manager environment variables:

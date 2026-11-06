@@ -4,6 +4,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import urllib.parse
 
@@ -273,6 +274,75 @@ class LlmCallTest(unittest.TestCase):
         mgr = RunTaskMgr()
         self.assertEqual(w.run_task(mgr, agent(), "sys", {"id": "t", "title": "x", "input": "hi"}), "done")
         self.assertTrue(all(m["content"] for m in sent[-1]))
+
+
+class EngineTest(unittest.TestCase):
+    def setUp(self):
+        orig = dict(w.ENGINES)
+        self.addCleanup(lambda: (w.ENGINES.clear(), w.ENGINES.update(orig)))
+        self.mgr = RunTaskMgr()
+
+    def run_task(self, engine, **cfg):
+        w.ENGINES["fake"] = engine
+        return w.run_task(self.mgr, agent(engine="fake", **cfg), "sys", {"id": "t1", "title": "x", "input": "do it"})
+
+    def test_engine_gets_the_prompt_and_limits(self):
+        seen = {}
+
+        def fake(run):
+            seen.update(prompt=run.prompt, system=run.system, workdir=run.workdir,
+                        minutes=run.minutes, turns=run.max_turns)
+            return w.EngineResult("done", answer="all good")
+        self.assertEqual(self.run_task(fake, maxTurns=-1, taskMinutes=5), "done")
+        self.assertEqual(seen, {"prompt": "do it", "system": "sys", "workdir": WS_DIR,
+                                "minutes": 5, "turns": None})
+        self.assertEqual(self.mgr.finished[-1][1], "done")
+
+    def test_outcomes(self):
+        for outcome in ("failed", "error", "limit"):
+            self.assertEqual(self.run_task(lambda run, o=outcome: w.EngineResult(o, error="nope")), outcome)
+            self.assertEqual(self.mgr.finished[-1][1:], ("failed", "nope"))
+
+        def crash(run):
+            raise OSError("boom")
+        self.assertEqual(self.run_task(crash), "error")
+
+    def test_time_limit(self):
+        def slow(run):
+            run.deadline = time.monotonic() - 1  # as if the limit had passed
+            run.check_time()
+        self.assertEqual(self.run_task(slow, taskMinutes=7), "error")
+        self.assertIn("time limit (7 min)", self.mgr.finished[-1][2])
+
+    def test_unknown_engine_fails(self):
+        out = w.run_task(self.mgr, agent(engine="nope"), "sys", {"id": "t1", "title": "x", "input": "hi"})
+        self.assertEqual((out, self.mgr.finished[-1][1]), ("failed", "failed"))
+
+    def test_usage_limits_are_retried(self):
+        src = "github:o/r#issues:3@assigned"
+        state = {"handled": [src]}
+        w.after_git_task(MgrStub(), state, os.path.join(WS_DIR, "limit-state.json"), {"id": "t", "source": src}, "limit")
+        self.assertNotIn(src, state["handled"])
+        self.assertEqual(state["retries"][src], 1)
+
+
+class RunProcessTest(unittest.TestCase):
+    def run_obj(self, minutes=1):
+        return w.TaskRun(MgrStub(), agent(), "sys", {"id": "t"}, "p", WS_DIR, minutes=minutes)
+
+    def test_streams_stdout_and_keeps_stderr(self):
+        lines = []
+        code, err = w.run_process(self.run_obj(), ["sh", "-c", "cat; echo second; echo oops >&2; exit 3"],
+                                  stdin_text="first\n", on_line=lines.append)
+        self.assertEqual((code, lines, err), (3, ["first", "second"], "oops"))
+
+    def test_killed_at_the_time_limit(self):
+        run = self.run_obj()
+        run.deadline = time.monotonic() + 0.5
+        started = time.monotonic()
+        with self.assertRaises(w.TaskTimeout):
+            w.run_process(run, ["sh", "-c", "sleep 30 & sleep 30"])
+        self.assertLess(time.monotonic() - started, 10)
 
 
 class SourceTest(unittest.TestCase):

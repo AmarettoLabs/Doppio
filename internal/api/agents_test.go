@@ -67,3 +67,42 @@ func TestAgentTriggers(t *testing.T) {
 		t.Fatalf("after updates: %v", v.Triggers)
 	}
 }
+
+func TestAgentEngine(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	h := srv.Handler()
+
+	rec := do(h, "POST", "/api/agents", "", agentJSON(`"ownerLogin":"me"`))
+	var v AgentView
+	if err := json.Unmarshal(rec.Body.Bytes(), &v); err != nil || rec.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", rec.Code, rec.Body)
+	}
+	if v.Engine != "doppio" || v.TaskMinutes != 30 {
+		t.Fatalf("defaults: engine %q, taskMinutes %d", v.Engine, v.TaskMinutes)
+	}
+
+	for body, want := range map[string]string{
+		`"engine":"gemini"`:    "unknown engine",
+		`"engine":"codex"`:     "not available yet",
+		`"taskMinutes":-1`:     "taskMinutes",
+		`"taskMinutes":100000`: "taskMinutes",
+	} {
+		rec := do(h, "PATCH", "/api/agents/"+v.ID, "", agentJSON(`"ownerLogin":"me",`+body))
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), want) {
+			t.Errorf("%s: got %d %s", body, rec.Code, rec.Body)
+		}
+	}
+
+	// A set limit sticks; omitting engine/limit keeps the stored values.
+	do(h, "PATCH", "/api/agents/"+v.ID, "", agentJSON(`"ownerLogin":"me","engine":"doppio","taskMinutes":90`))
+	rec = do(h, "PATCH", "/api/agents/"+v.ID, "", agentJSON(`"ownerLogin":"me"`))
+	_ = json.Unmarshal(rec.Body.Bytes(), &v)
+	if v.Engine != "doppio" || v.TaskMinutes != 90 {
+		t.Fatalf("after updates: engine %q, taskMinutes %d", v.Engine, v.TaskMinutes)
+	}
+
+	rec = do(h, "GET", "/api/providers", "", "")
+	if !strings.Contains(rec.Body.String(), `"engines":[{"id":"doppio","label":"Doppio loop","available":true}`) {
+		t.Fatalf("providers: %s", rec.Body)
+	}
+}

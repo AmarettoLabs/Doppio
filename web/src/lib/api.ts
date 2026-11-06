@@ -26,6 +26,8 @@ export interface AgentView {
 	/** a task is running or about to be picked up */
 	working: boolean;
 	restartPending: boolean;
+	engine: string;
+	taskMinutes: number;
 	createdAt: string;
 	updatedAt: string;
 }
@@ -49,6 +51,15 @@ export interface AgentPayload {
 	triggers: string[];
 	pollSeconds: number;
 	maxTurns: number;
+	engine: string;
+	taskMinutes: number;
+}
+
+/** An engine that runs an agent's tasks; unavailable ones are listed but can't be picked yet. */
+export interface EngineInfo {
+	id: string;
+	label: string;
+	available: boolean;
 }
 
 /** Git activity an agent can respond to, in display order. */
@@ -135,7 +146,7 @@ const json = (method: string) => (body: unknown) => ({
 });
 
 export const api = {
-	providers: () => req<{ llm: ProviderInfo[]; git: GitProviderInfo[] }>('/api/providers'),
+	providers: () => req<{ llm: ProviderInfo[]; git: GitProviderInfo[]; engines: EngineInfo[] }>('/api/providers'),
 	agents: () => req<AgentView[]>('/api/agents'),
 	agent: (id: string) => req<AgentView>(`/api/agents/${id}`),
 	createAgent: (a: AgentPayload) => req<AgentView>('/api/agents', json('POST')(a)),

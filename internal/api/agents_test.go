@@ -107,6 +107,43 @@ func TestAgentEngine(t *testing.T) {
 	}
 }
 
+func TestToolCallMode(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	h := srv.Handler()
+	create := func(extra string) AgentView {
+		t.Helper()
+		rec := do(h, "POST", "/api/agents", "", agentJSON("\"ownerLogin\":\"me\""+extra))
+		var v AgentView
+		if rec.Code != http.StatusCreated || json.Unmarshal(rec.Body.Bytes(), &v) != nil {
+			t.Fatalf("create %s: %d %s", extra, rec.Code, rec.Body)
+		}
+		return v
+	}
+	// default: detect automatically
+	if v := create(""); v.ToolCallMode != "" {
+		t.Fatalf("default mode: %q", v.ToolCallMode)
+	}
+	for _, m := range []string{"native", "text"} {
+		if v := create(",\"toolCallMode\":\"" + m + "\""); v.ToolCallMode != m {
+			t.Fatalf("%s: got %q", m, v.ToolCallMode)
+		}
+	}
+	// unknown modes are rejected
+	for _, bad := range []string{"auto", "builtin"} {
+		rec := do(h, "POST", "/api/agents", "", agentJSON(",\"toolCallMode\":\""+bad+"\""))
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: got %d", bad, rec.Code)
+		}
+	}
+	// empty on update keeps the stored mode
+	v := create(",\"toolCallMode\":\"text\"")
+	rec := do(h, "PATCH", "/api/agents/"+v.ID, "", agentJSON("\"ownerLogin\":\"me\""))
+	_ = json.Unmarshal(rec.Body.Bytes(), &v)
+	if v.ToolCallMode != "text" {
+		t.Fatalf("update kept: %q", v.ToolCallMode)
+	}
+}
+
 func TestMaxReplyTokens(t *testing.T) {
 	srv, _ := newTestServer(t, "")
 	h := srv.Handler()

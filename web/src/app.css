@@ -118,6 +118,7 @@ input[type='text'], input[type='password'], input[type='number'], select, textar
 textarea { min-height: 7rem; resize: vertical; }
 .hint { color: var(--muted); font-size: 0.75rem; margin-top: 0.2rem; }
 .err { color: var(--err); }
+.pending { color: var(--warn); }
 .muted { color: var(--muted); }
 .row { display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; }
 .stream {

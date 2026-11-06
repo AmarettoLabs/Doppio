@@ -97,12 +97,23 @@ def http_json(method, url, headers, body=None, timeout=30):
 
 
 def looks_like_no_tool_support(msg):
-    """Whether an API error means the server cannot handle tool definitions
-    (unknown field, unsupported parameter, not implemented...)."""
+    """Whether a 400/422 API error complains about the tools/tool_choice
+    parameter itself: the server does not implement tool definitions. Only
+    such errors may switch the loop to the text format; anything else (a bad
+    message sequence, a missing field...) is a conversation bug that switching
+    cannot fix."""
     low = (msg or "").lower()
+    if not re.search(r"http 4(?:00|22)\b", low):
+        return False
+    # The parameter as its own word (tools, tool_choice, functions...), not
+    # the message fields tool_calls/tool_use/tool_result, which point at a
+    # conversation bug.
+    if not re.search(r"(?<![a-z_])(tools?|tool_choice|functions?|function_call)(?![a-z_])", low):
+        return False
     return any(k in low for k in (
-        "tool", "function", "tools is not supported", "not supported",
-        "extra_forbidden", "unrecognized request argument",
+        "support", "not implemented", "unknown", "unrecognized", "invalid",
+        "forbidden", "not permitted", "not allowed", "param", "field",
+        "argument",
     ))
 
 
@@ -190,8 +201,8 @@ class ReplyTruncated(Exception):
 
 
 class NoToolSupport(Exception):
-    """The server rejected the tool definitions or cannot return structured
-    tool calls; the caller should fall back to the text format."""
+    """The server rejected the tool definitions; the caller may fall back to
+    the text format (only before any native turn was sent, see doppio_engine)."""
 
 
 class Reply:
@@ -297,11 +308,11 @@ def anthropic_tools():
 
 def tool_spec(agent, native):
     """The tool instructions that go with the system prompt: the provider's
-    built-in tool calling, or tool calls as JSON in the reply."""
+    built-in tool calling, or tool calls as JSON in the reply. The leading
+    separator keeps them off the persona and standing task."""
     repos = ", ".join(normalize_repo(r) for r in (agent.get("gitRepos") or [])) or "(none configured)"
-    if native:
-        return TOOL_SPEC_NATIVE
-    return TOOL_SPEC.replace("{repos}", repos)
+    spec = TOOL_SPEC_NATIVE if native else TOOL_SPEC
+    return "\n\n" + spec.replace("{repos}", repos)
 
 
 def llm_call(agent, system, messages, tools=False):
@@ -1162,7 +1173,7 @@ TOOL_DEFS = {
 TOOL_SPEC = """You can act with tools. Each turn, reply with EITHER:
 - a final plain-text answer (no JSON block), or
 - exactly one tool call in a ```json fenced block:
-  {"tool":"shell","command":"..."}                     run a shell command in /agent/workspace (git is preconfigured with your credentials; for git tasks the repository is already cloned and checked out under repos/<name>, see the task - do NOT clone again)
+  {"tool":"shell","command":"..."}                     run a shell command in /agent/workspace (git is preconfigured with your credentials; for git tasks the repository is already cloned and checked out under repos/<name>, see the task — do NOT clone again)
   {"tool":"read_file","path":"...","start_line":1,"end_line":400}   read a file under /agent/workspace (lines optional; long files are shown in parts)
   {"tool":"write_file","path":"...","content":"..."}   write a file under /agent/workspace
   {"tool":"create_pr","repo":"owner/repo","head":"your-branch","base":"main","title":"...","body":"..."}
@@ -1170,11 +1181,10 @@ Rules: one tool call per turn, wait for its result, keep going until the work is
 """
 
 
-TOOL_SPEC_NATIVE = """
-
-You can act with tools: call them, one or more per turn, and read their results
+TOOL_SPEC_NATIVE = """You can act with tools: call them, one or more per turn, and read their results
 in the next message. Keep going until the work is done, then give a short
 plain-text final answer. Work on your own branch; never push to main/master.
+Repos you watch: {repos}.
 """
 
 
@@ -1435,10 +1445,11 @@ def doppio_engine(run):
         try:
             reply = llm_call(run.agent, run.system, messages, tools=native)
         except NoToolSupport as e:
-            if not native or tool_call_mode(run.agent) == "native":
-                raise  # text mode, or native forced: no fallback
-            # The server rejects tool definitions: fall back to the text
-            # format for this agent.
+            # Fall back only on the first request of a task: later ones carry
+            # native turns in the history, and a request without tools but
+            # with tool_calls/tool_use messages fails more confusingly.
+            if not native or tool_call_mode(run.agent) == "native" or turn > 1:
+                raise  # text mode, native forced, or native already in use
             native = False
             run.emit("log", f"{e}; falling back to tool calls as JSON in the reply")
             continue
@@ -1449,6 +1460,8 @@ def doppio_engine(run):
             if bad >= 3:
                 return EngineResult("failed", error=f"3 replies in a row hit the length limit ({reply_token_cap(run.agent)} "
                                                     "tokens); the model may be looping, or needs a higher max reply tokens")
+            # Providers reject empty assistant messages: keep a placeholder.
+            messages.append(Reply("(reply cut off: too long)"))
             messages.append(UserMessage("Your last reply was cut off because it was too long, and was discarded. "
                              "Reply again, shorter: one tool call, or a concise final answer."))
             continue
@@ -1460,13 +1473,6 @@ def doppio_engine(run):
             call = parse_tool_call(reply.text)
             if call and call[0] != "__invalid__":
                 textish += 1
-                if textish >= 3 and tool_call_mode(run.agent) != "native":
-                    native = False
-                    run.emit("log", "the model keeps writing tool calls as JSON in its replies; "
-                                    "switching to the text format")
-                    messages.append(reply)
-                    messages.append(UserMessage("Your tool call was understood; keep answering in that format."))
-                    continue
                 name, args = call
                 run.emit("action", f"$ {name} {json.dumps(args)[:300]}")
                 try:
@@ -1474,8 +1480,16 @@ def doppio_engine(run):
                 except Exception as e:
                     result = f"tool error: {type(e).__name__}: {e}"
                 run.emit("log", f"→ {result[:1500]}")
+                bad = 0
                 messages.append(reply)
                 messages.append(UserMessage("TOOL RESULT (" + name + "):\n" + result))
+                if textish >= 3 and tool_call_mode(run.agent) != "native":
+                    # The call above ran and its result is in the history:
+                    # switch only now, so the model never believes a call
+                    # went through when it did not.
+                    native = False
+                    run.emit("log", "the model keeps writing tool calls as JSON in its replies; "
+                                    "switching to the text format")
                 continue
         if native:
             if not reply.calls and not reply.text.strip():
@@ -1503,6 +1517,13 @@ def doppio_engine(run):
             messages.append(ToolResults(results))
             continue
         # Text format: one JSON tool call in the reply, or a final answer.
+        if reply.calls and parse_tool_call(reply.text) is None:
+            # Some servers return tool_calls even though no tools were
+            # declared (seen with Mistral): turn the first one into the text
+            # format, so the conversation stays in one format.
+            _, name, args = reply.calls[0]
+            fenced = "```json\n" + json.dumps({"tool": name, **args}) + "\n```"
+            reply.text = (reply.text.strip() + "\n\n" if reply.text.strip() else "") + fenced
         call = parse_tool_call(reply.text)
         if call is None and reply.text.strip():
             return EngineResult("done", answer=reply.text)
@@ -1532,6 +1553,8 @@ def doppio_engine(run):
         run.emit("log", f"→ {result[:1500]}")
         messages.append(Reply(reply.text))
         messages.append(UserMessage(f"TOOL RESULT ({name}):\n{result}"))
+
+
 ENGINES = {"doppio": doppio_engine}
 
 

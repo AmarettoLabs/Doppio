@@ -314,13 +314,46 @@ class LlmCallTest(unittest.TestCase):
         self.assertEqual(self.bodies[1][1]["messages"][-2]["content"], "(empty reply)")
 
     def test_native_server_without_tool_support_falls_back_to_text(self):
-        a = self.fake([RuntimeError("HTTP 400 from https://x/v1/chat/completions: 'tools' is not supported"),
-                       self.msg(content='```json\n{"tool":"shell","command":"echo hi"}\n```'),
-                       self.msg(content="done")])
-        res = self.run_loop(a)
-        self.assertEqual((res.outcome, res.answer), ("done", "done"))
-        self.assertNotIn("tools", self.bodies[1][1])  # fell back to the text format
-        self.assertIn("```json", self.bodies[1][1]["messages"][0]["content"])  # text tool spec in the system prompt
+        for err in (
+            "HTTP 400 from https://x/v1/chat/completions: 'tools' is not supported",
+            "HTTP 422 from https://x/v1/chat/completions: Unrecognized request argument: tools",
+            "HTTP 400 from https://x/v1/messages: extra_forbidden: tools",
+            "HTTP 400: 'tool_choice' is not supported by this model",
+        ):
+            with self.subTest(err=err):
+                self.bodies = []
+                a = self.fake([RuntimeError(err),
+                               self.msg(content='```json\n{"tool":"shell","command":"echo hi"}\n```'),
+                               self.msg(content="done")])
+                res = self.run_loop(a)
+                self.assertEqual((res.outcome, res.answer), ("done", "done"))
+                self.assertNotIn("tools", self.bodies[1][1])  # fell back to the text format
+                self.assertIn("```json", self.bodies[1][1]["messages"][0]["content"])  # text spec
+
+    def test_conversation_bugs_do_not_switch_to_text(self):
+        # A 400 about the messages, not the tools parameter: switching cannot
+        # fix it, and the next request would fail more confusingly.
+        for err in (
+            "HTTP 400 from https://x/v1/chat/completions: Assistant message must have either content or tool_calls",
+            "HTTP 400 from https://x/v1/messages: tool_result block(s) provided when previous message has no tool_use",
+            "HTTP 400: Unexpected role 'user' after role 'tool'",
+            "HTTP 500 from https://x/v1/chat/completions: tools is not supported",
+        ):
+            with self.subTest(err=err):
+                self.bodies = []
+                a = self.fake([RuntimeError(err)])
+                with self.assertRaises(RuntimeError):
+                    self.run_loop(a)
+                self.assertIn("tools", self.bodies[0][1])  # still declared, no fallback
+
+    def test_no_fallback_after_the_first_request(self):
+        # Once native turns are in the history, a tools error is a server
+        # hiccup, not a missing feature: retry later, do not switch format.
+        a = self.fake([self.msg(tool_calls=[self.call("c1", "shell", {"command": "echo hi"})]),
+                       RuntimeError("HTTP 400 from https://x/v1/chat/completions: 'tools' is not supported")])
+        with self.assertRaises(w.NoToolSupport):
+            self.run_loop(a)  # run_task turns this into an "error" to retry later
+        self.assertIn("tools", self.bodies[1][1])  # no switch: tools still declared
 
     # ---- native: Anthropic ----
 
@@ -375,7 +408,10 @@ class LlmCallTest(unittest.TestCase):
         a = self.fake(replies)
         res = self.run_loop(a)
         self.assertEqual((res.outcome, res.answer), ("done", "done"))
-        # the calls ran (results came back), and the 4th request is text format
+        # every call ran and its result came back, including the third one
+        for i in range(3):
+            self.assertIn("TOOL RESULT (shell):\nexit=0\nhi", self.bodies[i + 1][1]["messages"][-1]["content"])
+        # the 4th request is in the text format
         self.assertNotIn("tools", self.bodies[3][1])
         self.assertIn("```json", self.bodies[3][1]["messages"][0]["content"])
 
@@ -388,6 +424,27 @@ class LlmCallTest(unittest.TestCase):
         self.assertEqual(last["role"], "user")
         self.assertTrue(last["content"].startswith("TOOL RESULT (shell):"))
 
+    def test_text_mode_runs_a_native_call_the_server_returns_anyway(self):
+        # Mistral sometimes returns tool_calls even though no tools were
+        # declared: the call must run, not be dropped as an empty reply.
+        a = self.fake([self.msg(content="", tool_calls=[self.call("c1", "shell", {"command": "echo hi"})]),
+                       self.msg(content="done")], toolCallMode="text")
+        res = self.run_loop(a)
+        self.assertEqual((res.outcome, res.answer), ("done", "done"))
+        msgs = self.bodies[1][1]["messages"]
+        self.assertEqual(msgs[-2]["role"], "assistant")
+        self.assertIn('"tool": "shell"', msgs[-2]["content"])  # turned into the text format
+        self.assertTrue(msgs[-1]["content"].startswith("TOOL RESULT (shell):\nexit=0\nhi"))
+
+    def test_text_mode_prefers_the_json_call_in_the_text(self):
+        # A fenced call in the text wins over a stray native one.
+        a = self.fake([self.msg(content='```json\n{"tool":"shell","command":"echo one"}\n```',
+                                tool_calls=[self.call("c1", "shell", {"command": "echo two"})]),
+                       self.msg(content="done")], toolCallMode="text")
+        res = self.run_loop(a)
+        self.assertEqual(res.outcome, "done")
+        self.assertTrue(self.bodies[1][1]["messages"][-1]["content"].startswith("TOOL RESULT (shell):\nexit=0\none"))
+
     # ---- reply cap ----
 
     def test_truncated_replies_are_retried_then_fail(self):
@@ -397,6 +454,17 @@ class LlmCallTest(unittest.TestCase):
         res = self.run_loop(a)
         self.assertEqual(res.outcome, "failed")
         self.assertIn("length limit", res.error)
+
+    def test_truncated_reply_is_followed_by_a_placeholder(self):
+        a = self.fake([self.msg(content="same", finish="length"), self.msg(content="done")])
+        res = self.run_loop(a)
+        self.assertEqual((res.outcome, res.answer), ("done", "done"))
+        # Mistral rejects a user message right after a tool message, and a
+        # request ending with two user messages: keep an assistant one between.
+        msgs = self.bodies[1][1]["messages"]
+        self.assertEqual(msgs[-2]["role"], "assistant")
+        self.assertEqual(msgs[-2]["content"], "(reply cut off: too long)")
+        self.assertEqual(msgs[-1]["role"], "user")
 
     def test_reply_length_is_capped(self):
         cases = [
@@ -418,9 +486,13 @@ class LlmCallTest(unittest.TestCase):
 class ToolModeTest(unittest.TestCase):
     def test_tool_spec_by_mode(self):
         a = agent(gitRepos=["o/r"])
-        self.assertIn("o/r", w.tool_spec(a, False))
+        for native in (False, True):
+            spec = w.tool_spec(a, native)
+            self.assertIn("Repos you watch: o/r.", spec)
+            self.assertNotIn("{repos}", spec)
+            self.assertTrue(spec.startswith("\n\n"), "the spec needs a separator")
         self.assertIn("```json", w.tool_spec(a, False))
-        self.assertNotIn("{repos}", w.tool_spec(a, False))
+        self.assertNotIn("```json", w.tool_spec(a, True))
         self.assertIn("tools", w.tool_spec(a, True))
 
 

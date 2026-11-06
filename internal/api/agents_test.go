@@ -135,12 +135,19 @@ func TestToolCallMode(t *testing.T) {
 			t.Errorf("%s: got %d", bad, rec.Code)
 		}
 	}
-	// empty on update keeps the stored mode
+	// the form sends the whole payload: an empty mode resets to detect
 	v := create(",\"toolCallMode\":\"text\"")
-	rec := do(h, "PATCH", "/api/agents/"+v.ID, "", agentJSON("\"ownerLogin\":\"me\""))
+	rec := do(h, "PATCH", "/api/agents/"+v.ID, "", agentJSON("\"ownerLogin\":\"me\",\"toolCallMode\":\"\""))
 	_ = json.Unmarshal(rec.Body.Bytes(), &v)
-	if v.ToolCallMode != "text" {
-		t.Fatalf("update kept: %q", v.ToolCallMode)
+	if v.ToolCallMode != "" {
+		t.Fatalf("update reset: %q", v.ToolCallMode)
+	}
+	// and a set mode is kept when the payload repeats it
+	v = create(",\"toolCallMode\":\"native\"")
+	rec = do(h, "PATCH", "/api/agents/"+v.ID, "", agentJSON("\"ownerLogin\":\"me\",\"toolCallMode\":\"native\""))
+	_ = json.Unmarshal(rec.Body.Bytes(), &v)
+	if v.ToolCallMode != "native" {
+		t.Fatalf("update kept native: %q", v.ToolCallMode)
 	}
 }
 

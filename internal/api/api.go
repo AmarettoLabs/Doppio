@@ -213,7 +213,7 @@ type agentInput struct {
 	TaskMinutes int `json:"taskMinutes"`
 	// MaxReplyTokens: 0 = the default for the agent's server.
 	MaxReplyTokens int `json:"maxReplyTokens"`
-	// ToolCallMode: "" keeps the stored one on update (detect on create).
+	// ToolCallMode: "" = detect automatically.
 	ToolCallMode string `json:"toolCallMode"`
 }
 
@@ -567,9 +567,7 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		a.TaskMinutes = in.TaskMinutes
 	}
 	a.MaxReplyTokens = in.MaxReplyTokens
-	if in.ToolCallMode != "" {
-		a.ToolCallMode = model.ToolCallMode(in.ToolCallMode)
-	}
+	a.ToolCallMode = model.ToolCallMode(in.ToolCallMode)
 	a.UpdatedAt = time.Now().UTC()
 	if err := s.store.UpsertAgent(a); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())

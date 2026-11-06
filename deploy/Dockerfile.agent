@@ -3,9 +3,69 @@
 # mounting the agent's config (mode 0600) at /agent/config.json. The worker
 # polls the manager for tasks and the git host for mentions/assigned work,
 # calls the configured LLM provider, and streams events back to the manager.
+#
+# On top of the worker it ships the coding CLIs (claude, codex, vibe, qwen),
+# the git hosts' CLIs (gh, glab) and the toolchains agents need to test their
+# work on a checkout (Go, Node/npm). Multi-stage: what downloads or compiles
+# stays in the build stages, the final image only has the runtimes and CLIs.
+# The result is about 2 GB unpacked (see "Agent image" in the README).
+#
+# Every version is a build arg, so a bump is a one-line change:
+#   docker build -f deploy/Dockerfile.agent --build-arg CLAUDE_CODE_VERSION=2.1.320 .
+
+# --- Node.js and the Node-based coding CLIs --------------------------------
+# Node 22, as in CI and Dockerfile.manager. The CLIs are installed into the
+# image's global node_modules; their npm cache stays in this stage.
+FROM node:22-bookworm-slim AS node-clis
+ARG CLAUDE_CODE_VERSION=2.1.318
+ARG QWEN_CODE_VERSION=0.25.1
+ENV NPM_CONFIG_UPDATE_NOTIFIER=false
+RUN npm install -g --omit=dev \
+      @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} \
+      @qwen-code/qwen-code@${QWEN_CODE_VERSION} \
+ && npm cache clean --force
+
+# --- codex CLI -------------------------------------------------------------
+# A native binary from its GitHub release (no Node involved).
+FROM python:3.14-slim AS codex-cli
+ARG CODEX_VERSION=0.166.0
+ADD https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/codex-x86_64-unknown-linux-musl.tar.gz /tmp/codex.tar.gz
+RUN tar -xzf /tmp/codex.tar.gz -C /tmp \
+ && mv /tmp/codex-x86_64-unknown-linux-musl /usr/local/bin/codex \
+ && rm -f /tmp/codex.tar.gz
+
+# --- vibe (Mistral Vibe) ----------------------------------------------------
+# A Python package, installed against the same Python as the final image.
+FROM python:3.14-slim AS vibe-cli
+ARG VIBE_VERSION=3.0.4
+RUN pip install --no-cache-dir mistral-vibe==${VIBE_VERSION}
+
+# --- Final image -----------------------------------------------------------
 FROM python:3.14-slim
+ARG GO_VERSION=1.26.7
+ARG GH_VERSION=2.76.2
+ARG GLAB_VERSION=1.128.0
+# ca-certificates: the worker and the CLIs talk HTTPS to the manager, the git
+# host and the model API. git: the workspace is a git checkout.
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
  && rm -rf /var/lib/apt/lists/*
+# gh / glab: the CLI engines don't have Doppio's create_pr tool, they open
+# pull/merge requests with these.
+ADD https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.deb /tmp/gh.deb
+ADD https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads/glab_${GLAB_VERSION}_linux_amd64.deb /tmp/glab.deb
+RUN dpkg -i /tmp/gh.deb /tmp/glab.deb && rm -f /tmp/gh.deb /tmp/glab.deb
+# Node, npm and the Node-based CLIs (agents run `npm ci && npm run check` on
+# a checkout).
+COPY --from=node-clis /usr/local/bin /usr/local/bin
+COPY --from=node-clis /usr/local/lib/node_modules /usr/local/lib/node_modules
+# The Go toolchain (agents run `go test ./...` on a checkout).
+ADD https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz /tmp/go.tgz
+RUN tar -C /usr/local -xzf /tmp/go.tgz && rm -f /tmp/go.tgz
+ENV PATH=/usr/local/go/bin:$PATH
+# codex and vibe (all three vibe entry points: the launcher points the Rust
+# CLI at the vibe-app-server script next to itself).
+COPY --from=codex-cli /usr/local/bin/codex /usr/local/bin/codex
+COPY --from=vibe-cli /usr/local/bin/vibe* /usr/local/bin/
 WORKDIR /agent
 COPY deploy/agent/agent_worker.py /agent/agent_worker.py
 ENTRYPOINT ["python3", "-u", "/agent/agent_worker.py"]

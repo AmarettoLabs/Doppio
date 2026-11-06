@@ -91,6 +91,24 @@ func LookupEngine(e Engine) (EngineInfo, bool) {
 	return EngineInfo{}, false
 }
 
+// ToolCallMode is how the Doppio loop calls the model's tools.
+type ToolCallMode string
+
+const (
+	// ToolCallNative sends the tools as tool definitions in the provider's
+	// format and reads the structured tool calls from the reply.
+	ToolCallNative ToolCallMode = "native"
+	// ToolCallText asks for tool calls as JSON in a fenced block in the
+	// reply text.
+	ToolCallText ToolCallMode = "text"
+)
+
+// ValidToolCallMode reports whether m is a known mode; the empty string
+// (detect automatically) is valid.
+func ValidToolCallMode(m ToolCallMode) bool {
+	return m == "" || m == ToolCallNative || m == ToolCallText
+}
+
 // DefaultTaskMinutes is the time limit of one task when the agent has none.
 const DefaultTaskMinutes = 30
 
@@ -126,6 +144,10 @@ type Agent struct {
 	// MaxReplyTokens caps one model reply; 0 means the default for the
 	// agent's server (see DefaultMaxReplyTokens).
 	MaxReplyTokens int `json:"maxReplyTokens,omitempty"`
+	// ToolCallMode is how the Doppio loop calls tools: empty = detect
+	// automatically, "native" = the provider's built-in tool calling,
+	// "text" = tool calls as JSON in the reply.
+	ToolCallMode ToolCallMode `json:"toolCallMode,omitempty"`
 
 	Status string `json:"status"` // created, running, stopped, error
 	// RestartPending: the agent's settings were saved while it was busy; its

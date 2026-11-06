@@ -1,4 +1,5 @@
 """Tests for the agent worker. Run: python -m unittest discover -s deploy/agent"""
+import json
 import os
 import re
 import subprocess
@@ -248,27 +249,224 @@ class ParseToolCallTest(unittest.TestCase):
 
 
 class LlmCallTest(unittest.TestCase):
-    def reply(self, message):
-        orig = w.http_json
-        self.addCleanup(setattr, w, "http_json", orig)
-        w.http_json = lambda *a, **k: {"choices": [{"message": message}]}
-        return w.llm_call(agent(provider="mistral", model="m", apiToken="k"), "sys", [{"role": "user", "content": "hi"}])
+    """llm_call against recorded provider responses, both formats."""
 
-    def test_builtin_tool_calls_become_text_calls(self):
-        text = self.reply({"content": [{"type": "thinking", "thinking": [{"type": "text", "text": "hmm"}]}],
-                           "tool_calls": [{"type": "function", "function": {"name": "shell", "arguments": '{"command": "ls"}'}},
-                                          {"type": "function", "function": {"name": "shell", "arguments": '{"command": "pwd"}'}}]})
-        self.assertEqual(w.parse_tool_call(text), ("shell", {"tool": "shell", "command": "ls"}))
+    def setUp(self):
+        self.orig = w.http_json
+        self.addCleanup(setattr, w, "http_json", self.orig)
+        self.bodies = []
+
+    def fake(self, replies, provider="mistral", **cfg):
+        a = agent(provider=provider, model="m", apiToken="k", **cfg)
+
+        def http(method, url, headers, body=None, timeout=30):
+            self.bodies.append((url, body))
+            r = replies.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return r
+        w.http_json = http
+        return a
+
+    def run_loop(self, a, system="sys", prompt="hi"):
+        return w.doppio_engine(w.TaskRun(RunTaskMgr(), a, system, {"id": "t"}, prompt, WS_DIR))
+
+    # ---- native: OpenAI-compatible ----
+
+    def msg(self, content=None, tool_calls=None, finish=None):
+        m = {"content": content}
+        if tool_calls is not None:
+            m["tool_calls"] = tool_calls
+        return {"choices": [{"message": m, "finish_reason": finish}]}
+
+    def call(self, cid, name, args):
+        return {"id": cid, "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}
+
+    def test_native_single_call_then_answer(self):
+        a = self.fake([self.msg(tool_calls=[self.call("c1", "shell", {"command": "echo hi"})]),
+                       self.msg(content="all done")])
+        res = self.run_loop(a)
+        self.assertEqual((res.outcome, res.answer), ("done", "all done"))
+        # tools were declared, the call round-trips, the result comes back as a tool message
+        first, second = self.bodies
+        self.assertEqual(first[1]["tools"][0]["function"]["name"], "shell")
+        self.assertEqual(first[1]["messages"][0]["role"], "system")
+        assistant = second[1]["messages"][-2]
+        tool = second[1]["messages"][-1]
+        self.assertEqual((assistant["role"], assistant["tool_calls"][0]["id"]), ("assistant", "c1"))
+        self.assertEqual((tool["role"], tool["tool_call_id"], tool["content"]), ("tool", "c1", "exit=0\nhi"))
+
+    def test_native_several_calls_in_one_reply(self):
+        a = self.fake([self.msg(tool_calls=[self.call("c1", "shell", {"command": "echo one"}),
+                                            self.call("c2", "shell", {"command": "echo two"})]),
+                       self.msg(content="done")])
+        res = self.run_loop(a)
+        self.assertEqual(res.outcome, "done")
+        tool_msgs = [m for m in self.bodies[1][1]["messages"] if m["role"] == "tool"]
+        self.assertEqual([(m["tool_call_id"], m["content"]) for m in tool_msgs],
+                         [("c1", "exit=0\none"), ("c2", "exit=0\ntwo")])
+
+    def test_native_empty_reply_is_not_the_answer(self):
+        a = self.fake([self.msg(content=""), self.msg(content="here it is")])
+        res = self.run_loop(a)
+        self.assertEqual((res.outcome, res.answer), ("done", "here it is"))
+        # the empty assistant reply is kept as a placeholder, never sent empty
+        self.assertEqual(self.bodies[1][1]["messages"][-2]["content"], "(empty reply)")
+
+    def test_native_server_without_tool_support_falls_back_to_text(self):
+        for err in (
+            "HTTP 400 from https://x/v1/chat/completions: 'tools' is not supported",
+            "HTTP 422 from https://x/v1/chat/completions: Unrecognized request argument: tools",
+            "HTTP 400 from https://x/v1/messages: extra_forbidden: tools",
+            "HTTP 400: 'tool_choice' is not supported by this model",
+        ):
+            with self.subTest(err=err):
+                self.bodies = []
+                a = self.fake([RuntimeError(err),
+                               self.msg(content='```json\n{"tool":"shell","command":"echo hi"}\n```'),
+                               self.msg(content="done")])
+                res = self.run_loop(a)
+                self.assertEqual((res.outcome, res.answer), ("done", "done"))
+                self.assertNotIn("tools", self.bodies[1][1])  # fell back to the text format
+                self.assertIn("```json", self.bodies[1][1]["messages"][0]["content"])  # text spec
+
+    def test_conversation_bugs_do_not_switch_to_text(self):
+        # A 400 about the messages, not the tools parameter: switching cannot
+        # fix it, and the next request would fail more confusingly.
+        for err in (
+            "HTTP 400 from https://x/v1/chat/completions: Assistant message must have either content or tool_calls",
+            "HTTP 400 from https://x/v1/messages: tool_result block(s) provided when previous message has no tool_use",
+            "HTTP 400: Unexpected role 'user' after role 'tool'",
+            "HTTP 500 from https://x/v1/chat/completions: tools is not supported",
+        ):
+            with self.subTest(err=err):
+                self.bodies = []
+                a = self.fake([RuntimeError(err)])
+                with self.assertRaises(RuntimeError):
+                    self.run_loop(a)
+                self.assertIn("tools", self.bodies[0][1])  # still declared, no fallback
+
+    def test_no_fallback_after_the_first_request(self):
+        # Once native turns are in the history, a tools error is a server
+        # hiccup, not a missing feature: retry later, do not switch format.
+        a = self.fake([self.msg(tool_calls=[self.call("c1", "shell", {"command": "echo hi"})]),
+                       RuntimeError("HTTP 400 from https://x/v1/chat/completions: 'tools' is not supported")])
+        with self.assertRaises(w.NoToolSupport):
+            self.run_loop(a)  # run_task turns this into an "error" to retry later
+        self.assertIn("tools", self.bodies[1][1])  # no switch: tools still declared
+
+    # ---- native: Anthropic ----
+
+    def anthropic(self, blocks, stop=None):
+        return {"content": blocks, "stop_reason": stop}
+
+    def test_native_anthropic_tool_use_and_result(self):
+        a = self.fake([self.anthropic([{"type": "text", "text": "checking"},
+                                      {"type": "tool_use", "id": "tu1", "name": "shell", "input": {"command": "echo hi"}}]),
+                       self.anthropic([{"type": "text", "text": "all good"}])], provider="anthropic")
+        res = self.run_loop(a)
+        self.assertEqual((res.outcome, res.answer), ("done", "all good"))
+        url, body = self.bodies[0]
+        self.assertTrue(url.endswith("/v1/messages"))
+        self.assertEqual(body["tools"][0]["name"], "shell")
+        self.assertEqual([t["name"] for t in body["tools"]], list(w.TOOL_DEFS))
+        # the second request carries the assistant blocks and one tool_result user message
+        second = self.bodies[1][1]["messages"]
+        self.assertEqual(second[0]["role"], "user")  # the task prompt
+        self.assertEqual(second[1]["role"], "assistant")
+        self.assertEqual(second[1]["content"][1]["id"], "tu1")
+        self.assertEqual(second[2]["role"], "user")
+        self.assertEqual(second[2]["content"][0]["tool_use_id"], "tu1")
+        self.assertEqual(second[2]["content"][0]["content"], "exit=0\nhi")
+
+    def test_native_anthropic_no_tools_in_request_when_text_mode(self):
+        a = self.fake([self.anthropic([{"type": "text", "text": "plain answer"}])], provider="anthropic")
+        a = dict(a, toolCallMode="text")
+        res = self.run_loop(a)
+        self.assertEqual((res.outcome, res.answer), ("done", "plain answer"))
+        self.assertNotIn("tools", self.bodies[0][1])
+
+    # ---- forced modes ----
+
+    def test_forced_text_mode_never_declares_tools(self):
+        a = self.fake([self.msg(content='```json\n{"tool":"shell","command":"echo hi"}\n```'),
+                       self.msg(content="done")])
+        a = dict(a, toolCallMode="text")
+        res = self.run_loop(a)
+        self.assertEqual(res.answer, "done")
+        self.assertNotIn("tools", self.bodies[0][1])
+
+    def test_forced_native_mode_does_not_fall_back(self):
+        a = self.fake([RuntimeError("HTTP 400: 'tools' is not supported")], toolCallMode="native")
+        with self.assertRaises(w.NoToolSupport):
+            self.run_loop(a)  # forced native: no fallback to the text format
+
+    def test_native_model_writing_json_calls_is_run_and_switches_to_text(self):
+        # The server accepts the tools but the model answers in the text format.
+        call = '```json\n{"tool":"shell","command":"echo hi"}\n```'
+        replies = [self.msg(content=call) for _ in range(3)] + [self.msg(content="done")]
+        a = self.fake(replies)
+        res = self.run_loop(a)
+        self.assertEqual((res.outcome, res.answer), ("done", "done"))
+        # every call ran and its result came back, including the third one
+        for i in range(3):
+            self.assertIn("TOOL RESULT (shell):\nexit=0\nhi", self.bodies[i + 1][1]["messages"][-1]["content"])
+        # the 4th request is in the text format
+        self.assertNotIn("tools", self.bodies[3][1])
+        self.assertIn("```json", self.bodies[3][1]["messages"][0]["content"])
+
+    def test_native_text_call_result_comes_back_as_a_user_message(self):
+        call = '```json\n{"tool":"shell","command":"echo hi"}\n```'
+        a = self.fake([self.msg(content=call), self.msg(content="done")])
+        res = self.run_loop(a)
+        self.assertEqual(res.outcome, "done")
+        last = self.bodies[1][1]["messages"][-1]
+        self.assertEqual(last["role"], "user")
+        self.assertTrue(last["content"].startswith("TOOL RESULT (shell):"))
+
+    def test_text_mode_runs_a_native_call_the_server_returns_anyway(self):
+        # Mistral sometimes returns tool_calls even though no tools were
+        # declared: the call must run, not be dropped as an empty reply.
+        a = self.fake([self.msg(content="", tool_calls=[self.call("c1", "shell", {"command": "echo hi"})]),
+                       self.msg(content="done")], toolCallMode="text")
+        res = self.run_loop(a)
+        self.assertEqual((res.outcome, res.answer), ("done", "done"))
+        msgs = self.bodies[1][1]["messages"]
+        self.assertEqual(msgs[-2]["role"], "assistant")
+        self.assertIn('"tool": "shell"', msgs[-2]["content"])  # turned into the text format
+        self.assertTrue(msgs[-1]["content"].startswith("TOOL RESULT (shell):\nexit=0\nhi"))
+
+    def test_text_mode_prefers_the_json_call_in_the_text(self):
+        # A fenced call in the text wins over a stray native one.
+        a = self.fake([self.msg(content='```json\n{"tool":"shell","command":"echo one"}\n```',
+                                tool_calls=[self.call("c1", "shell", {"command": "echo two"})]),
+                       self.msg(content="done")], toolCallMode="text")
+        res = self.run_loop(a)
+        self.assertEqual(res.outcome, "done")
+        self.assertTrue(self.bodies[1][1]["messages"][-1]["content"].startswith("TOOL RESULT (shell):\nexit=0\none"))
+
+    # ---- reply cap ----
+
+    def test_truncated_replies_are_retried_then_fail(self):
+        a = self.fake([self.msg(content="same", finish="length"),
+                       self.msg(content="same", finish="length"),
+                       self.msg(content="same", finish="length")], maxTurns=10)
+        res = self.run_loop(a)
+        self.assertEqual(res.outcome, "failed")
+        self.assertIn("length limit", res.error)
+
+    def test_truncated_reply_is_followed_by_a_placeholder(self):
+        a = self.fake([self.msg(content="same", finish="length"), self.msg(content="done")])
+        res = self.run_loop(a)
+        self.assertEqual((res.outcome, res.answer), ("done", "done"))
+        # Mistral rejects a user message right after a tool message, and a
+        # request ending with two user messages: keep an assistant one between.
+        msgs = self.bodies[1][1]["messages"]
+        self.assertEqual(msgs[-2]["role"], "assistant")
+        self.assertEqual(msgs[-2]["content"], "(reply cut off: too long)")
+        self.assertEqual(msgs[-1]["role"], "user")
 
     def test_reply_length_is_capped(self):
-        bodies = []
-        orig = w.http_json
-        self.addCleanup(setattr, w, "http_json", orig)
-
-        def fake(method, url, headers, body=None, timeout=30):
-            bodies.append(body)
-            return {"choices": [{"message": {"content": "same same same"}, "finish_reason": "length"}]}
-        w.http_json = fake
         cases = [
             # provider, apiBase, maxReplyTokens, field, cap
             ("openai", "", 0, "max_completion_tokens", 32768),
@@ -278,51 +476,33 @@ class LlmCallTest(unittest.TestCase):
             ("custom", "http://x/v1", 20000, "max_tokens", 20000),
         ]
         for provider, base, cap, field, want in cases:
-            with self.assertRaises(w.ReplyTruncated):
-                w.llm_call(agent(provider=provider, model="m", apiToken="k", apiBase=base, maxReplyTokens=cap), "sys", [])
-            self.assertEqual(bodies[-1][field], want, (provider, base, cap))
+            a = self.fake([self.msg(content="same", finish="length") for _ in range(3)],
+                          provider=provider, apiBase=base, maxReplyTokens=cap)
+            res = self.run_loop(a)
+            self.assertEqual(res.outcome, "failed")
+            self.assertEqual(self.bodies[-1][1][field], want, (provider, base, cap))
 
-    def test_truncated_replies_are_retried_then_fail(self):
-        orig = w.llm_call
-        self.addCleanup(setattr, w, "llm_call", orig)
-        replies = iter([w.ReplyTruncated("cut"), "Done, concisely."])
-        sent = []
 
-        def fake(agent_, system, messages):
-            sent.append([dict(m) for m in messages])
-            r = next(replies)
-            if isinstance(r, Exception):
-                raise r
-            return r
-        w.llm_call = fake
-        self.assertEqual(w.run_task(RunTaskMgr(), agent(), "sys", {"id": "t", "title": "x", "input": "hi"}), "done")
-        self.assertIn("cut off", sent[-1][-1]["content"])
+class ToolModeTest(unittest.TestCase):
+    def test_tool_spec_by_mode(self):
+        a = agent(gitRepos=["o/r"])
+        for native in (False, True):
+            spec = w.tool_spec(a, native)
+            self.assertIn("Repos you watch: o/r.", spec)
+            self.assertNotIn("{repos}", spec)
+            self.assertTrue(spec.startswith("\n\n"), "the spec needs a separator")
+        self.assertIn("```json", w.tool_spec(a, False))
+        self.assertNotIn("```json", w.tool_spec(a, True))
+        self.assertIn("tools", w.tool_spec(a, True))
 
-        def always(*a):
-            raise w.ReplyTruncated("cut")
-        w.llm_call = always
-        mgr = RunTaskMgr()
-        self.assertEqual(w.run_task(mgr, agent(maxTurns=10), "sys", {"id": "t", "title": "x", "input": "hi"}), "failed")
-        self.assertIn("length limit", mgr.finished[-1][2])
 
-    def test_text_calls_win_and_plain_answers_stay(self):
-        text = self.reply({"content": '```json\n{"tool":"read_file","path":"a"}\n```',
-                           "tool_calls": [{"function": {"name": "shell", "arguments": {"command": "ls"}}}]})
-        self.assertEqual(w.parse_tool_call(text)[0], "read_file")
-        self.assertEqual(self.reply({"content": "Done.", "tool_calls": None}), "Done.")
+class RunTaskMgr(MgrStub):
+    def __init__(self):
+        super().__init__()
+        self.finished = []
 
-    def test_empty_replies_are_never_sent_back_empty(self):
-        replies = iter(["", "All done."])
-        sent = []
-        orig = w.llm_call
-        self.addCleanup(setattr, w, "llm_call", orig)
-        def fake(agent_, system, messages):
-            sent.append([dict(m) for m in messages])
-            return next(replies)
-        w.llm_call = fake
-        mgr = RunTaskMgr()
-        self.assertEqual(w.run_task(mgr, agent(), "sys", {"id": "t", "title": "x", "input": "hi"}), "done")
-        self.assertTrue(all(m["content"] for m in sent[-1]))
+    def finish(self, task_id, status, output="", error=""):
+        self.finished.append((task_id, status, error))
 
 
 class EngineTest(unittest.TestCase):
@@ -435,15 +615,6 @@ class SourceTest(unittest.TestCase):
                          "bot/10-ci-checks-for-migrations")
 
 
-class RunTaskMgr(MgrStub):
-    def __init__(self):
-        super().__init__()
-        self.finished = []
-
-    def finish(self, task_id, status, output="", error=""):
-        self.finished.append((task_id, status, error))
-
-
 class RetryTest(unittest.TestCase):
     def setUp(self):
         orig = w.llm_call
@@ -453,15 +624,20 @@ class RetryTest(unittest.TestCase):
     def run_with(self, reply):
         w.llm_call = reply
         mgr = RunTaskMgr()
-        out = w.run_task(mgr, agent(maxTurns=1), "sys", {"id": "t1", "title": "x", "input": "hi"})
+        out = w.run_task(mgr, agent(maxTurns=1, toolCallMode="text"), "sys",
+                         {"id": "t1", "title": "x", "input": "hi"})
         return out, mgr
+
+    @staticmethod
+    def text_reply(text):
+        return lambda *a, **k: w.Reply(text)
 
     def test_run_task_outcomes(self):
         def broken(*a):
             raise RuntimeError("HTTP 401 from https://llm/v1/chat/completions")
         self.assertEqual(self.run_with(broken)[0], "error")
-        self.assertEqual(self.run_with(lambda *a: '```json\n{"tool":"read_file","path":"x"}\n```')[0], "failed")
-        out, mgr = self.run_with(lambda *a: "all good")
+        self.assertEqual(self.run_with(self.text_reply('```json\n{"tool":"read_file","path":"x"}\n```'))[0], "failed")
+        out, mgr = self.run_with(self.text_reply("all good"))
         self.assertEqual((out, mgr.finished[-1][1]), ("done", "done"))
 
     def test_errors_are_retried_then_given_up_until_restart(self):

@@ -37,6 +37,7 @@
 	let taskMinutes = $state(initial?.taskMinutes ?? 30);
 	// Empty = the default for the server, shown as the placeholder.
 	let maxReplyTokens = $state<number | null>(initial?.maxReplyTokens || null);
+	let toolCallMode = $state(initial?.toolCallMode || '');
 	const defaultReplyTokens = $derived.by(() => {
 		const p = providers.find((x) => x.id === provider);
 		const base = apiBase.trim().replace(/\/+$/, '');
@@ -95,7 +96,8 @@
 				maxTurns: Number(maxTurns) || 25,
 				engine,
 				taskMinutes: Number(taskMinutes) || 30,
-				maxReplyTokens: Number(maxReplyTokens) || 0
+				maxReplyTokens: Number(maxReplyTokens) || 0,
+				toolCallMode
 			});
 		} catch (e) {
 			error = String(e instanceof Error ? e.message : e);
@@ -230,6 +232,15 @@
 		<label for="f-reply">Max reply tokens (Doppio loop)</label>
 		<input id="f-reply" type="number" min="256" bind:value={maxReplyTokens} placeholder={`default: ${defaultReplyTokens}`} />
 		<p class="hint">Caps one model reply, thinking included. Leave empty for the default: {HOSTED_MAX_REPLY_TOKENS} on a provider's own API, {LOCAL_MAX_REPLY_TOKENS} on custom and local servers, where a looping reply keeps the GPU busy.</p>
+	</div>
+	<div class="field">
+		<label for="f-toolmode">Tool calls (Doppio loop)</label>
+		<select id="f-toolmode" bind:value={toolCallMode}>
+			<option value="">Detect automatically</option>
+			<option value="native">Provider's built-in tool calling</option>
+			<option value="text">JSON tool calls in the reply</option>
+		</select>
+		<p class="hint">Built-in tool calling when the server supports it, otherwise tool calls as JSON in the reply; falls back automatically. Force it here if detection misbehaves.</p>
 	</div>
 	<div class="field">
 		<label for="f-minutes">Time limit per task (minutes)</label>

@@ -30,6 +30,8 @@ export interface AgentView {
 	taskMinutes: number;
 	maxReplyTokens: number;
 	defaultMaxReplyTokens: number;
+	/** how the Doppio loop calls tools: '' = detect, 'native', 'text' */
+	toolCallMode: string;
 	createdAt: string;
 	updatedAt: string;
 }
@@ -57,6 +59,8 @@ export interface AgentPayload {
 	taskMinutes: number;
 	/** 0 = the default for the agent's server */
 	maxReplyTokens: number;
+	/** '' = detect automatically, 'native' or 'text' */
+	toolCallMode: string;
 }
 
 /** Reply caps when an agent sets none (keep in sync with the Go model). */

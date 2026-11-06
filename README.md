@@ -95,6 +95,12 @@ listed in the agent form and will become selectable as they're added. Whatever
 the engine, the worker handles the git side: triggers, workspace, guidance and
 posting the answer.
 
+The Doppio loop calls the model's tools with the provider's built-in tool
+calling (OpenAI-compatible `tools`/`tool_calls`, Anthropic
+`tools`/`tool_use`/`tool_result`) and falls back to tool calls as JSON in the
+reply when the server does not support it; the agent settings can force either
+format.
+
 Each task has a time limit (30 minutes by default, set per agent). A task
 still running then is stopped and retried at a later git check, like other
 infrastructure failures.

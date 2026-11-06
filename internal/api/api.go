@@ -145,13 +145,17 @@ type AgentView struct {
 	TaskMinutes int      `json:"taskMinutes"`
 	// MaxReplyTokens: 0 = the default for the agent's server, which
 	// DefaultMaxReplyTokens gives.
-	MaxReplyTokens        int        `json:"maxReplyTokens"`
-	DefaultMaxReplyTokens int        `json:"defaultMaxReplyTokens"`
-	Status                string     `json:"status"`
-	ContainerID           string     `json:"containerId,omitempty"`
-	Error                 string     `json:"error,omitempty"`
-	LastPollAt            *time.Time `json:"lastPollAt,omitempty"`
-	NextPollAt            *time.Time `json:"nextPollAt,omitempty"`
+	MaxReplyTokens        int `json:"maxReplyTokens"`
+	DefaultMaxReplyTokens int `json:"defaultMaxReplyTokens"`
+	// ToolCallMode is how the Doppio loop calls tools: "" = detect
+	// automatically, "native" = the provider's built-in tool calling,
+	// "text" = JSON tool calls in the reply.
+	ToolCallMode string     `json:"toolCallMode"`
+	Status       string     `json:"status"`
+	ContainerID  string     `json:"containerId,omitempty"`
+	Error        string     `json:"error,omitempty"`
+	LastPollAt   *time.Time `json:"lastPollAt,omitempty"`
+	NextPollAt   *time.Time `json:"nextPollAt,omitempty"`
 	// Working is true while one of the agent's tasks is running or pending.
 	// Only set by the list/get endpoints.
 	Working bool `json:"working"`
@@ -173,7 +177,8 @@ func toView(a *model.Agent) AgentView {
 		MaxTurns:    maxTurnsOrDefault(a.MaxTurns),
 		Engine:      string(a.EffectiveEngine()), TaskMinutes: a.EffectiveTaskMinutes(),
 		MaxReplyTokens: a.MaxReplyTokens, DefaultMaxReplyTokens: a.DefaultMaxReplyTokens(),
-		Status: a.Status, ContainerID: a.ContainerID, Error: a.Error,
+		ToolCallMode: string(a.ToolCallMode),
+		Status:       a.Status, ContainerID: a.ContainerID, Error: a.Error,
 		LastPollAt: a.LastPollAt, NextPollAt: a.NextPollAt,
 		RestartPending: a.RestartPending,
 		CreatedAt:      a.CreatedAt, UpdatedAt: a.UpdatedAt,
@@ -208,6 +213,8 @@ type agentInput struct {
 	TaskMinutes int `json:"taskMinutes"`
 	// MaxReplyTokens: 0 = the default for the agent's server.
 	MaxReplyTokens int `json:"maxReplyTokens"`
+	// ToolCallMode: "" = detect automatically.
+	ToolCallMode string `json:"toolCallMode"`
 }
 
 func triggerStrings(ts []model.Trigger) []string {
@@ -353,6 +360,9 @@ func (in *agentInput) validate() string {
 	if in.TaskMinutes < 0 || in.TaskMinutes > 24*60 {
 		return "taskMinutes must be between 1 and 1440 (0 = default)"
 	}
+	if in.ToolCallMode != "" && !model.ValidToolCallMode(model.ToolCallMode(in.ToolCallMode)) {
+		return "toolCallMode must be native or text (empty = detect automatically)"
+	}
 	return ""
 }
 
@@ -495,6 +505,7 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		Engine:         model.Engine(orDefault(in.Engine, string(model.EngineDoppio))),
 		TaskMinutes:    in.TaskMinutes,
 		MaxReplyTokens: in.MaxReplyTokens,
+		ToolCallMode:   model.ToolCallMode(in.ToolCallMode),
 		Status:         "created",
 		CreatedAt:      now,
 		UpdatedAt:      now,
@@ -556,6 +567,7 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		a.TaskMinutes = in.TaskMinutes
 	}
 	a.MaxReplyTokens = in.MaxReplyTokens
+	a.ToolCallMode = model.ToolCallMode(in.ToolCallMode)
 	a.UpdatedAt = time.Now().UTC()
 	if err := s.store.UpsertAgent(a); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())

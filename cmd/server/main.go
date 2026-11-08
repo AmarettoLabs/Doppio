@@ -15,6 +15,9 @@
 //	DOCKER_BIN       docker CLI binary (default docker)
 //	AGENT_EXTRA_HOSTS  "host:ip" entries (comma-separated) added to agents' /etc/hosts
 //	AGENT_CA_BUNDLE  PEM file of extra CA certificates agents trust (path as seen by the manager)
+//
+// Shared logins ("accounts") live under DATA_DIR/accounts/<id>/ with mode
+// 0600; their credentials are mounted into agent containers read-only.
 package main
 
 import (

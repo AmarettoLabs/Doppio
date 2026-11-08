@@ -795,3 +795,36 @@ class PrepareTaskTest(Patched):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AccountTest(unittest.TestCase):
+    def test_load_account_missing_file(self):
+        with unittest.mock.patch.object(w, "ACCOUNT_PATH", "/nonexistent/account.json"):
+            self.assertEqual(w.load_account(), {})
+
+    def test_load_account_reads_fields(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"apiToken": "sk-shared"}, f)
+            path = f.name
+        try:
+            with unittest.mock.patch.object(w, "ACCOUNT_PATH", path):
+                self.assertEqual(w.load_account(), {"apiToken": "sk-shared"})
+        finally:
+            os.unlink(path)
+
+    def test_apply_account_overlays_token_and_base(self):
+        agent = w.apply_account({"apiToken": "own", "apiBase": "", "provider": "openai"},
+                                {"apiToken": "sk-shared", "baseURL": "https://llm:8443/v1"})
+        self.assertEqual(agent["apiToken"], "sk-shared")
+        self.assertEqual(agent["apiBase"], "https://llm:8443/v1")
+
+    def test_apply_account_cli_token(self):
+        agent = w.apply_account({"apiToken": ""}, {"token": "claude-tok"})
+        self.assertEqual(agent["accountToken"], "claude-tok")
+        self.assertEqual(agent["apiToken"], "")
+        agent = w.apply_account({}, {"apiKey": "vibe-key"})
+        self.assertEqual(agent["accountToken"], "vibe-key")
+
+    def test_apply_account_without_account_keeps_agent(self):
+        a = {"apiToken": "own"}
+        self.assertEqual(w.apply_account(a, {}), a)

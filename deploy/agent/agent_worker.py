@@ -27,6 +27,9 @@ import urllib.parse
 import urllib.request
 
 CFG_PATH = os.environ.get("AGENT_CONFIG", "/agent/config.json")
+# The shared account's credentials, written by the manager next to the config
+# (read-only mount); absent when the agent uses its own API token.
+ACCOUNT_PATH = os.environ.get("AGENT_ACCOUNT", "/agent/state/account.json")
 WS = os.environ.get("AGENT_WORKSPACE", "/agent/workspace")
 TASK_POLL_SECONDS = 5
 
@@ -39,6 +42,35 @@ DEFAULT_BASE = {
 
 def log(*a):
     print("[doppio]", *a, flush=True)
+
+
+def load_account():
+    """The shared account's credentials (field -> value), or {} when the agent
+    has no account. Never logged."""
+    try:
+        with open(ACCOUNT_PATH) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def apply_account(agent, account):
+    """Overlay the shared account on the agent config: an API-key account
+    replaces the model token/base, a CLI account (claude-code, codex, vibe)
+    hands its credentials to the engine instead of an API key."""
+    if not account:
+        return agent
+    out = dict(agent)
+    if account.get("apiToken"):
+        out["apiToken"] = account["apiToken"]
+    if account.get("baseURL"):
+        out["apiBase"] = account["baseURL"]
+    if account.get("token"):
+        out["accountToken"] = account["token"]  # e.g. claude setup-token
+    if account.get("apiKey"):
+        out["accountToken"] = account["apiKey"]  # e.g. Vibe's MISTRAL_API_KEY
+    return out
 
 
 def normalize_login(s):
@@ -1683,7 +1715,7 @@ def main():
     setup_extra_ca()
     with open(CFG_PATH) as f:
         cfg = json.load(f)
-    agent = cfg["agent"]
+    agent = apply_account(cfg["agent"], load_account())
     mgr = Manager(cfg)
     os.makedirs(WS, exist_ok=True)
     state_path = os.path.join(WS, "worker-state.json")

@@ -86,6 +86,28 @@ Saving a running agent's settings restarts its container so they take effect.
 If the agent is busy (a task, or a git check), the restart waits until it's
 done and the agent page shows "Restart pending" meanwhile.
 
+## Accounts
+
+CLI engines log in with an account rather than an API key per agent, so logins
+are their own objects: the **Accounts** page lists, creates, renames and deletes
+them. One account per provider is shared by every agent that uses its engine.
+
+| Kind | Credentials |
+| --- | --- |
+| API key (Doppio loop) | a pasted key for OpenAI / Anthropic / Mistral / a custom `provider/model` |
+| OpenAI-compatible endpoint | base URL + token (e.g. a local LLM; uses the extra hosts / CA bundle settings) |
+| Claude Code | the long-lived token from `claude setup-token`, pasted |
+| Codex CLI | ChatGPT login (device-code flow) |
+| Mistral Vibe | the `MISTRAL_API_KEY` Vibe writes to `~/.vibe/.env`, pasted |
+
+Credentials are stored once under `DATA_DIR/accounts/<id>/` (mode 0600), are
+never returned by the API (only which fields are set) and never written to
+events or logs. An agent references an account in its settings; the manager
+passes the account's credentials into the agent's container on start, read-only.
+Deleting an account is refused while an agent still uses it, with the list of
+those agents. Existing per-agent API tokens keep working; moving them to an
+account is optional.
+
 ## Engines
 
 An agent's **engine** runs its tasks. The default, and for now the only one

@@ -98,7 +98,9 @@
 				pollSeconds: Number(pollSeconds) || 1800,
 				maxTurns: Number(maxTurns) || 25,
 				engine,
-				accountId,
+				// '' would mean "keep the stored account" on update; the
+				// "(own API token below)" option clears it instead.
+				accountId: accountId === '' ? 'none' : accountId,
 				taskMinutes: Number(taskMinutes) || 30,
 				maxReplyTokens: Number(maxReplyTokens) || 0,
 				toolCallMode

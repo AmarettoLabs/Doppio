@@ -54,8 +54,10 @@
 			return;
 		}
 		const payload: AccountPayload = { name: name.trim(), kind, notes: notes.trim() };
-		if (editing) payload.secrets = { ...secretValues };
-		else payload.secrets = Object.fromEntries(Object.entries(secretValues).filter(([, v]) => v.trim() !== ''));
+		// Only the fields that were typed are sent: on edit an untouched field
+		// (empty input = "keep the stored value") is left out, so the store
+		// keeps it instead of clearing it.
+		payload.secrets = Object.fromEntries(Object.entries(secretValues).filter(([, v]) => v.trim() !== ''));
 		busy = editing ? editing.id : 'new';
 		try {
 			if (editing) await api.updateAccount(editing.id, payload);

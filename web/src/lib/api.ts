@@ -111,7 +111,10 @@ export interface AccountPayload {
 	name: string;
 	kind: string;
 	notes: string;
-	/** nil/absent on update = keep the stored secrets */
+	/**
+	 * Credential fields to write. Only the fields present are written: on
+	 * update a missing field keeps its stored value (absent/nil also keeps all).
+	 */
 	secrets?: Record<string, string>;
 }
 

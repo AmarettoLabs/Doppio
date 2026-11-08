@@ -111,9 +111,9 @@ func (a *Accounts) Create(name string, kind model.AccountKind, notes string, sec
 	return acc, nil
 }
 
-// Update renames an account and/or replaces its secrets. A nil secrets map
-// keeps the stored ones; a non-nil map writes exactly the given fields (empty
-// values clear them).
+// Update renames an account and/or updates its secrets. A nil secrets map
+// keeps every stored field; a non-nil map touches only the fields it contains
+// (an empty value clears that field, a missing field is left alone).
 func (a *Accounts) Update(id, name, notes string, secrets map[string]string) (*model.Account, error) {
 	a.s.mu.Lock()
 	acc := a.s.data.Accounts[id]
@@ -172,7 +172,10 @@ func (a *Accounts) AgentsUsing(id string) []string {
 }
 
 // writeSecrets writes the given secret fields to the account's dir with mode
-// 0600 and updates the account's SecretSet flags. Unknown fields for the
+// 0600 and updates the account's SecretSet flags. Only the fields present in
+// the map are touched: a field sent as "" is cleared, a field missing from the
+// map keeps its stored value (so an update that renames the account, or fills
+// only one of several fields, never wipes the others). Unknown fields for the
 // account's kind are rejected.
 func (a *Accounts) writeSecrets(acc *model.Account, secrets map[string]string) error {
 	info, ok := model.LookupAccountKind(acc.Kind)
@@ -189,21 +192,6 @@ func (a *Accounts) writeSecrets(acc *model.Account, secrets map[string]string) e
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
-	}
-	// Clear flags and files for fields that are not part of this write.
-	for _, f := range info.SecretFields {
-		if secrets != nil {
-			if _, keep := secrets[f]; !keep {
-				acc.UnsetSecret(f)
-				p, err := a.secretPath(acc.ID, f)
-				if err != nil {
-					return err
-				}
-				if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
-					return err
-				}
-			}
-		}
 	}
 	for field, value := range secrets {
 		if !allowed[field] {

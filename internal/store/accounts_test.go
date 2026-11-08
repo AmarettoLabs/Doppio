@@ -103,6 +103,46 @@ func TestAccountCreateReadUpdateDelete(t *testing.T) {
 	}
 }
 
+// TestUpdatePartialSecrets: a non-nil secrets map touches only the fields it
+// contains; the others keep their stored values.
+func TestUpdatePartialSecrets(t *testing.T) {
+	_, ac := openAccounts(t)
+	acc, err := ac.Create("ep", model.AcctEndpoint, "", map[string]string{"baseURL": "https://llm:8443/v1", "apiToken": "tok-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Rename with an empty (non-nil) map keeps both fields.
+	if _, err := ac.Update(acc.ID, "ep2", "", map[string]string{}); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := ac.ReadSecret(acc.ID, "baseURL"); v != "https://llm:8443/v1" {
+		t.Fatalf("baseURL lost on empty-map update: %q", v)
+	}
+	if v, _ := ac.ReadSecret(acc.ID, "apiToken"); v != "tok-1" {
+		t.Fatalf("apiToken lost on empty-map update: %q", v)
+	}
+	// Only one field in the map: the other is untouched.
+	if _, err := ac.Update(acc.ID, "", "", map[string]string{"apiToken": "tok-2"}); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := ac.ReadSecret(acc.ID, "apiToken"); v != "tok-2" {
+		t.Fatalf("apiToken not updated: %q", v)
+	}
+	if v, _ := ac.ReadSecret(acc.ID, "baseURL"); v != "https://llm:8443/v1" {
+		t.Fatalf("baseURL wiped by a one-field update: %q", v)
+	}
+	// A field sent as "" clears exactly that field.
+	if _, err := ac.Update(acc.ID, "", "", map[string]string{"apiToken": ""}); err != nil {
+		t.Fatal(err)
+	}
+	if ac.Get(acc.ID).HasSecret("apiToken") {
+		t.Fatal("cleared field still marked set")
+	}
+	if v, _ := ac.ReadSecret(acc.ID, "baseURL"); v != "https://llm:8443/v1" {
+		t.Fatalf("clearing one field wiped the other: %q", v)
+	}
+}
+
 func TestAccountKindValidation(t *testing.T) {
 	_, ac := openAccounts(t)
 	if _, err := ac.Create("", model.AcctAPIKey, "", nil); err == nil {

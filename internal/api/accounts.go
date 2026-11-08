@@ -138,7 +138,8 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
-	if s.store.Accounts().Get(id) == nil {
+	acc := s.store.Accounts().Get(id)
+	if acc == nil {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
@@ -146,7 +147,7 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, msg)
 		return
 	}
-	if in.Kind != "" {
+	if in.Kind != "" && model.AccountKind(in.Kind) != acc.Kind {
 		// The kind only changes together with its secrets; refuse a bare kind
 		// switch so an account never ends up with another kind's fields.
 		if in.Secrets == nil {

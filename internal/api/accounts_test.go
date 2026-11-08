@@ -143,6 +143,56 @@ func TestAccountCRUDAndSecretHandling(t *testing.T) {
 	}
 }
 
+// TestUpdateKeepsUnsentSecrets is the portal's save flow: an edit that does not
+// touch a credential field (the input stays empty = "keep the stored value")
+// must not clear it, and filling only one of an endpoint's two fields must
+// keep the other.
+func TestUpdateKeepsUnsentSecrets(t *testing.T) {
+	srv, st := newTestServer(t, "")
+	h := srv.Handler()
+
+	id, _ := createAccount(t, h, `{"name":"ep","kind":"endpoint","secrets":{"baseURL":"https://llm:8443/v1","apiToken":"tok-1"}}`)
+
+	// Rename with an empty secrets map: both fields survive.
+	rec, m := doJSON(t, h, "PATCH", "/api/accounts/"+id, `{"name":"ep2","kind":"endpoint","notes":"","secrets":{}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("rename with empty secrets: %d %s", rec.Code, rec.Body)
+	}
+	if m["name"] != "ep2" || m["status"] != "configured" || m["hasSecrets"] != true {
+		t.Fatalf("rename wiped the secrets: %s", mustJSON(m))
+	}
+	if v, _ := st.Accounts().ReadSecret(id, "baseURL"); v != "https://llm:8443/v1" {
+		t.Fatalf("baseURL lost: %q", v)
+	}
+	if v, _ := st.Accounts().ReadSecret(id, "apiToken"); v != "tok-1" {
+		t.Fatalf("apiToken lost: %q", v)
+	}
+
+	// Update only one of the two fields: the other is kept.
+	rec, m = doJSON(t, h, "PATCH", "/api/accounts/"+id, `{"secrets":{"apiToken":"tok-2"}}`)
+	if rec.Code != http.StatusOK || m["status"] != "configured" {
+		t.Fatalf("one-field update: %d %s", rec.Code, rec.Body)
+	}
+	if v, _ := st.Accounts().ReadSecret(id, "apiToken"); v != "tok-2" {
+		t.Fatalf("apiToken not updated: %q", v)
+	}
+	if v, _ := st.Accounts().ReadSecret(id, "baseURL"); v != "https://llm:8443/v1" {
+		t.Fatalf("baseURL wiped by a one-field update: %q", v)
+	}
+
+	// A field sent as "" still clears exactly that field.
+	rec, m = doJSON(t, h, "PATCH", "/api/accounts/"+id, `{"secrets":{"apiToken":""}}`)
+	if rec.Code != http.StatusOK || m["status"] != "missing" {
+		t.Fatalf("clear one field: %d %s", rec.Code, rec.Body)
+	}
+	if v, _ := st.Accounts().ReadSecret(id, "apiToken"); v != "" {
+		t.Fatalf("apiToken not cleared: %q", v)
+	}
+	if v, _ := st.Accounts().ReadSecret(id, "baseURL"); v != "https://llm:8443/v1" {
+		t.Fatalf("clearing apiToken wiped baseURL too: %q", v)
+	}
+}
+
 func TestDeleteAccountInUseIsRefused(t *testing.T) {
 	srv, st := newTestServer(t, "")
 	h := srv.Handler()

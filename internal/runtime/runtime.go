@@ -213,7 +213,18 @@ func checkPEMCerts(b []byte) error {
 
 // Start creates and starts the agent's container, returning its ID.
 func (r *Runtime) Start(a *model.Agent) (string, error) {
+	return r.StartWithAccounts(a, nil)
+}
+
+// StartWithAccounts is Start with the shared account credentials to pass into
+// the container (nil/empty for agents that use their own token). The secrets
+// are written to a 0600 file in the agent's state dir, which is mounted
+// read-only; nothing is passed via env or labels.
+func (r *Runtime) StartWithAccounts(a *model.Agent, accountSecrets map[string]string) (string, error) {
 	if _, err := r.writeConfig(a); err != nil {
+		return "", err
+	}
+	if err := r.writeAccount(a, accountSecrets); err != nil {
 		return "", err
 	}
 	hasCA, err := r.writeCABundle(a)
@@ -249,6 +260,27 @@ func (r *Runtime) Start(a *model.Agent) (string, error) {
 		return "", fmt.Errorf("docker run: %v: %s", err, strings.TrimSpace(out))
 	}
 	return strings.TrimSpace(out), nil
+}
+
+// accountFile is the account credentials' name in the per-agent state dir,
+// mounted in the container at /agent/state.
+const accountFile = "account.json"
+
+// writeAccount writes the shared account's credentials into the agent's state
+// dir as a 0600 file, or removes a stale one when the agent has no account.
+func (r *Runtime) writeAccount(a *model.Agent, secrets map[string]string) error {
+	p := filepath.Join(r.agentDir(a.ID), accountFile)
+	if len(secrets) == 0 {
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	b, err := json.MarshalIndent(secrets, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(p, b, 0o600)
 }
 
 // Stop stops and removes the agent's container.

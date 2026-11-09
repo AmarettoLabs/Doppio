@@ -140,7 +140,10 @@
 	<div class="panel">
 		<dl class="summary">
 			<dt>Engine</dt><dd>{agent.engine === 'doppio' ? 'Doppio loop' : agent.engine} · {agent.taskMinutes} min per task</dd>
-			<dt>Model</dt><dd>{agent.provider}/{agent.model}{agent.apiBase ? ` (${agent.apiBase})` : ''} · token {agent.hasApiToken ? 'set' : 'missing'}</dd>
+			<dt>Model</dt><dd>{agent.provider}/{agent.model}{agent.apiBase ? ` (${agent.apiBase})` : ''} · token {agent.accountId ? 'via account' : agent.hasApiToken ? 'set' : 'missing'}</dd>
+			{#if agent.accountId}
+				<dt>Account</dt><dd><a href="/accounts">{agent.accountName ?? agent.accountId}</a></dd>
+			{/if}
 			<dt>Emails</dt><dd>{agent.emails?.join(', ') || '—'}</dd>
 			<dt>Git</dt><dd>{agent.gitProvider && agent.gitProvider !== 'none' ? `${agent.gitProvider} @${agent.gitLogin ?? ''} · token ${agent.hasGitToken ? 'set' : 'missing'} · repos ${(agent.gitRepos ?? []).join(', ') || '—'}${agent.ownerLogin ? ` · owner @${agent.ownerLogin}` : ''}` : '—'}</dd>
 			{#if agent.gitProvider && agent.gitProvider !== 'none'}

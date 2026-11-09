@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { api, splitList, TRIGGERS, HOSTED_MAX_REPLY_TOKENS, LOCAL_MAX_REPLY_TOKENS, type AgentPayload, type AgentView, type EngineInfo, type GitProviderInfo, type ProviderInfo } from './api';
+	import { api, splitList, TRIGGERS, HOSTED_MAX_REPLY_TOKENS, LOCAL_MAX_REPLY_TOKENS, type AccountView, type AgentPayload, type AgentView, type EngineInfo, type GitProviderInfo, type ProviderInfo } from './api';
 
 	let {
 		initial = null,
@@ -13,6 +13,7 @@
 	let providers = $state<ProviderInfo[]>([]);
 	let gitProviders = $state<GitProviderInfo[]>([]);
 	let engines = $state<EngineInfo[]>([{ id: 'doppio', label: 'Doppio loop', available: true }]);
+	let accounts = $state<AccountView[]>([]);
 
 	let name = $state(initial?.name ?? '');
 	let provider = $state(initial?.provider ?? 'openai');
@@ -34,6 +35,7 @@
 	let pollSeconds = $state(initial?.pollSeconds ?? 1800);
 	let maxTurns = $state(initial?.maxTurns ?? 25);
 	let engine = $state(initial?.engine ?? 'doppio');
+	let accountId = $state(initial?.accountId ?? '');
 	let taskMinutes = $state(initial?.taskMinutes ?? 30);
 	// Empty = the default for the server, shown as the placeholder.
 	let maxReplyTokens = $state<number | null>(initial?.maxReplyTokens || null);
@@ -53,6 +55,7 @@
 		providers = p.llm;
 		gitProviders = p.git;
 		if (p.engines?.length) engines = p.engines;
+		accounts = await api.accounts();
 		if (!initial) {
 			model = providers.find((x) => x.id === provider)?.models[0] ?? '';
 			apiBase = providers.find((x) => x.id === provider)?.apiBase ?? '';
@@ -95,6 +98,9 @@
 				pollSeconds: Number(pollSeconds) || 1800,
 				maxTurns: Number(maxTurns) || 25,
 				engine,
+				// '' would mean "keep the stored account" on update; the
+				// "(own API token below)" option clears it instead.
+				accountId: accountId === '' ? 'none' : accountId,
 				taskMinutes: Number(taskMinutes) || 30,
 				maxReplyTokens: Number(maxReplyTokens) || 0,
 				toolCallMode
@@ -122,6 +128,16 @@
 			{/each}
 		</select>
 		<p class="hint">What runs the agent's tasks: Doppio's own tool loop over the model below, or a coding CLI.</p>
+	</div>
+	<div class="field">
+		<label for="f-account">Account</label>
+		<select id="f-account" bind:value={accountId}>
+			<option value="">(own API token below)</option>
+			{#each accounts as a}
+				<option value={a.id}>{a.name} · {a.kindLabel}{a.status !== 'configured' ? ' (' + a.status + ')' : ''}</option>
+			{/each}
+		</select>
+		<p class="hint">Shared login from the <a href="/accounts">Accounts</a> page; its credentials are passed to the container instead of the token below.</p>
 	</div>
 	<div class="row">
 		<div class="field" style="flex:1">

@@ -24,6 +24,10 @@ type fakeContainers struct {
 
 func (f *fakeContainers) EnsureNetwork() error { return nil }
 func (f *fakeContainers) Start(a *model.Agent) (string, error) {
+	return f.StartWithAccounts(a, nil)
+}
+
+func (f *fakeContainers) StartWithAccounts(a *model.Agent, _ map[string]string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.running[a.ID] = true

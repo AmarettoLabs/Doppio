@@ -21,15 +21,22 @@ type Data struct {
 	Tasks       map[string]*model.Task  `json:"tasks"`
 	Events      []model.Event           `json:"events"`
 	NextEventID int64                   `json:"nextEventID"`
+	// Accounts are the shared logins; their secrets live in files under
+	// <dir>/accounts/<id>/, only the SecretSet flags are persisted here.
+	Accounts map[string]*model.Account `json:"accounts,omitempty"`
 }
 
 // Store is a goroutine-safe JSON-file store.
 type Store struct {
 	mu   sync.Mutex
+	dir  string
 	path string
 	data Data
 	keep int // max events kept per agent; 0 = unlimited
 }
+
+// Dir is the directory the store was opened in (secrets live under it).
+func (s *Store) Dir() string { return s.dir }
 
 // SetEventRetention caps how many events are kept per agent (0 = unlimited).
 // The oldest events are pruned on append.
@@ -45,6 +52,7 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{
+		dir:  dir,
 		path: filepath.Join(dir, "store.json"),
 		data: Data{Agents: map[string]*model.Agent{}, Tasks: map[string]*model.Task{}, NextEventID: 1},
 	}
@@ -65,6 +73,9 @@ func Open(dir string) (*Store, error) {
 	}
 	if s.data.NextEventID == 0 {
 		s.data.NextEventID = 1
+	}
+	if s.data.Accounts == nil {
+		s.data.Accounts = map[string]*model.Account{}
 	}
 	return s, nil
 }

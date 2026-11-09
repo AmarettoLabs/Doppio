@@ -139,6 +139,10 @@ type Agent struct {
 	// Engine runs the agent's tasks; empty (agents created before engines
 	// existed) means the Doppio loop.
 	Engine Engine `json:"engine,omitempty"`
+	// AccountID references the shared login (see Accounts) whose credentials
+	// the manager passes to the agent's container. Empty = the agent uses
+	// its own APIToken.
+	AccountID string `json:"accountId,omitempty"`
 	// TaskMinutes caps one task's run time; 0 means DefaultTaskMinutes.
 	TaskMinutes int `json:"taskMinutes,omitempty"`
 	// MaxReplyTokens caps one model reply; 0 means the default for the

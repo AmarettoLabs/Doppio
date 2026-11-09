@@ -32,6 +32,9 @@ export interface AgentView {
 	defaultMaxReplyTokens: number;
 	/** how the Doppio loop calls tools: '' = detect, 'native', 'text' */
 	toolCallMode: string;
+	/** shared login the agent uses; empty = its own API token */
+	accountId?: string;
+	accountName?: string;
 	createdAt: string;
 	updatedAt: string;
 }
@@ -61,6 +64,8 @@ export interface AgentPayload {
 	maxReplyTokens: number;
 	/** '' = detect automatically, 'native' or 'text' */
 	toolCallMode: string;
+	/** shared account to use; empty = keep, 'none' = clear */
+	accountId: string;
 }
 
 /** Reply caps when an agent sets none (keep in sync with the Go model). */
@@ -72,6 +77,46 @@ export interface EngineInfo {
 	id: string;
 	label: string;
 	available: boolean;
+}
+
+/** A kind of shared login (account). */
+export interface AccountKindInfo {
+	id: string;
+	label: string;
+	/** credential fields the account stores, e.g. ["apiToken"] */
+	secretFields: string[];
+	hint: string;
+}
+
+/** An account as the API returns it: secrets are never sent, only which fields are set. */
+export interface AccountView {
+	id: string;
+	name: string;
+	kind: string;
+	kindLabel: string;
+	/** the credential fields that are set */
+	secretFields: string[];
+	/** every field the kind needs is set */
+	hasSecrets: boolean;
+	notes?: string;
+	/** names of the agents using this account */
+	agents: string[];
+	/** configured, missing, expired */
+	status: string;
+	createdAt: string;
+	updatedAt: string;
+}
+
+export interface AccountPayload {
+	name: string;
+	kind: string;
+	/** absent on update = keep the stored notes, "" clears them */
+	notes?: string;
+	/**
+	 * Credential fields to write. Only the fields present are written: on
+	 * update a missing field keeps its stored value (absent/nil also keeps all).
+	 */
+	secrets?: Record<string, string>;
 }
 
 /** Git activity an agent can respond to, in display order. */
@@ -169,7 +214,13 @@ export const api = {
 	tasks: (id: string) => req<Task[]>(`/api/agents/${id}/tasks`),
 	createTask: (id: string, input: string, title?: string) =>
 		req<Task>(`/api/agents/${id}/tasks`, json('POST')({ input, title })),
-	events: (id: string, since = 0) => req<AgentEvent[]>(`/api/agents/${id}/events?since=${since}`)
+	events: (id: string, since = 0) => req<AgentEvent[]>(`/api/agents/${id}/events?since=${since}`),
+	accountKinds: () => req<AccountKindInfo[]>('/api/account-kinds'),
+	accounts: () => req<AccountView[]>('/api/accounts'),
+	account: (id: string) => req<AccountView>(`/api/accounts/${id}`),
+	createAccount: (a: AccountPayload) => req<AccountView>('/api/accounts', json('POST')(a)),
+	updateAccount: (id: string, a: AccountPayload) => req<AccountView>(`/api/accounts/${id}`, json('PATCH')(a)),
+	deleteAccount: (id: string) => req<{ deleted: string } | { error: string; agents: string[] }>(`/api/accounts/${id}`, { method: 'DELETE' })
 };
 
 export function splitList(s: string): string[] {

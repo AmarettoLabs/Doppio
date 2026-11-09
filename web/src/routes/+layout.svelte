@@ -12,6 +12,7 @@
 <nav>
 	<a class="brand" href="/"><img src="/assets/doppio-logo.png" alt="Doppio" width="28" height="28" /> Doppio</a>
 	<span class="spacer"></span>
+	<a class="btn ghost" href="/accounts">Accounts</a>
 	<a class="btn" href="/agents/new">+ New agent</a>
 </nav>
 <main>{@render children()}</main>

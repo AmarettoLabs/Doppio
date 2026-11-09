@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -96,5 +97,40 @@ func TestWriteCABundle(t *testing.T) {
 		if _, err := r.writeCABundle(a); err == nil {
 			t.Errorf("%s: expected error", p)
 		}
+	}
+}
+
+func TestWriteAccount(t *testing.T) {
+	dir := t.TempDir()
+	r := &Runtime{DataDir: dir}
+	a := &model.Agent{ID: "a1"}
+	if err := os.MkdirAll(r.agentDir(a.ID), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(r.agentDir(a.ID), accountFile)
+
+	// No account: nothing written, a stale file is removed.
+	if err := os.WriteFile(p, []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.writeAccount(a, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(p); !os.IsNotExist(err) {
+		t.Fatal("stale account file not removed")
+	}
+
+	// With an account: a 0600 file with the credentials.
+	secrets := map[string]string{"token": "claude-tok", "apiKey": "vibe-key"}
+	if err := r.writeAccount(a, secrets); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(p)
+	if err != nil || !strings.Contains(string(b), "claude-tok") {
+		t.Fatalf("account file: %v %s", err, b)
+	}
+	fi, err := os.Stat(p)
+	if err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("account file mode: %v %v", fi.Mode().Perm(), err)
 	}
 }

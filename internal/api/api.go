@@ -27,6 +27,9 @@ import (
 type Containers interface {
 	EnsureNetwork() error
 	Start(a *model.Agent) (string, error)
+	// StartWithAccounts starts the container with the shared account's
+	// credentials passed in read-only (nil/empty = none).
+	StartWithAccounts(a *model.Agent, accountSecrets map[string]string) (string, error)
 	Stop(agentID string) error
 	Status(agentID string) string
 	RemoveState(agentID string) error
@@ -86,6 +89,12 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/agents/{id}/events", s.handleEvents)
 	mux.HandleFunc("GET /api/agents/{id}/stream", s.handleStream)
 	mux.HandleFunc("GET /api/tasks/{id}", s.handleGetTask)
+	mux.HandleFunc("GET /api/account-kinds", s.handleAccountKinds)
+	mux.HandleFunc("GET /api/accounts", s.handleListAccounts)
+	mux.HandleFunc("POST /api/accounts", s.handleCreateAccount)
+	mux.HandleFunc("GET /api/accounts/{id}", s.handleGetAccount)
+	mux.HandleFunc("PATCH /api/accounts/{id}", s.handleUpdateAccount)
+	mux.HandleFunc("DELETE /api/accounts/{id}", s.handleDeleteAccount)
 
 	// internal API (agent worker containers, authenticated by manager token)
 	mux.HandleFunc("GET /api/internal/agents/{id}/ping", s.handleInternalPing)
@@ -150,12 +159,16 @@ type AgentView struct {
 	// ToolCallMode is how the Doppio loop calls tools: "" = detect
 	// automatically, "native" = the provider's built-in tool calling,
 	// "text" = JSON tool calls in the reply.
-	ToolCallMode string     `json:"toolCallMode"`
-	Status       string     `json:"status"`
-	ContainerID  string     `json:"containerId,omitempty"`
-	Error        string     `json:"error,omitempty"`
-	LastPollAt   *time.Time `json:"lastPollAt,omitempty"`
-	NextPollAt   *time.Time `json:"nextPollAt,omitempty"`
+	ToolCallMode string `json:"toolCallMode"`
+	// AccountID references the shared login the agent uses; empty = its own
+	// API token. AccountName is set by the list/get endpoints.
+	AccountID   string     `json:"accountId,omitempty"`
+	AccountName string     `json:"accountName,omitempty"`
+	Status      string     `json:"status"`
+	ContainerID string     `json:"containerId,omitempty"`
+	Error       string     `json:"error,omitempty"`
+	LastPollAt  *time.Time `json:"lastPollAt,omitempty"`
+	NextPollAt  *time.Time `json:"nextPollAt,omitempty"`
 	// Working is true while one of the agent's tasks is running or pending.
 	// Only set by the list/get endpoints.
 	Working bool `json:"working"`
@@ -178,6 +191,7 @@ func toView(a *model.Agent) AgentView {
 		Engine:      string(a.EffectiveEngine()), TaskMinutes: a.EffectiveTaskMinutes(),
 		MaxReplyTokens: a.MaxReplyTokens, DefaultMaxReplyTokens: a.DefaultMaxReplyTokens(),
 		ToolCallMode: string(a.ToolCallMode),
+		AccountID:    a.AccountID,
 		Status:       a.Status, ContainerID: a.ContainerID, Error: a.Error,
 		LastPollAt: a.LastPollAt, NextPollAt: a.NextPollAt,
 		RestartPending: a.RestartPending,
@@ -209,6 +223,8 @@ type agentInput struct {
 	MaxTurns    int      `json:"maxTurns"`
 	// Engine: empty keeps the stored one on update (Doppio loop on create).
 	Engine string `json:"engine"`
+	// AccountID: empty keeps the stored one on update; "none" clears it.
+	AccountID string `json:"accountId"`
 	// TaskMinutes: 0 keeps the stored limit on update (default on create).
 	TaskMinutes int `json:"taskMinutes"`
 	// MaxReplyTokens: 0 = the default for the agent's server.
@@ -366,6 +382,27 @@ func (in *agentInput) validate() string {
 	return ""
 }
 
+// validAccountID resolves the accountId input on create: "" or "none" means no
+// account. Unknown ids are reported by the caller via checkAccountID.
+func (s *Server) validAccountID(id string) string {
+	if id == "" || id == "none" {
+		return ""
+	}
+	return id
+}
+
+// checkAccountID reports an error message when id does not reference an
+// existing account ("" and "none" are fine: no account).
+func (s *Server) checkAccountID(id string) string {
+	if id == "" || id == "none" {
+		return ""
+	}
+	if s.store.Accounts().Get(id) == nil {
+		return "unknown account " + id
+	}
+	return ""
+}
+
 // ---------- broker (SSE fan-out) ----------
 
 type broker struct {
@@ -437,6 +474,9 @@ func (s *Server) handleListAgents(w http.ResponseWriter, _ *http.Request) {
 	for _, a := range agents {
 		a.Status = liveStatus(s.rt, a)
 		v := toView(a)
+		if acc := s.store.Accounts().Get(a.AccountID); acc != nil {
+			v.AccountName = acc.Name
+		}
 		v.Working = working[a.ID]
 		views = append(views, v)
 	}
@@ -451,6 +491,9 @@ func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	a.Status = liveStatus(s.rt, a)
 	v := toView(a)
+	if acc := s.store.Accounts().Get(a.AccountID); acc != nil {
+		v.AccountName = acc.Name
+	}
 	v.Working = s.store.WorkingAgents()[a.ID]
 	writeJSON(w, http.StatusOK, v)
 }
@@ -480,6 +523,10 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, msg)
 		return
 	}
+	if msg := s.checkAccountID(in.AccountID); msg != "" {
+		writeErr(w, http.StatusBadRequest, msg)
+		return
+	}
 	normalizeAgentInput(&in)
 	now := time.Now().UTC()
 	a := &model.Agent{
@@ -503,6 +550,7 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		PollSeconds:    in.PollSeconds,
 		MaxTurns:       in.MaxTurns,
 		Engine:         model.Engine(orDefault(in.Engine, string(model.EngineDoppio))),
+		AccountID:      s.validAccountID(in.AccountID),
 		TaskMinutes:    in.TaskMinutes,
 		MaxReplyTokens: in.MaxReplyTokens,
 		ToolCallMode:   model.ToolCallMode(in.ToolCallMode),
@@ -562,6 +610,13 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	a.MaxTurns = in.MaxTurns
 	if in.Engine != "" {
 		a.Engine = model.Engine(in.Engine)
+	}
+	if in.AccountID != "" {
+		if msg := s.checkAccountID(in.AccountID); msg != "" {
+			writeErr(w, http.StatusBadRequest, msg)
+			return
+		}
+		a.AccountID = s.validAccountID(in.AccountID)
 	}
 	if in.TaskMinutes != 0 {
 		a.TaskMinutes = in.TaskMinutes
@@ -631,6 +686,9 @@ func (s *Server) applyPendingRestart(id string) {
 func (s *Server) view(a *model.Agent) AgentView {
 	a.Status = liveStatus(s.rt, a)
 	v := toView(a)
+	if acc := s.store.Accounts().Get(a.AccountID); acc != nil {
+		v.AccountName = acc.Name
+	}
 	v.Working = s.store.WorkingAgents()[a.ID]
 	return v
 }
@@ -706,7 +764,7 @@ func (s *Server) start(id string) (*model.Agent, int, error) {
 	if err := s.rt.EnsureNetwork(); err != nil {
 		return nil, http.StatusInternalServerError, err
 	}
-	cid, err := s.rt.Start(a)
+	cid, err := s.rtStart(a)
 	if err != nil {
 		a.Status = "error"
 		a.Error = err.Error()
@@ -731,6 +789,19 @@ func (s *Server) start(id string) (*model.Agent, int, error) {
 	}
 	s.broker.publish(id, model.Event{AgentID: id, Type: "status", Content: "container started"})
 	return a, http.StatusOK, nil
+}
+
+// rtStart starts the agent's container, resolving the shared account it
+// references into credentials for the container.
+func (s *Server) rtStart(a *model.Agent) (string, error) {
+	if a.AccountID == "" {
+		return s.rt.Start(a)
+	}
+	secrets, err := s.store.Accounts().Secrets(a.AccountID)
+	if err != nil {
+		return "", errors.New("account " + a.AccountID + " is not available: " + err.Error())
+	}
+	return s.rt.StartWithAccounts(a, secrets)
 }
 
 func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {

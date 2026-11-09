@@ -53,10 +53,12 @@
 			error = 'Name is required.';
 			return;
 		}
-		const payload: AccountPayload = { name: name.trim(), kind, notes: notes.trim() };
+		const payload: AccountPayload = { name: name.trim(), kind };
 		// Only the fields that were typed are sent: on edit an untouched field
 		// (empty input = "keep the stored value") is left out, so the store
-		// keeps it instead of clearing it.
+		// keeps it instead of clearing it. Notes are sent only when they differ
+		// from the stored ones, so a rename keeps them.
+		if (!editing || notes.trim() !== (editing.notes ?? '')) payload.notes = notes.trim();
 		payload.secrets = Object.fromEntries(Object.entries(secretValues).filter(([, v]) => v.trim() !== ''));
 		busy = editing ? editing.id : 'new';
 		try {
@@ -74,7 +76,9 @@
 
 	async function del(a: AccountView) {
 		if (busy) return;
-		if (a.agents.length && !confirm(`Delete the account "${a.name}"? No agent uses it.`)) return;
+		// The button is disabled while an agent uses the account, so only this
+		// confirm can run; the API still refuses with the agent list if one
+		// appeared meanwhile.
 		if (!confirm(`Delete the account "${a.name}" and its stored credentials?`)) return;
 		busy = a.id;
 		try {

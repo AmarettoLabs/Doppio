@@ -1,10 +1,12 @@
 package store
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/AmarettoLabs/Doppio/internal/model"
@@ -61,21 +63,21 @@ func TestAccountCreateReadUpdateDelete(t *testing.T) {
 	}
 
 	// Rename + replace the secret; a nil map keeps it.
-	if _, err := ac.Update(acc.ID, "Work key", "renamed", nil); err != nil {
+	if _, err := ac.Update(acc.ID, "Work key", strPtr("renamed"), nil); err != nil {
 		t.Fatal(err)
 	}
 	if v, _ := ac.ReadSecret(acc.ID, "apiToken"); v != "sk-test" {
 		t.Fatalf("secret not kept on update: %q", v)
 	}
-	upd, err := ac.Update(acc.ID, "", "", map[string]string{"apiToken": "sk-new"})
-	if err != nil || upd.Name != "Work key" || upd.Notes != "" {
+	upd, err := ac.Update(acc.ID, "", nil, map[string]string{"apiToken": "sk-new"})
+	if err != nil || upd.Name != "Work key" || upd.Notes != "renamed" {
 		t.Fatalf("update: %+v %v", upd, err)
 	}
 	if v, _ := ac.ReadSecret(acc.ID, "apiToken"); v != "sk-new" {
 		t.Fatalf("secret not replaced: %q", v)
 	}
 	// An empty value clears the field.
-	if _, err := ac.Update(acc.ID, "", "", map[string]string{"apiToken": ""}); err != nil {
+	if _, err := ac.Update(acc.ID, "", nil, map[string]string{"apiToken": ""}); err != nil {
 		t.Fatal(err)
 	}
 	if ac.Get(acc.ID).HasSecret("apiToken") {
@@ -85,7 +87,7 @@ func TestAccountCreateReadUpdateDelete(t *testing.T) {
 		t.Fatal("cleared secret file still there")
 	}
 	// Restore for the delete check.
-	if _, err := ac.Update(acc.ID, "", "", map[string]string{"apiToken": "sk-new"}); err != nil {
+	if _, err := ac.Update(acc.ID, "", nil, map[string]string{"apiToken": "sk-new"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -112,7 +114,7 @@ func TestUpdatePartialSecrets(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Rename with an empty (non-nil) map keeps both fields.
-	if _, err := ac.Update(acc.ID, "ep2", "", map[string]string{}); err != nil {
+	if _, err := ac.Update(acc.ID, "ep2", nil, map[string]string{}); err != nil {
 		t.Fatal(err)
 	}
 	if v, _ := ac.ReadSecret(acc.ID, "baseURL"); v != "https://llm:8443/v1" {
@@ -122,7 +124,7 @@ func TestUpdatePartialSecrets(t *testing.T) {
 		t.Fatalf("apiToken lost on empty-map update: %q", v)
 	}
 	// Only one field in the map: the other is untouched.
-	if _, err := ac.Update(acc.ID, "", "", map[string]string{"apiToken": "tok-2"}); err != nil {
+	if _, err := ac.Update(acc.ID, "", nil, map[string]string{"apiToken": "tok-2"}); err != nil {
 		t.Fatal(err)
 	}
 	if v, _ := ac.ReadSecret(acc.ID, "apiToken"); v != "tok-2" {
@@ -132,7 +134,7 @@ func TestUpdatePartialSecrets(t *testing.T) {
 		t.Fatalf("baseURL wiped by a one-field update: %q", v)
 	}
 	// A field sent as "" clears exactly that field.
-	if _, err := ac.Update(acc.ID, "", "", map[string]string{"apiToken": ""}); err != nil {
+	if _, err := ac.Update(acc.ID, "", nil, map[string]string{"apiToken": ""}); err != nil {
 		t.Fatal(err)
 	}
 	if ac.Get(acc.ID).HasSecret("apiToken") {
@@ -214,3 +216,90 @@ func TestAccountBadIDs(t *testing.T) {
 }
 
 func contains(s, sub string) bool { return strings.Contains(s, sub) }
+
+func strPtr(s string) *string { return &s }
+
+// TestUpdateNotesSemantics: on update a nil notes keeps the stored ones and a
+// non-nil pointer replaces them ("" clears), like the API's *string.
+func TestUpdateNotesSemantics(t *testing.T) {
+	_, ac := openAccounts(t)
+	acc, err := ac.Create("ep", model.AcctEndpoint, "llm box", map[string]string{"baseURL": "https://llm:8443/v1", "apiToken": "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Rename only: notes stay.
+	if _, err := ac.Update(acc.ID, "ep2", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := ac.Get(acc.ID).Notes; got != "llm box" {
+		t.Fatalf("notes lost on rename: %q", got)
+	}
+	// Explicitly sent notes replace them.
+	if _, err := ac.Update(acc.ID, "", strPtr("other box"), nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := ac.Get(acc.ID).Notes; got != "other box" {
+		t.Fatalf("notes not replaced: %q", got)
+	}
+	// An empty string clears them.
+	if _, err := ac.Update(acc.ID, "", strPtr(""), nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := ac.Get(acc.ID).Notes; got != "" {
+		t.Fatalf("notes not cleared: %q", got)
+	}
+}
+
+// TestUpdateConcurrentWithReads hammers Update together with List/Get so
+// `go test -race` covers the account mutation: a reader walking SecretSet
+// while writeSecrets writes it would be a fatal race.
+func TestUpdateConcurrentWithReads(t *testing.T) {
+	_, ac := openAccounts(t)
+	acc, err := ac.Create("ep", model.AcctEndpoint, "notes", map[string]string{"baseURL": "https://llm:8443/v1", "apiToken": "tok-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	var readers, writers sync.WaitGroup
+	// Readers: walk the accounts the way the API handlers do.
+	for i := 0; i < 3; i++ {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				for _, a := range ac.List() {
+					_ = a.SecretFields()
+					_ = a.Notes
+					_ = ac.AgentsUsing(a.ID)
+				}
+				if got := ac.Get(acc.ID); got != nil {
+					_ = got.SecretFields()
+				}
+			}
+		}()
+	}
+	// Writers: rename + change notes + secrets over and over.
+	for i := 0; i < 2; i++ {
+		writers.Add(1)
+		go func(i int) {
+			defer writers.Done()
+			for j := 0; j < 50; j++ {
+				name := fmt.Sprintf("ep-%d-%d", i, j)
+				notes := strPtr(fmt.Sprintf("notes %d", j))
+				secrets := map[string]string{"apiToken": fmt.Sprintf("tok-%d-%d", i, j)}
+				if _, err := ac.Update(acc.ID, name, notes, secrets); err != nil {
+					t.Errorf("update: %v", err)
+					return
+				}
+			}
+		}(i)
+	}
+	writers.Wait()
+	close(stop)
+	readers.Wait()
+}

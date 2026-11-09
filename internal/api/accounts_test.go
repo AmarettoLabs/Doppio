@@ -2,11 +2,13 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/AmarettoLabs/Doppio/internal/model"
@@ -138,8 +140,10 @@ func TestAccountCRUDAndSecretHandling(t *testing.T) {
 	if st.Accounts().Get(id) != nil {
 		t.Fatal("account still in the store")
 	}
-	if _, err := st.Accounts().ReadSecret(id, "apiToken"); err != nil {
-		t.Fatalf("secret dir not removed: %v", err)
+	// The secrets dir is gone (ReadSecret alone can't tell: it returns "", nil
+	// for a missing file, so stat the directory).
+	if _, err := os.Stat(filepath.Join(st.Dir(), store.AccountsDir, id)); !os.IsNotExist(err) {
+		t.Fatalf("secrets dir still there after delete: %v", err)
 	}
 }
 
@@ -390,4 +394,115 @@ func (r *recordingRuntime) RemoveState(string) error { return nil }
 func mustJSON(m map[string]any) string {
 	b, _ := json.Marshal(m)
 	return string(b)
+}
+
+// TestUpdateKindChangeRefused: the kind decides which secret fields exist, so
+// it can't be swapped on an existing account — the UI locks it while editing.
+func TestUpdateKindChangeRefused(t *testing.T) {
+	srv, st := newTestServer(t, "")
+	h := srv.Handler()
+	id, _ := createAccount(t, h, `{"name":"ep","kind":"endpoint","secrets":{"baseURL":"https://llm:8443/v1","apiToken":"tok-1"}}`)
+
+	// A different kind, with or without secrets, is refused with a clear
+	// message and changes nothing.
+	for _, body := range []string{
+		`{"kind":"api-key"}`,
+		`{"kind":"api-key","secrets":{"apiToken":"sk-x"}}`,
+		`{"name":"other","kind":"vibe","secrets":{"apiKey":"k"}}`,
+	} {
+		rec, m := doJSON(t, h, "PATCH", "/api/accounts/"+id, body)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: got %d %s", body, rec.Code, rec.Body)
+		}
+		if !strings.Contains(m["error"].(string), "kind can't be changed") {
+			t.Fatalf("%s: unclear message %s", body, rec.Body)
+		}
+	}
+	if acc := st.Accounts().Get(id); acc.Kind != model.AcctEndpoint || acc.Name != "ep" {
+		t.Fatalf("account changed: %+v", acc)
+	}
+	if v, _ := st.Accounts().ReadSecret(id, "apiToken"); v != "tok-1" {
+		t.Fatalf("secret changed: %q", v)
+	}
+	// Re-sending the account's own kind still passes (the portal does that).
+	rec, m := doJSON(t, h, "PATCH", "/api/accounts/"+id, `{"kind":"endpoint","name":"ep2"}`)
+	if rec.Code != http.StatusOK || m["name"] != "ep2" || m["status"] != "configured" {
+		t.Fatalf("same kind refused: %d %s", rec.Code, rec.Body)
+	}
+}
+
+// TestUpdateKeepsAbsentNotes: a PATCH without "notes" keeps the stored notes,
+// an explicit "" clears them (the input uses a *string).
+func TestUpdateKeepsAbsentNotes(t *testing.T) {
+	srv, st := newTestServer(t, "")
+	h := srv.Handler()
+	id, _ := createAccount(t, h, `{"name":"ep","kind":"endpoint","notes":"llm box","secrets":{"baseURL":"https://llm:8443/v1","apiToken":"t"}}`)
+
+	// Rename only: notes survive.
+	rec, m := doJSON(t, h, "PATCH", "/api/accounts/"+id, `{"name":"ep2"}`)
+	if rec.Code != http.StatusOK || m["notes"] != "llm box" {
+		t.Fatalf("rename wiped the notes: %d %s", rec.Code, rec.Body)
+	}
+	if got := st.Accounts().Get(id).Notes; got != "llm box" {
+		t.Fatalf("notes lost in the store: %q", got)
+	}
+	// Explicit empty notes clear them.
+	rec, m = doJSON(t, h, "PATCH", "/api/accounts/"+id, `{"notes":""}`)
+	if rec.Code != http.StatusOK || m["notes"] != nil {
+		t.Fatalf("notes not cleared: %d %s", rec.Code, rec.Body)
+	}
+	if got := st.Accounts().Get(id).Notes; got != "" {
+		t.Fatalf("notes not cleared in the store: %q", got)
+	}
+}
+
+// TestUpdateAccountsConcurrently runs PATCHes against List/Get handlers at the
+// same time, so `go test -race` covers the account update path (the store used
+// to mutate the shared account pointer outside its lock).
+func TestUpdateAccountsConcurrently(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	h := srv.Handler()
+	id, _ := createAccount(t, h, `{"name":"ep","kind":"endpoint","notes":"n","secrets":{"baseURL":"https://llm:8443/v1","apiToken":"tok-1"}}`)
+
+	var readers, writers sync.WaitGroup
+	stop := make(chan struct{})
+	// Readers through the HTTP handlers, like the portal's polling.
+	for i := 0; i < 3; i++ {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if rec := do(h, "GET", "/api/accounts", "", ""); rec.Code != http.StatusOK {
+					t.Errorf("list: %d %s", rec.Code, rec.Body)
+					return
+				}
+				if rec := do(h, "GET", "/api/accounts/"+id, "", ""); rec.Code != http.StatusOK {
+					t.Errorf("get: %d %s", rec.Code, rec.Body)
+					return
+				}
+			}
+		}()
+	}
+	// Writers.
+	for i := 0; i < 2; i++ {
+		writers.Add(1)
+		go func(i int) {
+			defer writers.Done()
+			for j := 0; j < 25; j++ {
+				body := fmt.Sprintf(`{"name":"ep-%d-%d","notes":"n%d","secrets":{"apiToken":"tok-%d-%d"}}`, i, j, j, i, j)
+				if rec := do(h, "PATCH", "/api/accounts/"+id, "", body); rec.Code != http.StatusOK {
+					t.Errorf("patch: %d %s", rec.Code, rec.Body)
+					return
+				}
+			}
+		}(i)
+	}
+	writers.Wait()
+	close(stop)
+	readers.Wait()
 }

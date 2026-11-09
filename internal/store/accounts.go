@@ -94,11 +94,13 @@ func (a *Accounts) Create(name string, kind model.AccountKind, notes string, sec
 	if msg := acc.Validate(); msg != "" {
 		return nil, fmt.Errorf("%s", msg)
 	}
+	// The whole create runs under the store lock: writeSecrets mutates
+	// acc.SecretSet, and every reader of the account sees the same pointer.
+	a.s.mu.Lock()
+	defer a.s.mu.Unlock()
 	if err := a.writeSecrets(acc, secrets); err != nil {
 		return nil, err
 	}
-	a.s.mu.Lock()
-	defer a.s.mu.Unlock()
 	if a.s.data.Accounts == nil {
 		a.s.data.Accounts = map[string]*model.Account{}
 	}
@@ -111,28 +113,36 @@ func (a *Accounts) Create(name string, kind model.AccountKind, notes string, sec
 	return acc, nil
 }
 
-// Update renames an account and/or updates its secrets. A nil secrets map
-// keeps every stored field; a non-nil map touches only the fields it contains
-// (an empty value clears that field, a missing field is left alone).
-func (a *Accounts) Update(id, name, notes string, secrets map[string]string) (*model.Account, error) {
+// Update changes an account's name, notes and/or secrets.
+//
+// A nil secrets map keeps every stored field; a non-nil map touches only the
+// fields it contains (an empty value clears that field, a missing field is
+// left alone). An empty name keeps the stored name; notes is a pointer:
+// nil keeps the stored notes, a non-nil value (possibly "") replaces them.
+//
+// The whole update runs under the store lock: acc.Name, acc.Notes and
+// acc.SecretSet (via writeSecrets) are mutated here while List/Get/AgentsUsing
+// readers hold the same pointer, and an unsynchronized map write would be a
+// fatal race. Writing the tiny secret files under the lock is fine.
+func (a *Accounts) Update(id, name string, notes *string, secrets map[string]string) (*model.Account, error) {
 	a.s.mu.Lock()
+	defer a.s.mu.Unlock()
 	acc := a.s.data.Accounts[id]
-	a.s.mu.Unlock()
 	if acc == nil {
 		return nil, os.ErrNotExist
 	}
 	if strings.TrimSpace(name) != "" {
 		acc.Name = strings.TrimSpace(name)
 	}
-	acc.Notes = strings.TrimSpace(notes)
+	if notes != nil {
+		acc.Notes = strings.TrimSpace(*notes)
+	}
 	if secrets != nil {
 		if err := a.writeSecrets(acc, secrets); err != nil {
 			return nil, err
 		}
 	}
 	acc.UpdatedAt = time.Now().UTC()
-	a.s.mu.Lock()
-	defer a.s.mu.Unlock()
 	if err := a.s.saveLocked(); err != nil {
 		return nil, err
 	}
@@ -176,7 +186,7 @@ func (a *Accounts) AgentsUsing(id string) []string {
 // the map are touched: a field sent as "" is cleared, a field missing from the
 // map keeps its stored value (so an update that renames the account, or fills
 // only one of several fields, never wipes the others). Unknown fields for the
-// account's kind are rejected.
+// account's kind are rejected. The caller holds the store lock.
 func (a *Accounts) writeSecrets(acc *model.Account, secrets map[string]string) error {
 	info, ok := model.LookupAccountKind(acc.Kind)
 	if !ok {

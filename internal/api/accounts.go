@@ -59,13 +59,19 @@ func accountStatus(acc *model.Account) string {
 	return "missing"
 }
 
+// accountInput is the create/update body. On update every field is optional:
+// an absent field keeps the stored value (secrets: nil keeps them all, notes
+// absent keeps the notes, an empty name keeps the name, kind absent keeps the
+// kind). A field present as "" clears it (notes, secrets).
 type accountInput struct {
 	Name    string            `json:"name"`
 	Kind    string            `json:"kind"`
-	Notes   string            `json:"notes"`
+	Notes   *string           `json:"notes"`
 	Secrets map[string]string `json:"secrets"` // nil on update = keep the stored ones
 }
 
+// validate checks the input. On update (kindRequired=false) an empty name or
+// kind means "keep the stored one".
 func (in *accountInput) validate(kindRequired bool) string {
 	if in.Name == "" && !kindRequired {
 		// keep the stored name on update
@@ -115,7 +121,11 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, msg)
 		return
 	}
-	acc, err := s.store.Accounts().Create(in.Name, model.AccountKind(in.Kind), in.Notes, in.Secrets)
+	notes := ""
+	if in.Notes != nil {
+		notes = *in.Notes
+	}
+	acc, err := s.store.Accounts().Create(in.Name, model.AccountKind(in.Kind), notes, in.Secrets)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -148,12 +158,10 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if in.Kind != "" && model.AccountKind(in.Kind) != acc.Kind {
-		// The kind only changes together with its secrets; refuse a bare kind
-		// switch so an account never ends up with another kind's fields.
-		if in.Secrets == nil {
-			writeErr(w, http.StatusBadRequest, "changing the kind needs its secrets too")
-			return
-		}
+		// The kind decides which secret fields exist, so it can't be swapped
+		// on an existing account; the UI locks it while editing too.
+		writeErr(w, http.StatusBadRequest, "the kind can't be changed; create a new account")
+		return
 	}
 	acc, err := s.store.Accounts().Update(id, in.Name, in.Notes, in.Secrets)
 	if err != nil {

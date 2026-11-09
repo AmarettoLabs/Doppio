@@ -303,3 +303,26 @@ func TestUpdateConcurrentWithReads(t *testing.T) {
 	close(stop)
 	readers.Wait()
 }
+
+// TestAccountsAreReturnedAsCopies checks callers can't reach the stored
+// account: changing what Get/List/Create/Update return leaves the store as is.
+func TestAccountsAreReturnedAsCopies(t *testing.T) {
+	_, ac := openAccounts(t)
+	created, err := ac.Create("k", model.AcctAPIKey, "", map[string]string{"apiToken": "sk"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	notes := "n"
+	updated, err := ac.Update(created.ID, "", &notes, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, acc := range []*model.Account{created, updated, ac.Get(created.ID), ac.List()[0]} {
+		acc.Name = "changed"
+		acc.UnsetSecret("apiToken")
+	}
+	got := ac.Get(created.ID)
+	if got.Name != "k" || !got.HasSecret("apiToken") {
+		t.Fatalf("the store's account was changed through a returned copy: %+v", got)
+	}
+}

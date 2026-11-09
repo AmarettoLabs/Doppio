@@ -60,23 +60,32 @@ func NewAccountID() string {
 	return hex.EncodeToString(b)
 }
 
-// List returns all accounts sorted by creation time.
+// The store never hands out its own *model.Account: List, Get, Create and
+// Update return clones, and Update works on a clone it swaps in when the
+// update succeeded. Callers read accounts without the store lock, so a shared
+// pointer would race with the next update (and a concurrent read/write of
+// SecretSet is a fatal error, not just a stale read).
+
+// List returns copies of all accounts sorted by creation time.
 func (a *Accounts) List() []*model.Account {
 	a.s.mu.Lock()
 	defer a.s.mu.Unlock()
 	out := make([]*model.Account, 0, len(a.s.data.Accounts))
 	for _, acc := range a.s.data.Accounts {
-		out = append(out, acc)
+		out = append(out, acc.Clone())
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
 	return out
 }
 
-// Get returns the account or nil.
+// Get returns a copy of the account, or nil.
 func (a *Accounts) Get(id string) *model.Account {
 	a.s.mu.Lock()
 	defer a.s.mu.Unlock()
-	return a.s.data.Accounts[id]
+	if acc := a.s.data.Accounts[id]; acc != nil {
+		return acc.Clone()
+	}
+	return nil
 }
 
 // Create makes a new account with the given secrets (field -> value; empty
@@ -94,8 +103,8 @@ func (a *Accounts) Create(name string, kind model.AccountKind, notes string, sec
 	if msg := acc.Validate(); msg != "" {
 		return nil, fmt.Errorf("%s", msg)
 	}
-	// The whole create runs under the store lock: writeSecrets mutates
-	// acc.SecretSet, and every reader of the account sees the same pointer.
+	// Under the store lock so the secret files and the metadata change
+	// together.
 	a.s.mu.Lock()
 	defer a.s.mu.Unlock()
 	if err := a.writeSecrets(acc, secrets); err != nil {
@@ -107,30 +116,32 @@ func (a *Accounts) Create(name string, kind model.AccountKind, notes string, sec
 	a.s.data.Accounts[acc.ID] = acc
 	if err := a.s.saveLocked(); err != nil {
 		// Roll the secret files back so nothing is left behind.
+		delete(a.s.data.Accounts, acc.ID)
 		_ = a.removeSecretsLocked(acc)
 		return nil, err
 	}
-	return acc, nil
+	return acc.Clone(), nil
 }
 
-// Update changes an account's name, notes and/or secrets.
+// Update changes an account's name, notes and/or secrets, and returns a copy
+// of the result.
 //
 // A nil secrets map keeps every stored field; a non-nil map touches only the
 // fields it contains (an empty value clears that field, a missing field is
 // left alone). An empty name keeps the stored name; notes is a pointer:
 // nil keeps the stored notes, a non-nil value (possibly "") replaces them.
 //
-// The whole update runs under the store lock: acc.Name, acc.Notes and
-// acc.SecretSet (via writeSecrets) are mutated here while List/Get/AgentsUsing
-// readers hold the same pointer, and an unsynchronized map write would be a
-// fatal race. Writing the tiny secret files under the lock is fine.
+// It runs under the store lock and changes a clone, which replaces the stored
+// account only once the secrets and store.json are written: a failed update
+// leaves the stored account as it was.
 func (a *Accounts) Update(id, name string, notes *string, secrets map[string]string) (*model.Account, error) {
 	a.s.mu.Lock()
 	defer a.s.mu.Unlock()
-	acc := a.s.data.Accounts[id]
-	if acc == nil {
+	old := a.s.data.Accounts[id]
+	if old == nil {
 		return nil, os.ErrNotExist
 	}
+	acc := old.Clone()
 	if strings.TrimSpace(name) != "" {
 		acc.Name = strings.TrimSpace(name)
 	}
@@ -143,10 +154,12 @@ func (a *Accounts) Update(id, name string, notes *string, secrets map[string]str
 		}
 	}
 	acc.UpdatedAt = time.Now().UTC()
+	a.s.data.Accounts[id] = acc
 	if err := a.s.saveLocked(); err != nil {
+		a.s.data.Accounts[id] = old
 		return nil, err
 	}
-	return acc, nil
+	return acc.Clone(), nil
 }
 
 // Delete removes the account, its metadata and its secret files.

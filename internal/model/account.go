@@ -84,6 +84,17 @@ type Account struct {
 	Notes string `json:"notes,omitempty"`
 }
 
+// Clone returns a copy of the account that shares nothing with it (SecretSet
+// included), so the store can hand accounts out without exposing its own.
+func (a *Account) Clone() *Account {
+	c := *a
+	c.SecretSet = make(map[string]bool, len(a.SecretSet))
+	for k, v := range a.SecretSet {
+		c.SecretSet[k] = v
+	}
+	return &c
+}
+
 // HasSecret reports whether the named credential field is set.
 func (a *Account) HasSecret(field string) bool {
 	return a.SecretSet[field]

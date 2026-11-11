@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -537,6 +538,239 @@ class RunTaskMgr(MgrStub):
 
     def finish(self, task_id, status, output="", error=""):
         self.finished.append((task_id, status, error))
+
+
+class FakeVibe:
+    """A fake `vibe` binary: records its argv and env, prints a scripted
+    stream of JSON entries on stdout, and writes an export.json like the real
+    one. `script` is a list of (lines, exit_code, export) steps."""
+
+    def __init__(self, tmp, steps):
+        self.dir = os.path.join(tmp, "bin")
+        os.makedirs(self.dir, exist_ok=True)
+        self.path = os.path.join(self.dir, "vibe")
+        self.steps = steps
+        self.calls = []
+        with open(self.path, "w") as f:
+            f.write("#!/bin/sh\n")
+            f.write("python3 \"$FAKE_VIBE_SCRIPT\" \"$@\"\n")
+        os.chmod(self.path, 0o755)
+        self.script = os.path.join(tmp, "fake_vibe.py")
+        with open(self.script, "w") as f:
+            f.write("import json, os, sys\n")
+            f.write("calls = os.environ['FAKE_VIBE_CALLS']\n")
+            f.write("with open(calls, 'a') as fh:\n")
+            f.write("    fh.write(json.dumps({'argv': ['vibe'] + sys.argv[1:], 'cwd': os.getcwd(),\n")
+            f.write("                         'key': os.environ.get('MISTRAL_API_KEY'),\n")
+            f.write("                         'vibe_home': os.environ.get('VIBE_HOME'),\n")
+            f.write("                         'gh_token': os.environ.get('GH_TOKEN')}) + '\\n')\n")
+            for lines, code, export in steps:
+                f.write("for line in %r:\n    print(line, flush=True)\n" % (lines,))
+                if export is not None:
+                    f.write("import pathlib\n")
+                    f.write("out = [a for a in sys.argv[1:] if a.startswith('--output-dir')]\n")
+                    f.write("d = pathlib.Path(out[0][len('--output-dir='):] if '=' in out[0] else sys.argv[sys.argv.index('--output-dir') + 1])\n")
+                    f.write("d.mkdir(parents=True, exist_ok=True)\n")
+                    f.write("(d / 'export.json').write_text(json.dumps(%r))\n" % (export,))
+                f.write("sys.exit(%d)\n" % (code,))
+        os.environ["FAKE_VIBE_SCRIPT"] = self.script
+        os.environ["FAKE_VIBE_CALLS"] = os.path.join(tmp, "calls.jsonl")
+        self.calls_path = os.environ["FAKE_VIBE_CALLS"]
+
+    def use(self):
+        orig = os.environ["PATH"]
+        os.environ["PATH"] = self.dir + os.pathsep + orig
+        return lambda: os.environ.update(PATH=orig)
+
+    def recorded(self):
+        if not os.path.exists(self.calls_path):
+            return []
+        with open(self.calls_path) as f:
+            return [json.loads(l) for l in f if l.strip()]
+
+
+def vibe_run(mgr, tmp, agent_cfg=None, task=None, system="sys persona"):
+    """Run the vibe engine on one task with a fake binary; returns (result,
+    events, recorded call)."""
+    if os.environ.get("FAKE_VIBE_CALLS") and os.path.exists(os.environ["FAKE_VIBE_CALLS"]):
+        os.unlink(os.environ["FAKE_VIBE_CALLS"])
+    a = agent(engine="vibe", **(agent_cfg or {}))
+    t = task or {"id": "t9", "title": "x", "input": "do it"}
+    run = w.TaskRun(mgr, a, system, t, t["input"], WS_DIR, minutes=5)
+    res = w.vibe_engine(run)
+    calls = []
+    p = os.environ.get("FAKE_VIBE_CALLS")
+    if p and os.path.exists(p):
+        with open(p) as f:
+            calls = [json.loads(l) for l in f if l.strip()]
+    return res, mgr.events, (calls[-1] if calls else None)
+
+
+class VibeEngineTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="doppio-vibe-")
+        self.mgr = RunTaskMgr()
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+        # No leftover fake from another test: the real `vibe` must not run here.
+        for k in ("FAKE_VIBE_SCRIPT", "FAKE_VIBE_CALLS"):
+            os.environ.pop(k, None)
+
+    def fake(self, steps):
+        fv = FakeVibe(self.tmp, steps)
+        self.addCleanup(fv.use())
+        return fv
+
+    def test_argv_prompt_and_env(self):
+        fv = self.fake([([
+            '{"type":"message","role":"assistant","content":[{"type":"text","text":"all good"}]}',
+        ], 0, {"outcome": "finished", "usage": {"input_tokens": 10, "output_tokens": 5,
+                                                 "total_tokens": 15}, "cost_usd": 0.01, "steps": 2})])
+        res, events, call = vibe_run(self.mgr, self.tmp,
+                                     agent_cfg={"accountToken": "vibe-key", "model": "mistral-large-4",
+                                                "maxTurns": 7, "taskMinutes": 5, "gitToken": "gt"})
+        argv = call["argv"]
+        self.assertEqual(argv[0], "vibe")
+        self.assertIn("--prompt-file", argv)
+        self.assertEqual(argv[argv.index("--output") + 1], "streaming")
+        self.assertEqual(argv[argv.index("--agent") + 1], "auto-approve")
+        self.assertEqual(argv[argv.index("--workdir") + 1], WS_DIR)
+        self.assertEqual(argv[argv.index("--model") + 1], "mistral-large-4")
+        self.assertIn("--output-dir", argv)
+        self.assertEqual(argv[argv.index("--max-turns") + 1], "7")
+        self.assertIn("--time-limit", argv)
+        # The prompt file holds persona + standing task + the worker's prompt.
+        prompt_file = argv[argv.index("--prompt-file") + 1]
+        with open(prompt_file) as f:
+            text = f.read()
+        self.assertTrue(text.startswith("sys persona\n\n"))
+        self.assertIn("do it", text)
+        self.assertNotIn("--system-prompt-file", " ".join(argv))
+        # Auth: the account's key, in the env and in ~/.vibe/.env.
+        self.assertEqual(call["key"], "vibe-key")
+        env_file = os.path.join(WS_DIR, ".vibe", ".env")
+        with open(env_file) as f:
+            self.assertEqual(f.read().strip(), "MISTRAL_API_KEY=vibe-key")
+        self.assertEqual(os.stat(env_file).st_mode & 0o777, 0o600)
+        self.assertEqual(call["vibe_home"], os.path.join(WS_DIR, ".vibe"))
+        self.assertEqual(call["gh_token"], "gt")
+        # Outcome, answer and usage.
+        self.assertEqual((res.outcome, res.answer), ("done", "all good"))
+        self.assertIn(("assistant", "all good"), events)
+        self.assertTrue(any("vibe usage: 15 tokens (10 in / 5 out), $0.0100, 2 steps" in c
+                            for _, c in events), events)
+
+    def test_streamed_tool_calls_and_results(self):
+        self.fake([([
+            '{"type":"effect","title":"shell","detail":{"tool_name":"shell","display":{"summary":"ls -la","verb":"Running"}},"state":{"status":"running"}}',
+            '{"type":"effect","title":"shell","detail":{"tool_name":"shell","display":{"summary":"ls -la"}},"state":{"status":"completed","output_text":"a.txt\\nb.txt","display":{"message":"2 files"}}}',
+            '{"type":"effect","title":"shell","detail":{"tool_name":"shell","display":{"summary":"rm -rf /"}},"state":{"status":"failed","error":{"message":"denied"},"output_text":""}}',
+            '{"type":"reasoning","text":"thinking hard"}',
+            '{"type":"notice","level":"warning","message":"a config file failed to load"}',
+            '{"type":"message","role":"assistant","content":[{"type":"text","text":"done: two files"}]}',
+        ], 0, {"outcome": "finished"})])
+        res, events, _ = vibe_run(self.mgr, self.tmp)
+        kinds = [(t, c) for t, c in events if t in ("action", "log", "assistant")]
+        self.assertIn(("action", "Running ls -la"), kinds)
+        self.assertIn(("log", "→ a.txt\nb.txt"), kinds)  # output_text, kept as printed
+        self.assertIn(("log", "→ denied"), kinds)  # a failed call logs its error
+        self.assertIn(("log", "thinking: thinking hard"), kinds)
+        self.assertIn(("log", "vibe: a config file failed to load"), kinds)
+        self.assertEqual((res.outcome, res.answer), ("done", "done: two files"))
+
+    def test_outcomes(self):
+        cases = [
+            ({"outcome": "finished"}, 0, "failed"),  # no final message streamed
+            ({"outcome": "turn_limit", "error": None}, 3, "failed"),
+            ({"outcome": "token_limit"}, 3, "failed"),
+            ({"outcome": "length"}, 3, "failed"),
+            ({"outcome": "refusal"}, 3, "failed"),
+            ({"outcome": "price_limit"}, 3, "limit"),
+            ({"outcome": "infrastructure_failure", "error": {"message": "HTTP 500 from the API"}}, 2, "error"),
+            ({"outcome": "config_error", "error": {"message": "Invalid API key", "code": "invalid_api_key"}}, 1, "error"),
+            ({"outcome": "deadline"}, 3, "error"),
+            ({"outcome": "terminated"}, 3, "error"),
+            ({"outcome": "usage_error", "error": {"message": "Unknown model"}}, 1, "failed"),
+            ({}, 2, "error"),       # crashed before writing an export
+            ({}, 0, "failed"),     # exit 0 without an export: no usable answer
+        ]
+        for export, code, want in cases:
+            with self.subTest(export=export, code=code):
+                self.fake([([], code, export)])
+                res, events, _ = vibe_run(self.mgr, self.tmp)
+                self.assertEqual(res.outcome, want)
+                if want != "done":
+                    self.assertTrue(res.error, (export, code))
+
+    def test_error_message_from_export_then_stderr(self):
+        self.fake([([], 2, {"outcome": "infrastructure_failure",
+                            "error": {"message": "connection refused"}})])
+        res, _, _ = vibe_run(self.mgr, self.tmp)
+        self.assertEqual(res.error, "connection refused")
+        # No export (and a fresh out dir): fall back to the last stderr line.
+        self.fake([([], 2, None)])
+        res, _, _ = vibe_run(self.mgr, self.tmp, task={"id": "t10", "title": "x", "input": "hi"})
+        self.assertIn("vibe exited 2", res.error)
+
+    def test_finished_without_an_answer_fails(self):
+        self.fake([([], 0, {"outcome": "finished"})])
+        res, _, _ = vibe_run(self.mgr, self.tmp)
+        self.assertEqual(res.outcome, "failed")
+        self.assertIn("without a final message", res.error)
+
+    def test_time_limit_kills_vibe(self):
+        # A fake vibe that never exits: run_process kills it at the deadline.
+        self.fake([(["import time\nwhile True: time.sleep(1)\n".replace("import", "#")], 0, None)])
+        script = os.path.join(self.tmp, "slow.py")
+        with open(script, "w") as f:
+            f.write("import sys, time\nprint('starting', flush=True)\ntime.sleep(60)\nsys.exit(0)\n")
+        os.environ["FAKE_VIBE_SCRIPT"] = script
+        a = agent(engine="vibe")
+        run = w.TaskRun(self.mgr, a, "sys", {"id": "t9", "title": "x", "input": "slow"}, "slow",
+                       WS_DIR, minutes=5)
+        run.deadline = time.monotonic() - 1  # as if the limit had passed
+        with self.assertRaises(w.TaskTimeout):
+            w.vibe_engine(run)
+
+    def test_playbook_uses_gh_for_cli_engines(self):
+        self.use = lambda routes: None
+        # The assigned-issues playbook for a vibe agent names gh/glab.
+        text = w.PLAYBOOKS["assigned_issues"].format(
+            repo="o/r", repo_dir="/ws/r", base="main", num=7, branch="bot/7-x",
+            existing="", fork="",
+            pr_line=w.CLI_PR_LINE.format(repo="o/r", branch="bot/7-x", base="main", num=7))
+        self.assertIn("gh pr create", text)
+        self.assertIn("glab mr create", text)
+        self.assertIn("Closes #7", text)
+        self.assertNotIn("with create_pr", text)
+        # The Doppio loop keeps its create_pr tool.
+        text = w.PLAYBOOKS["assigned_issues"].format(
+            repo="o/r", repo_dir="/ws/r", base="main", num=7, branch="bot/7-x",
+            existing="", fork="",
+            pr_line="open one with create_pr (repo {repo}, head `{branch}`, base `{base}`) whose body "
+                    "explains the change and ends with `Closes #{num}`".format(
+                        repo="o/r", branch="bot/7-x", base="main", num=7))
+        self.assertIn("create_pr", text)
+
+    def test_vibe_engine_needs_a_login(self):
+        out = w.run_task(self.mgr, agent(engine="vibe"), "sys",
+                         {"id": "t1", "title": "x", "input": "hi"})
+        self.assertEqual(out, "failed")
+        self.assertIn("needs a login", self.mgr.finished[-1][2])
+
+    def test_vibe_is_a_registered_engine(self):
+        self.assertIs(w.ENGINES["vibe"], w.vibe_engine)
+
+    def test_model_alias_defaults_and_passes_through(self):
+        self.assertEqual(w.vibe_model_alias({"model": "codestral-2"}), "codestral-2")
+        self.assertEqual(w.vibe_model_alias({"model": "custom/thing"}), "custom/thing")
+        self.assertEqual(w.vibe_model_alias({}), w.VIBE_DEFAULT_MODEL)
+
+    def test_vibe_env_without_a_key_writes_no_env_file(self):
+        run = w.TaskRun(self.mgr, agent(engine="vibe"), "sys",
+                        {"id": "t1", "title": "x", "input": "hi"}, "hi", WS_DIR)
+        env = w.vibe_env(run)
+        self.assertNotIn("MISTRAL_API_KEY", env)
+        self.assertEqual(env["VIBE_HOME"], os.path.join(WS_DIR, ".vibe"))
 
 
 class EngineTest(unittest.TestCase):

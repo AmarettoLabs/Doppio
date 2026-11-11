@@ -1056,6 +1056,13 @@ def repo_guidance(repo_dir):
     return "\n".join(out)
 
 
+# The CLI engines (vibe, codex, claude, qwen) open pull/merge requests with
+# gh / glab instead of Doppio's create_pr tool, so their playbooks say so.
+CLI_PR_LINE = ("open one with the `gh` CLI (GitHub: `gh pr create --repo {repo} --head {branch} "
+               "--base {base} --title ... --body ...`, the body ending with `Closes #{num}`; "
+               "GitLab: `glab mr create --source-branch {branch} --target-branch {base} "
+               "--title ... --description ...`) — there is no create_pr tool here")
+
 PLAYBOOKS = {
     "review_requests": """\
 Your job: review this pull request. The pull request's head is checked out in {repo_dir}.
@@ -1073,7 +1080,7 @@ Your job: implement this issue. The branch `{branch}` is checked out in {repo_di
 2. If the issue is blocked (for example by another open issue or pull request), unclear, or needs a decision from the owner, do not write code: your final answer is your question(s) to the owner.
 3. Otherwise make the change on `{branch}`, add or update tests, and run the checks the guidance asks for (tests, linters, formatters). Fix failures before going on.
 4. Commit with clear messages and push: `git -C {repo_dir} push -u origin {branch}`. Never push to `{base}`, never force-push, never merge.
-5. If there is no pull request for `{branch}` yet, open one with create_pr (repo {repo}, head `{branch}`, base `{base}`) whose body explains the change and ends with `Closes #{num}`.
+5. If there is no pull request for `{branch}` yet, {pr_line}.
 Your final answer is posted as a comment on the issue: a short summary of what you did and the pull request link, or your questions.""",
     "assigned_prs": """\
 Your job: follow up on this pull request. Its branch `{branch}` is checked out in {repo_dir}.{fork}
@@ -1118,7 +1125,12 @@ def prepare_task(agent, t):
         # Leftovers from an earlier task: keep them in a stash, start clean.
         git(repo_dir, "stash", "push", "-u", "-m", f"doppio: leftovers before task {t['id']}")
     pr_ref = f"merge-requests/{num}/head" if provider == "gitlab" else f"pull/{num}/head"
-    vars_ = {"repo": repo, "repo_dir": repo_dir, "base": base, "num": num, "branch": "", "existing": "", "fork": ""}
+    # A CLI engine has no create_pr tool: its playbook opens the PR with gh/glab.
+    cli = (agent.get("engine") or "doppio") != "doppio"
+    pr_line = CLI_PR_LINE if cli else ("open one with create_pr (repo {repo}, head `{branch}`, base "
+                                       "`{base}`) whose body explains the change and ends with `Closes #{num}`")
+    vars_ = {"repo": repo, "repo_dir": repo_dir, "base": base, "num": num, "branch": "", "existing": "",
+             "fork": "", "pr_line": pr_line}  # its own {branch} etc. are filled in below
     if trigger == "review_requests" or (trigger == "mentions" and kind != "issues"):
         item = fetch_item(agent, repo, kind, num)
         vars_["base"] = (item.get("base") or {}).get("ref") or item.get("target_branch") or base
@@ -1150,6 +1162,9 @@ def prepare_task(agent, t):
         vars_["branch"] = branch
     else:  # mentions on an issue
         git(repo_dir, "checkout", "-q", "--detach", f"origin/{base}")
+    # pr_line carries its own {branch}/{base}/... placeholders; fill them now
+    # that the trigger has set branch, then render the playbook itself.
+    vars_["pr_line"] = pr_line.format(**{k: v for k, v in vars_.items() if k != "pr_line"})
     parts = [PLAYBOOKS[trigger].format(**vars_),
              f"Workspace: {repo_dir} (default branch `{base}`, currently on "
              f"`{git(repo_dir, 'rev-parse', '--abbrev-ref', 'HEAD', check=False)}`)."]
@@ -1607,7 +1622,251 @@ def doppio_engine(run):
         messages.append(UserMessage(f"TOOL RESULT ({name}):\n{result}"))
 
 
-ENGINES = {"doppio": doppio_engine}
+# ---------- Mistral Vibe engine ----------
+
+# Where the engine writes the prompt file and its --output-dir, inside the
+# workspace so nothing is left in the container's root.
+VIBE_RUN_DIR = "vibe-run"
+VIBE_HOME_DIR = ".vibe"  # Vibe's own home, relative to the task's workdir
+
+
+# The model Vibe runs when the agent has none configured: the catalog's
+# recommended default.
+VIBE_DEFAULT_MODEL = "mistral-large-latest"
+
+
+def vibe_model_alias(agent):
+    """The --model value for the agent's configured model. Vibe takes a
+    catalog alias (or a configured [[models]] entry), and rejects an unknown
+    one as a config error, so the id is passed as is and Vibe resolves it."""
+    return (agent.get("model") or "").strip() or VIBE_DEFAULT_MODEL
+
+
+def vibe_env(run):
+    """The environment for the vibe process: the account's key where Vibe
+    looks for it, the workspace as Vibe's home (so ~/.vibe/.env and its logs
+    stay in the workspace), and the git credentials for gh/glab."""
+    env = dict(os.environ)
+    key = run.agent.get("accountToken") or run.agent.get("apiToken") or ""
+    if key:
+        # Vibe reads MISTRAL_API_KEY from the environment first and from
+        # ~/.vibe/.env otherwise; write it there too, the way `vibe --setup`
+        # saves a login, so a key Vibe itself asks for is the same one.
+        home = os.path.join(run.workdir, VIBE_HOME_DIR)
+        os.makedirs(home, exist_ok=True)
+        env_file = os.path.join(home, ".env")
+        try:
+            with open(env_file, "w") as f:
+                f.write(f"MISTRAL_API_KEY={key}\n")
+            os.chmod(env_file, 0o600)
+        except OSError as e:
+            run.emit("log", f"could not write {env_file}: {e}")
+        env["MISTRAL_API_KEY"] = key
+    env["VIBE_HOME"] = os.path.join(run.workdir, VIBE_HOME_DIR)
+    if run.agent.get("gitToken"):
+        env["GH_TOKEN"] = run.agent["gitToken"]
+        env["GITLAB_TOKEN"] = run.agent["gitToken"]
+    return env
+
+
+def vibe_argv(run, prompt_file, out_dir):
+    """The headless vibe invocation for one task: the prompt from a file, the
+    streamed output format, auto-approve (the container is the sandbox), the
+    turn and time limits, and the export dir for the outcome and usage."""
+    argv = [
+        "vibe",
+        "--prompt-file", prompt_file,
+        "--output", "streaming",
+        "--agent", "auto-approve",
+        "--workdir", run.workdir,
+        "--model", vibe_model_alias(run.agent),
+        "--output-dir", out_dir,
+    ]
+    if run.max_turns is not None:
+        argv += ["--max-turns", str(run.max_turns)]
+    secs = int(run.remaining())
+    if secs > 0:
+        argv += ["--time-limit", str(secs)]
+    return argv
+
+
+def vibe_text(entry):
+    """The text of a streamed entry's content blocks."""
+    content = entry.get("content")
+    if not isinstance(content, list):
+        return ""
+    return "\n\n".join(b.get("text", "") for b in content
+                        if isinstance(b, dict) and b.get("type") == "text")
+
+
+def vibe_stream_event(run, entry, last_answer):
+    """Turn one streamed vibe entry into portal events. Returns the latest
+    assistant answer (the final message), which the caller keeps as the
+    task's answer."""
+    kind = entry.get("type")
+    if kind == "message":
+        role = entry.get("role")
+        text = vibe_text(entry)
+        if role == "assistant" and text.strip():
+            run.emit("assistant", text)
+            return text
+        if role == "user" and text.strip():
+            run.emit("user", text)
+        return last_answer
+    if kind == "effect":
+        detail = entry.get("detail") or {}
+        state = entry.get("state") or {}
+        title = entry.get("title") or detail.get("tool_name") or "tool"
+        call = detail.get("display") or {}
+        line = call.get("summary") or title
+        if state.get("status") == "running" and call.get("verb"):
+            line = call["verb"] + " " + line
+        run.emit("action", line)
+        if state.get("status") in ("completed", "failed", "cancelled"):
+            out = state.get("output_text") or ""
+            display = state.get("display") or {}
+            if state.get("status") == "failed":
+                out = out or (state.get("error") or {}).get("message") or "failed"
+            elif not out and display.get("message"):
+                out = display["message"]
+            if out.strip():
+                run.emit("log", "→ " + out.strip()[:1500])
+        return last_answer
+    if kind == "reasoning":
+        text = entry.get("text") or ""
+        if text.strip():
+            run.emit("log", "thinking: " + text.strip()[:1500])
+        return last_answer
+    if kind == "notice":
+        msg = entry.get("message") or ""
+        if msg.strip():
+            run.emit("log", f"vibe: {msg.strip()[:500]}")
+        return last_answer
+    return last_answer
+
+
+# Vibe's export.json outcomes (vibe.app_server.run_export.RunOutcome) mapped to
+# the worker's task outcomes: "done" finishes the task, "failed" is a task
+# that ran but produced no usable answer, "error" and "limit" are retried at a
+# later git check (see RETRIED_OUTCOMES).
+VIBE_OUTCOME_MAP = {
+    "finished": "done",
+    "turn_limit": "failed",      # ran out of turns: the work did not finish
+    "token_limit": "failed",
+    "price_limit": "limit",       # the account's usage limit: retried later
+    "length": "failed",           # the last answer was cut off
+    "refusal": "failed",
+    "deadline": "error",          # our own time limit (also raised as TaskTimeout)
+    "terminated": "error",
+    "infrastructure_failure": "error",  # the model API, the network, the runtime
+    "aborted": "error",
+    "config_error": "error",      # e.g. a bad or expired key: fix and retry
+    "usage_error": "failed",      # our invocation is wrong: retrying won't help
+}
+
+
+def vibe_outcome(export, code, err_tail):
+    """Map a finished vibe run to an EngineResult: the export's outcome when
+    there is one, else the exit code, else the stderr tail. The export's error
+    message is preferred over a bare exit code."""
+    outcome = (export or {}).get("outcome")
+    mapped = VIBE_OUTCOME_MAP.get(outcome)
+    if mapped is None:
+        # No export (vibe crashed before writing one) or an unknown outcome:
+        # exit 0 with no export is a crash, anything else is infrastructure.
+        if code == 0:
+            mapped = "failed"
+        else:
+            mapped = "error"
+    error = ((export or {}).get("error") or {}).get("message") or ""
+    if not error and err_tail.strip():
+        error = err_tail.strip().splitlines()[-1][:300]
+    if not error:
+        error = f"vibe exited {code}" + (f" ({outcome})" if outcome else "")
+    return mapped, error, (export or {})
+
+
+def vibe_read_export(out_dir):
+    """The export.json vibe wrote in out_dir, or {} (never raises)."""
+    try:
+        with open(os.path.join(out_dir, "export.json")) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def vibe_usage_note(export):
+    """One log line with the run's token usage and cost, when it has any."""
+    usage = export.get("usage") or {}
+    if not usage:
+        return ""
+    total = usage.get("total_tokens") or 0
+    note = f"vibe usage: {total} tokens"
+    if usage.get("input_tokens") or usage.get("output_tokens"):
+        note += f" ({usage.get('input_tokens', 0)} in / {usage.get('output_tokens', 0)} out)"
+    cost = export.get("cost_usd")
+    if cost:
+        note += f", ${cost:.4f}"
+    steps = export.get("steps")
+    if steps:
+        note += f", {steps} steps"
+    return note
+
+
+def vibe_engine(run):
+    """Run one task with Mistral Vibe, headless, in the task's repository.
+
+    Vibe does its own tool loop there (auto-approve: the agent's container is
+    the sandbox); the worker only builds the prompt, streams vibe's output to
+    the portal and maps its export to a task outcome."""
+    run_dir = os.path.join(run.workdir, VIBE_RUN_DIR)
+    os.makedirs(run_dir, exist_ok=True)
+    prompt_file = os.path.join(run_dir, f"prompt-{run.task['id']}.md")
+    with open(prompt_file, "w") as f:
+        # The persona and standing task go in the prompt, not in
+        # --system-prompt-file: that flag replaces Vibe's own instructions.
+        f.write((run.system or "").strip() + "\n\n" + run.prompt)
+    out_dir = os.path.join(run_dir, f"out-{run.task['id']}")
+    os.makedirs(out_dir, exist_ok=True)
+    argv = vibe_argv(run, prompt_file, out_dir)
+    run.emit("log", "running: " + " ".join(argv))
+    answer = ""
+
+    def on_line(line):
+        nonlocal answer
+        line = line.strip()
+        if not line.startswith("{"):
+            return
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(entry, dict):
+            return
+        answer = vibe_stream_event(run, entry, answer) or answer
+
+    try:
+        code, err_tail = run_process(run, argv, env=vibe_env(run), on_line=on_line)
+    except TaskTimeout as e:
+        # vibe writes its export on SIGTERM too; read what it left.
+        export = vibe_read_export(out_dir)
+        note = vibe_usage_note(export)
+        if note:
+            run.emit("log", note)
+        raise TaskTimeout(str(e)) from None
+    export = vibe_read_export(out_dir)
+    outcome, error, export = vibe_outcome(export, code, err_tail)
+    note = vibe_usage_note(export)
+    if note:
+        run.emit("log", note)
+    if outcome == "done" and not answer.strip():
+        # vibe reports "finished" but streamed no final message: no usable answer.
+        return EngineResult("failed", error="vibe finished without a final message")
+    return EngineResult(outcome, answer=answer, error=error)
+
+
+ENGINES = {"doppio": doppio_engine, "vibe": vibe_engine}
 
 
 def task_workdir(t):
@@ -1646,6 +1905,17 @@ def run_task(mgr, agent, system, t):
             return "error"
     mgr.emit("user", prompt, task_id=tid)
     run = TaskRun(mgr, agent, system, t, prompt, task_workdir(t))
+    # A CLI engine logs in with the shared account, not with the agent's own
+    # API token: without one it cannot authenticate at all. Engines that are
+    # not built in (the tests register their own) are exempt.
+    builtin = ENGINES.get(engine_name) in (doppio_engine, vibe_engine)
+    if engine_name != "doppio" and builtin \
+            and not (agent.get("accountToken") or agent.get("apiToken")):
+        msg = (f"engine {engine_name!r} needs a login: pick an account in the agent's settings "
+               "(Accounts page) or set the agent's own API token")
+        mgr.emit("error", msg, task_id=tid)
+        mgr.finish(tid, "failed", error=msg)
+        return "failed"
     try:
         res = engine(run)
     except TaskTimeout as e:

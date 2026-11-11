@@ -74,9 +74,9 @@ type EngineInfo struct {
 func Engines() []EngineInfo {
 	return []EngineInfo{
 		{EngineDoppio, "Doppio loop", true},
+		{EngineVibe, "Mistral Vibe", true},
 		{EngineClaudeCode, "Claude Code", false},
 		{EngineCodex, "Codex CLI", false},
-		{EngineVibe, "Mistral Vibe", false},
 		{EngineQwenCode, "Qwen Code", false},
 	}
 }

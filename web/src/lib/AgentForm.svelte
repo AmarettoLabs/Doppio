@@ -127,7 +127,7 @@
 				<option value={e.id} disabled={!e.available}>{e.label}{e.available ? '' : ' (coming soon)'}</option>
 			{/each}
 		</select>
-		<p class="hint">What runs the agent's tasks: Doppio's own tool loop over the model below, or a coding CLI.</p>
+		<p class="hint">What runs the agent's tasks: Doppio's own tool loop over the model below, or a coding CLI (which logs in with the account).</p>
 	</div>
 	<div class="field">
 		<label for="f-account">Account</label>

@@ -110,19 +110,32 @@ account is optional.
 
 ## Engines
 
-An agent's **engine** runs its tasks. The default, and for now the only one
-available, is the **Doppio loop**: Doppio's own tool loop over the agent's
-model API. Coding CLIs (Claude Code, Codex CLI, Mistral Vibe, Qwen Code) are
-listed in the agent form and will become selectable as they're added; the
-agent image already ships them, with `gh` and `glab` to open pull/merge
-requests. Whatever the engine, the worker handles the git side: triggers,
-workspace, guidance and posting the answer.
+An agent's **engine** runs its tasks. Two are available: the **Doppio loop**
+(the default), Doppio's own tool loop over the agent's model API, and
+**Mistral Vibe**, which runs the task headless in the prepared repository
+(`vibe --prompt-file … --output streaming --agent auto-approve --max-turns N
+--workdir <repo> --model <alias>`). Coding CLIs (Claude Code, Codex CLI,
+Qwen Code) are listed in the agent form and will become selectable as they're
+added; the agent image already ships them, with `gh` and `glab` to open
+pull/merge requests. Whatever the engine, the worker handles the git side:
+triggers, workspace, guidance and posting the answer.
 
 The Doppio loop calls the model's tools with the provider's built-in tool
 calling (OpenAI-compatible `tools`/`tool_calls`, Anthropic
 `tools`/`tool_use`/`tool_result`) and falls back to tool calls as JSON in the
 reply when the server does not support it; the agent settings can force either
 format.
+
+A CLI engine logs in with a shared **account** instead of an API key per agent:
+for Mistral Vibe that is a Mistral account's key (the `MISTRAL_API_KEY` Vibe
+writes to `~/.vibe/.env`), which the worker passes to the container and Vibe
+picks up from there. Vibe's own sandbox and approval prompts stay off
+(`--agent auto-approve`): the agent's Docker container is the sandbox. The
+worker streams Vibe's output to the portal (assistant text, tool calls and
+results), takes its final message as the task's answer, and reads Vibe's
+`export.json` (`--output-dir`) for the outcome and the token usage shown on
+the task. Pull/merge requests are opened with `gh` / `glab` — the playbooks
+say so for CLI engines.
 
 Each task has a time limit (30 minutes by default, set per agent). A task
 still running then is stopped and retried at a later git check, like other

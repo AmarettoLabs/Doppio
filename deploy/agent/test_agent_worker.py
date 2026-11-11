@@ -614,6 +614,11 @@ class VibeEngineTest(unittest.TestCase):
         # No leftover fake from another test: the real `vibe` must not run here.
         for k in ("FAKE_VIBE_SCRIPT", "FAKE_VIBE_CALLS"):
             os.environ.pop(k, None)
+        # Vibe's home and the run files go to temp dirs, never the real ones.
+        for name, sub in (("VIBE_HOME", "vibe-home"), ("VIBE_RUN_DIR", "vibe-runs")):
+            p = unittest.mock.patch.object(w, name, os.path.join(self.tmp, sub))
+            p.start()
+            self.addCleanup(p.stop)
 
     def fake(self, steps):
         fv = FakeVibe(self.tmp, steps)
@@ -645,13 +650,15 @@ class VibeEngineTest(unittest.TestCase):
         self.assertTrue(text.startswith("sys persona\n\n"))
         self.assertIn("do it", text)
         self.assertNotIn("--system-prompt-file", " ".join(argv))
-        # Auth: the account's key, in the env and in ~/.vibe/.env.
+        # Auth: the account's key, in the env and in Vibe's own ~/.vibe/.env.
         self.assertEqual(call["key"], "vibe-key")
-        env_file = os.path.join(WS_DIR, ".vibe", ".env")
+        env_file = os.path.join(w.VIBE_HOME, ".env")
         with open(env_file) as f:
             self.assertEqual(f.read().strip(), "MISTRAL_API_KEY=vibe-key")
         self.assertEqual(os.stat(env_file).st_mode & 0o777, 0o600)
-        self.assertEqual(call["vibe_home"], os.path.join(WS_DIR, ".vibe"))
+        # Vibe keeps its home, so the image's config.toml (no update checks)
+        # still applies.
+        self.assertIsNone(call["vibe_home"])
         self.assertEqual(call["gh_token"], "gt")
         # Outcome, answer and usage.
         self.assertEqual((res.outcome, res.answer), ("done", "all good"))
@@ -763,14 +770,60 @@ class VibeEngineTest(unittest.TestCase):
     def test_model_alias_defaults_and_passes_through(self):
         self.assertEqual(w.vibe_model_alias({"model": "codestral-2"}), "codestral-2")
         self.assertEqual(w.vibe_model_alias({"model": "custom/thing"}), "custom/thing")
-        self.assertEqual(w.vibe_model_alias({}), w.VIBE_DEFAULT_MODEL)
+        self.assertIsNone(w.vibe_model_alias({}))
+
+    def test_no_model_leaves_vibe_its_default(self):
+        self.fake([(['{"type":"message","role":"assistant","content":[{"type":"text","text":"ok"}]}'],
+                    0, {"outcome": "finished"})])
+        _, _, call = vibe_run(self.mgr, self.tmp, agent_cfg={"model": ""})
+        self.assertNotIn("--model", call["argv"])
+
+    def test_unknown_model_runs_again_with_vibes_default(self):
+        # The fake refuses --model like the real one does for a model that
+        # isn't in its config, and answers without it.
+        script = os.path.join(self.tmp, "picky.py")
+        with open(script, "w") as f:
+            f.write(
+                "import json, os, pathlib, sys\n"
+                "a = sys.argv[1:]\n"
+                "with open(os.environ['FAKE_VIBE_CALLS'], 'a') as fh:\n"
+                "    fh.write(json.dumps({'argv': ['vibe'] + a}) + '\\n')\n"
+                "d = pathlib.Path(a[a.index('--output-dir') + 1]); d.mkdir(parents=True, exist_ok=True)\n"
+                "if '--model' in a:\n"
+                "    (d / 'export.json').write_text(json.dumps({'outcome': 'usage_error', 'error': {'message':\n"
+                "        'Unknown model: mistral-large-4. Available: mistral-medium-3.5'}}))\n"
+                "    sys.exit(1)\n"
+                "print(json.dumps({'type': 'message', 'role': 'assistant', 'content': [{'type': 'text', 'text': 'hi'}]}))\n"
+                "(d / 'export.json').write_text(json.dumps({'outcome': 'finished'}))\n")
+        self.fake([([], 0, None)])
+        os.environ["FAKE_VIBE_SCRIPT"] = script
+        res, events, _ = vibe_run(self.mgr, self.tmp, agent_cfg={"model": "mistral-large-4"})
+        with open(os.environ["FAKE_VIBE_CALLS"]) as f:
+            argvs = [json.loads(l)["argv"] for l in f if l.strip()]
+        self.assertEqual(len(argvs), 2)
+        self.assertIn("--model", argvs[0])
+        self.assertNotIn("--model", argvs[1])
+        self.assertEqual((res.outcome, res.answer), ("done", "hi"))
+        self.assertTrue(any("does not know the model 'mistral-large-4'" in c for _, c in events), events)
+
+    def test_nothing_is_written_into_the_repository(self):
+        repo = os.path.join(self.tmp, "repo")
+        os.makedirs(repo)
+        self.fake([(['{"type":"message","role":"assistant","content":[{"type":"text","text":"ok"}]}'],
+                    0, {"outcome": "finished"})])
+        a = agent(engine="vibe", accountToken="vibe-key")
+        t = {"id": "t11", "title": "x", "input": "do it"}
+        run = w.TaskRun(self.mgr, a, "sys", t, t["input"], repo, minutes=5)
+        self.assertEqual(w.vibe_engine(run).outcome, "done")
+        self.assertEqual(os.listdir(repo), [])
 
     def test_vibe_env_without_a_key_writes_no_env_file(self):
         run = w.TaskRun(self.mgr, agent(engine="vibe"), "sys",
                         {"id": "t1", "title": "x", "input": "hi"}, "hi", WS_DIR)
         env = w.vibe_env(run)
         self.assertNotIn("MISTRAL_API_KEY", env)
-        self.assertEqual(env["VIBE_HOME"], os.path.join(WS_DIR, ".vibe"))
+        self.assertNotIn("VIBE_HOME", env)
+        self.assertFalse(os.path.exists(os.path.join(w.VIBE_HOME, ".env")))
 
 
 class EngineTest(unittest.TestCase):

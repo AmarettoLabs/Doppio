@@ -137,6 +137,13 @@ results), takes its final message as the task's answer, and reads Vibe's
 the task. Pull/merge requests are opened with `gh` / `glab` — the playbooks
 say so for CLI engines.
 
+Vibe runs the agent's model when it knows it, and its own default model
+otherwise: out of the box Vibe only knows its coding model
+(`mistral-medium-3.5`) and refuses any other name before calling the API, so
+the worker logs it and runs again without `--model`. The key stays in Vibe's
+own home (`~/.vibe/.env`) and the run's prompt and export in the workspace's
+`vibe-runs/`, never inside the repository checkout.
+
 Each task has a time limit (30 minutes by default, set per agent). A task
 still running then is stopped and retried at a later git check, like other
 infrastructure failures.

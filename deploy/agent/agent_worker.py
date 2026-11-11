@@ -1624,37 +1624,36 @@ def doppio_engine(run):
 
 # ---------- Mistral Vibe engine ----------
 
-# Where the engine writes the prompt file and its --output-dir, inside the
-# workspace so nothing is left in the container's root.
-VIBE_RUN_DIR = "vibe-run"
-VIBE_HOME_DIR = ".vibe"  # Vibe's own home, relative to the task's workdir
-
-
-# The model Vibe runs when the agent has none configured: the catalog's
-# recommended default.
-VIBE_DEFAULT_MODEL = "mistral-large-latest"
+# Where the engine writes the prompt file and its --output-dir: in the
+# workspace but outside every repository checkout (those live under repos/),
+# so nothing of a run (prompt, export, session journal) can end up committed.
+VIBE_RUN_DIR = os.path.join(WS, "vibe-runs")
+# Vibe's own home, where `vibe --setup` saves a login (.env) and where the
+# image's config.toml turns its update checks off. Never inside a checkout:
+# the key would be one `git add -A` away from a commit.
+VIBE_HOME = os.path.expanduser("~/.vibe")
 
 
 def vibe_model_alias(agent):
-    """The --model value for the agent's configured model. Vibe takes a
-    catalog alias (or a configured [[models]] entry), and rejects an unknown
-    one as a config error, so the id is passed as is and Vibe resolves it."""
-    return (agent.get("model") or "").strip() or VIBE_DEFAULT_MODEL
+    """The --model value: the agent's configured model, or None for Vibe's
+    default. Vibe only knows the aliases in its config (by default just its
+    own coding model) and refuses any other as a usage error; vibe_engine then
+    runs again with Vibe's default."""
+    return (agent.get("model") or "").strip() or None
 
 
 def vibe_env(run):
     """The environment for the vibe process: the account's key where Vibe
-    looks for it, the workspace as Vibe's home (so ~/.vibe/.env and its logs
-    stay in the workspace), and the git credentials for gh/glab."""
+    looks for it, and the git credentials for gh/glab. Vibe keeps its own
+    home (~/.vibe), outside the repository."""
     env = dict(os.environ)
     key = run.agent.get("accountToken") or run.agent.get("apiToken") or ""
     if key:
         # Vibe reads MISTRAL_API_KEY from the environment first and from
         # ~/.vibe/.env otherwise; write it there too, the way `vibe --setup`
         # saves a login, so a key Vibe itself asks for is the same one.
-        home = os.path.join(run.workdir, VIBE_HOME_DIR)
-        os.makedirs(home, exist_ok=True)
-        env_file = os.path.join(home, ".env")
+        os.makedirs(VIBE_HOME, exist_ok=True)
+        env_file = os.path.join(VIBE_HOME, ".env")
         try:
             with open(env_file, "w") as f:
                 f.write(f"MISTRAL_API_KEY={key}\n")
@@ -1662,26 +1661,27 @@ def vibe_env(run):
         except OSError as e:
             run.emit("log", f"could not write {env_file}: {e}")
         env["MISTRAL_API_KEY"] = key
-    env["VIBE_HOME"] = os.path.join(run.workdir, VIBE_HOME_DIR)
     if run.agent.get("gitToken"):
         env["GH_TOKEN"] = run.agent["gitToken"]
         env["GITLAB_TOKEN"] = run.agent["gitToken"]
     return env
 
 
-def vibe_argv(run, prompt_file, out_dir):
+def vibe_argv(run, prompt_file, out_dir, model):
     """The headless vibe invocation for one task: the prompt from a file, the
     streamed output format, auto-approve (the container is the sandbox), the
-    turn and time limits, and the export dir for the outcome and usage."""
+    model (None: Vibe's default), the turn and time limits, and the export dir
+    for the outcome and usage."""
     argv = [
         "vibe",
         "--prompt-file", prompt_file,
         "--output", "streaming",
         "--agent", "auto-approve",
         "--workdir", run.workdir,
-        "--model", vibe_model_alias(run.agent),
         "--output-dir", out_dir,
     ]
+    if model:
+        argv += ["--model", model]
     if run.max_turns is not None:
         argv += ["--max-turns", str(run.max_turns)]
     secs = int(run.remaining())
@@ -1820,16 +1820,43 @@ def vibe_engine(run):
     Vibe does its own tool loop there (auto-approve: the agent's container is
     the sandbox); the worker only builds the prompt, streams vibe's output to
     the portal and maps its export to a task outcome."""
-    run_dir = os.path.join(run.workdir, VIBE_RUN_DIR)
+    run_dir = os.path.join(VIBE_RUN_DIR, str(run.task["id"]))
     os.makedirs(run_dir, exist_ok=True)
-    prompt_file = os.path.join(run_dir, f"prompt-{run.task['id']}.md")
+    prompt_file = os.path.join(run_dir, "prompt.md")
     with open(prompt_file, "w") as f:
         # The persona and standing task go in the prompt, not in
         # --system-prompt-file: that flag replaces Vibe's own instructions.
         f.write((run.system or "").strip() + "\n\n" + run.prompt)
-    out_dir = os.path.join(run_dir, f"out-{run.task['id']}")
+    model = vibe_model_alias(run.agent)
+    code, err_tail, answer, export = vibe_attempt(run, prompt_file, os.path.join(run_dir, "out"), model)
+    if model and vibe_unknown_model(export):
+        # Refused before any model call, so nothing was spent: run with
+        # Vibe's default model instead.
+        run.emit("log", f"vibe does not know the model {model!r} "
+                        f"({(export.get('error') or {}).get('message', '')}); using Vibe's default model")
+        code, err_tail, answer, export = vibe_attempt(run, prompt_file,
+                                                      os.path.join(run_dir, "out-default"), None)
+    outcome, error, export = vibe_outcome(export, code, err_tail)
+    note = vibe_usage_note(export)
+    if note:
+        run.emit("log", note)
+    if outcome == "done" and not answer.strip():
+        # vibe reports "finished" but streamed no final message: no usable answer.
+        return EngineResult("failed", error="vibe finished without a final message")
+    return EngineResult(outcome, answer=answer, error=error)
+
+
+def vibe_unknown_model(export):
+    """Whether Vibe refused the run because it doesn't know the --model."""
+    return (export.get("outcome") == "usage_error"
+            and "unknown model" in ((export.get("error") or {}).get("message") or "").lower())
+
+
+def vibe_attempt(run, prompt_file, out_dir, model):
+    """One vibe process: streams its output to the portal and returns (exit
+    code, stderr tail, final answer, export)."""
     os.makedirs(out_dir, exist_ok=True)
-    argv = vibe_argv(run, prompt_file, out_dir)
+    argv = vibe_argv(run, prompt_file, out_dir, model)
     run.emit("log", "running: " + " ".join(argv))
     answer = ""
 
@@ -1848,22 +1875,15 @@ def vibe_engine(run):
 
     try:
         code, err_tail = run_process(run, argv, env=vibe_env(run), on_line=on_line)
-    except TaskTimeout as e:
-        # vibe writes its export on SIGTERM too; read what it left.
-        export = vibe_read_export(out_dir)
-        note = vibe_usage_note(export)
+    except TaskTimeout:
+        # Vibe has --time-limit set to the task's remaining time, so it
+        # normally stops and writes its export first; it only gets here when
+        # it overran and run_process killed it. Log what usage it recorded.
+        note = vibe_usage_note(vibe_read_export(out_dir))
         if note:
             run.emit("log", note)
-        raise TaskTimeout(str(e)) from None
-    export = vibe_read_export(out_dir)
-    outcome, error, export = vibe_outcome(export, code, err_tail)
-    note = vibe_usage_note(export)
-    if note:
-        run.emit("log", note)
-    if outcome == "done" and not answer.strip():
-        # vibe reports "finished" but streamed no final message: no usable answer.
-        return EngineResult("failed", error="vibe finished without a final message")
-    return EngineResult(outcome, answer=answer, error=error)
+        raise
+    return code, err_tail, answer, vibe_read_export(out_dir)
 
 
 ENGINES = {"doppio": doppio_engine, "vibe": vibe_engine}

@@ -1,0 +1,5 @@
+# Every change to the repository needs the maintainer's review. With the main
+# ruleset requiring a code owner's approval, the agents (write collaborators)
+# can open pull requests but can't get one merged on their own or each
+# other's approval.
+* @danteismyname

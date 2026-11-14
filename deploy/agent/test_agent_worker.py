@@ -615,7 +615,8 @@ class VibeEngineTest(unittest.TestCase):
         for k in ("FAKE_VIBE_SCRIPT", "FAKE_VIBE_CALLS"):
             os.environ.pop(k, None)
         # Vibe's home and the run files go to temp dirs, never the real ones.
-        for name, sub in (("VIBE_HOME", "vibe-home"), ("VIBE_RUN_DIR", "vibe-runs")):
+        for name, sub in (("VIBE_HOME", "vibe-home"), ("VIBE_RUN_DIR", "vibe-runs"),
+                          ("VIBE_STATE", "ws-vibe-home")):
             p = unittest.mock.patch.object(w, name, os.path.join(self.tmp, sub))
             p.start()
             self.addCleanup(p.stop)
@@ -778,10 +779,12 @@ class VibeEngineTest(unittest.TestCase):
         _, _, call = vibe_run(self.mgr, self.tmp, agent_cfg={"model": ""})
         self.assertNotIn("--model", call["argv"])
 
-    def test_unknown_model_runs_again_with_vibes_default(self):
-        # The fake refuses --model like the real one does for a model that
-        # isn't in its config, and answers without it.
+    def picky_vibe(self, learns):
+        """A fake vibe that refuses --model like the real one does for a model
+        missing from its config. learns=True: a run without --model "fetches
+        the plan's list" (a marker file), after which --model is accepted."""
         script = os.path.join(self.tmp, "picky.py")
+        marker = os.path.join(self.tmp, "plan-models-cached")
         with open(script, "w") as f:
             f.write(
                 "import json, os, pathlib, sys\n"
@@ -789,22 +792,66 @@ class VibeEngineTest(unittest.TestCase):
                 "with open(os.environ['FAKE_VIBE_CALLS'], 'a') as fh:\n"
                 "    fh.write(json.dumps({'argv': ['vibe'] + a}) + '\\n')\n"
                 "d = pathlib.Path(a[a.index('--output-dir') + 1]); d.mkdir(parents=True, exist_ok=True)\n"
-                "if '--model' in a:\n"
+                f"marker = {marker!r}\n"
+                "if '--model' in a and not os.path.exists(marker):\n"
                 "    (d / 'export.json').write_text(json.dumps({'outcome': 'usage_error', 'error': {'message':\n"
                 "        'Unknown model: mistral-large-4. Available: mistral-medium-3.5'}}))\n"
                 "    sys.exit(1)\n"
-                "print(json.dumps({'type': 'message', 'role': 'assistant', 'content': [{'type': 'text', 'text': 'hi'}]}))\n"
+                f"if {learns!r} and '--model' not in a:\n"
+                "    open(marker, 'w').close()\n"
+                "prompt = open(a[a.index('--prompt-file') + 1]).read()\n"
+                "text = 'OK' if 'single word OK' in prompt else ('large' if '--model' in a else 'medium')\n"
+                "print(json.dumps({'type': 'message', 'role': 'assistant', 'content': [{'type': 'text', 'text': text}]}))\n"
                 "(d / 'export.json').write_text(json.dumps({'outcome': 'finished'}))\n")
         self.fake([([], 0, None)])
         os.environ["FAKE_VIBE_SCRIPT"] = script
-        res, events, _ = vibe_run(self.mgr, self.tmp, agent_cfg={"model": "mistral-large-4"})
+
+    def calls(self):
         with open(os.environ["FAKE_VIBE_CALLS"]) as f:
-            argvs = [json.loads(l)["argv"] for l in f if l.strip()]
-        self.assertEqual(len(argvs), 2)
-        self.assertIn("--model", argvs[0])
-        self.assertNotIn("--model", argvs[1])
-        self.assertEqual((res.outcome, res.answer), ("done", "hi"))
-        self.assertTrue(any("does not know the model 'mistral-large-4'" in c for _, c in events), events)
+            return [json.loads(l)["argv"] for l in f if l.strip()]
+
+    def test_unknown_model_is_learned_by_a_warmup_run(self):
+        self.picky_vibe(learns=True)
+        res, events, _ = vibe_run(self.mgr, self.tmp, agent_cfg={"model": "mistral-large-4"})
+        argvs = self.calls()
+        # Refused, warm-up without --model, then the task on the agent's model.
+        self.assertEqual(["--model" in a for a in argvs], [True, False, True])
+        self.assertEqual((res.outcome, res.answer), ("done", "large"))
+        self.assertTrue(any("warm-up" in c for _, c in events), events)
+        self.assertFalse(any(k == "error" for k, _ in events), events)
+        # The warm-up's own reply never reaches the portal.
+        self.assertFalse(any(c == "OK" for _, c in events), events)
+
+    def test_model_still_unknown_runs_on_vibes_default_and_flags_it(self):
+        self.picky_vibe(learns=False)
+        res, events, _ = vibe_run(self.mgr, self.tmp, agent_cfg={"model": "mistral-large-4"})
+        argvs = self.calls()
+        # Refused, warm-up, refused again, then Vibe's default model.
+        self.assertEqual(["--model" in a for a in argvs], [True, False, True, False])
+        self.assertEqual((res.outcome, res.answer), ("done", "medium"))
+        self.assertTrue(any(k == "error" and "does not know the model 'mistral-large-4'" in c
+                            for k, c in events), events)
+
+    def test_vibe_home_is_kept_in_the_workspace(self):
+        home, state = w.VIBE_HOME, w.VIBE_STATE
+        # A previous container left a cached model list and an old config.
+        os.makedirs(state)
+        for name, text in (("experiment_eval_cache.json", "plan"), ("config.toml", "old")):
+            with open(os.path.join(state, name), "w") as f:
+                f.write(text)
+        # The new container's image ships ~/.vibe with its config.
+        os.makedirs(os.path.join(home, "logs"))
+        for name, text in (("config.toml", "image"), ("experiment_eval_cache.json", "empty")):
+            with open(os.path.join(home, name), "w") as f:
+                f.write(text)
+        w.persist_vibe_home()
+        self.assertTrue(os.path.islink(home))
+        read = lambda n: open(os.path.join(home, n)).read()
+        self.assertEqual(read("config.toml"), "image")               # the image's config wins
+        self.assertEqual(read("experiment_eval_cache.json"), "plan")  # the cache survives
+        self.assertTrue(os.path.isdir(os.path.join(home, "logs")))
+        w.persist_vibe_home()  # idempotent
+        self.assertTrue(os.path.islink(home))
 
     def test_nothing_is_written_into_the_repository(self):
         repo = os.path.join(self.tmp, "repo")
@@ -1115,6 +1162,28 @@ class PrepareTaskTest(Patched):
         self.assertIn("--- pkg/CONTRIBUTING.md ---", text)
         self.assertIn("docs/design.md", text)  # listed, not inlined
         self.assertNotIn("--- docs/design.md", text)
+
+    def test_clone_is_reused_and_local_default_branch_fast_forwarded(self):
+        self.use({r"/repos/o/r/issues/7": {"title": "Add CI"}, r"/repos/o/r/pulls\?.*": []})
+        w.prepare_task(agent(), {"id": "t1", "kind": "assigned", "source": "github:o/r#issues:7"})
+        repo_dir = os.path.join(WS_DIR, "repos", "r")
+        marker = os.path.join(repo_dir, ".git", "kept")
+        open(marker, "w").close()
+        # main moves on upstream while the agent sits on its issue branch.
+        sh("git", "push", "-q", self.origin, "HEAD:main", cwd=os.path.join(self.tmp, "seed"))
+        self.use({r"/repos/o/r/pulls/8": {"base": {"ref": "main"}, "head": {"ref": "fix"}}})
+        w.prepare_task(agent(), {"id": "t2", "kind": "review", "source": "github:o/r#pull_requests:8@abc"})
+        self.assertTrue(os.path.exists(marker))  # same clone, not a new one
+        self.assertEqual(w.git(repo_dir, "rev-parse", "main"), w.git(repo_dir, "rev-parse", "origin/main"))
+
+    def test_same_name_other_owner_gets_its_own_clone(self):
+        other = os.path.join(WS_DIR, "repos", "r")
+        sh("git", "init", "-q", other)
+        sh("git", "-C", other, "remote", "add", "origin", "https://github.com/someone/r.git")
+        w.clone_url = lambda agent, repo: f"https://github.com/{repo}.git"  # setUp's points at the local origin
+        self.assertEqual(w.repo_path(agent(), "o/r"), os.path.join(WS_DIR, "repos", "o-r"))
+        # Its own clone stays where it is.
+        self.assertEqual(w.repo_path(agent(), "someone/r"), other)
 
     def test_review_checks_out_pr_head_and_stashes_leftovers(self):
         self.use({r"/repos/o/r/issues/7": {"title": "Add CI"}, r"/repos/o/r/pulls\?.*": []})

@@ -18,6 +18,7 @@ import datetime
 import json
 import os
 import re
+import shutil
 import ssl
 import subprocess
 import sys
@@ -1067,6 +1068,19 @@ def checkout_branch(repo_dir, branch, default):
         git(repo_dir, "checkout", "-b", branch, f"origin/{default}")
 
 
+def fast_forward_default(repo_dir, base):
+    """Move the local default branch up to origin's, so a `main` the agent
+    looks at isn't days old. Only a fast-forward: local commits on it are
+    left alone."""
+    if not git(repo_dir, "branch", "--list", base):
+        return
+    if git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD", check=False) == base:
+        git(repo_dir, "merge", "--ff-only", "-q", f"origin/{base}", check=False)
+    elif subprocess.run(["git", "-C", repo_dir, "merge-base", "--is-ancestor", base, f"origin/{base}"],
+                        capture_output=True, timeout=SHELL_TIMEOUT).returncode == 0:
+        git(repo_dir, "update-ref", f"refs/heads/{base}", f"origin/{base}", check=False)
+
+
 def repo_guidance(repo_dir):
     """The repo's agent/contributor guidance (AGENTS.md, CLAUDE.md,
     CONTRIBUTING.md at any depth, the root README) and the list of its other
@@ -1159,13 +1173,27 @@ def task_trigger(t):
     return None
 
 
+def repo_path(agent, repo):
+    """The clone of owner/name: repos/<name>, kept between tasks and restarts
+    (each task only fetches). If repos/<name> already holds a clone of
+    another repository (same name, other owner), this one goes to
+    repos/<owner>-<name> instead."""
+    owner, name = repo.split("/")[-2:] if "/" in repo else ("", repo)
+    d = os.path.join(WS, "repos", name)
+    if os.path.isdir(os.path.join(d, ".git")):
+        url = git(d, "config", "--get", "remote.origin.url", check=False)
+        if url and url.lower() != clone_url(agent, repo).lower():
+            return os.path.join(WS, "repos", f"{owner}-{name}")
+    return d
+
+
 def prepare_task(agent, t):
     """Clone/fetch the task's repository, check out what the trigger needs
     and return the playbook + workspace + guidance text that goes before
     the task input."""
     trigger = task_trigger(t)
     provider, repo, kind, num = parse_source(t["source"])
-    repo_dir = os.path.join(WS, "repos", repo.split("/")[-1])
+    repo_dir = repo_path(agent, repo)
     if not os.path.isdir(os.path.join(repo_dir, ".git")):
         os.makedirs(os.path.dirname(repo_dir), exist_ok=True)
         r = subprocess.run(["git", "clone", "-q", clone_url(agent, repo), repo_dir],
@@ -1178,6 +1206,7 @@ def prepare_task(agent, t):
     if git(repo_dir, "status", "--porcelain"):
         # Leftovers from an earlier task: keep them in a stash, start clean.
         git(repo_dir, "stash", "push", "-u", "-m", f"doppio: leftovers before task {t['id']}")
+    fast_forward_default(repo_dir, base)
     pr_ref = f"merge-requests/{num}/head" if provider == "gitlab" else f"pull/{num}/head"
     # A CLI engine has no create_pr tool: its playbook opens the PR with gh/glab.
     cli = (agent.get("engine") or "doppio") != "doppio"
@@ -1686,6 +1715,32 @@ VIBE_RUN_DIR = os.path.join(WS, "vibe-runs")
 # image's config.toml turns its update checks off. Never inside a checkout:
 # the key would be one `git add -A` away from a commit.
 VIBE_HOME = os.path.expanduser("~/.vibe")
+# Where ~/.vibe really lives: in the persistent workspace (outside every
+# checkout), so what Vibe caches there survives container restarts. That
+# includes the list of models the account's plan covers, which Vibe only
+# fetches during a run: without it a fresh container refuses those models.
+VIBE_STATE = os.path.join(WS, ".vibe-home")
+
+
+def persist_vibe_home():
+    """Make ~/.vibe a link to VIBE_STATE. The image's fresh ~/.vibe is merged
+    in first: its config.toml (update checks off) replaces the stored one,
+    other files only fill gaps."""
+    if os.path.islink(VIBE_HOME) and os.path.realpath(VIBE_HOME) == os.path.realpath(VIBE_STATE):
+        return
+    os.makedirs(VIBE_STATE, exist_ok=True)
+    os.chmod(VIBE_STATE, 0o700)
+    if os.path.isdir(VIBE_HOME) and not os.path.islink(VIBE_HOME):
+        for name in os.listdir(VIBE_HOME):
+            src, dst = os.path.join(VIBE_HOME, name), os.path.join(VIBE_STATE, name)
+            if name == "config.toml" or not os.path.lexists(dst):
+                if os.path.isdir(dst) and not os.path.islink(dst):
+                    shutil.rmtree(dst)
+                shutil.move(src, dst)
+        shutil.rmtree(VIBE_HOME)
+    elif os.path.lexists(VIBE_HOME):
+        os.remove(VIBE_HOME)
+    os.symlink(VIBE_STATE, VIBE_HOME)
 
 
 def vibe_model_alias(agent):
@@ -1881,13 +1936,26 @@ def vibe_engine(run):
         # The persona and standing task go in the prompt, not in
         # --system-prompt-file: that flag replaces Vibe's own instructions.
         f.write((run.system or "").strip() + "\n\n" + run.prompt)
+    try:
+        persist_vibe_home()
+    except OSError as e:
+        run.emit("log", f"could not keep Vibe's home in the workspace: {e}")
     model = vibe_model_alias(run.agent)
     code, err_tail, answer, export = vibe_attempt(run, prompt_file, os.path.join(run_dir, "out"), model)
     if model and vibe_unknown_model(export):
-        # Refused before any model call, so nothing was spent: run with
-        # Vibe's default model instead.
-        run.emit("log", f"vibe does not know the model {model!r} "
-                        f"({(export.get('error') or {}).get('message', '')}); using Vibe's default model")
+        # Refused before any model call, so nothing was spent. Vibe may just
+        # not have the plan's model list yet (it fetches it during a run): a
+        # tiny run fetches it, then the task runs again on the agent's model.
+        run.emit("log", f"vibe does not know the model {model!r} yet; "
+                        "a short warm-up run fetches the plan's model list")
+        vibe_warmup(run, run_dir)
+        code, err_tail, answer, export = vibe_attempt(run, prompt_file, os.path.join(run_dir, "out-retry"), model)
+    if model and vibe_unknown_model(export):
+        # Still unknown: not in the plan, or a typo. Run on Vibe's default
+        # model so the task gets done, but flag it on the task.
+        run.emit("error", f"vibe does not know the model {model!r} "
+                          f"({(export.get('error') or {}).get('message', '')}): fix the agent's model; "
+                          "this task runs on Vibe's default model")
         code, err_tail, answer, export = vibe_attempt(run, prompt_file,
                                                       os.path.join(run_dir, "out-default"), None)
     outcome, error, export = vibe_outcome(export, code, err_tail)
@@ -1898,6 +1966,24 @@ def vibe_engine(run):
         # vibe reports "finished" but streamed no final message: no usable answer.
         return EngineResult("failed", error="vibe finished without a final message")
     return EngineResult(outcome, answer=answer, error=error)
+
+
+WARMUP_PROMPT = "Reply with the single word OK."
+
+
+def vibe_warmup(run, run_dir):
+    """A tiny vibe run on the default model, its output not streamed to the
+    portal: Vibe fetches the plan's model list during it and caches it."""
+    out_dir = os.path.join(run_dir, "out-warmup")
+    os.makedirs(out_dir, exist_ok=True)
+    prompt_file = os.path.join(run_dir, "warmup.md")
+    with open(prompt_file, "w") as f:
+        f.write(WARMUP_PROMPT + "\n")
+    argv = vibe_argv(run, prompt_file, out_dir, None)
+    run_process(run, argv, env=vibe_env(run), on_line=lambda line: None)
+    note = vibe_usage_note(vibe_read_export(out_dir))
+    if note:
+        run.emit("log", "warm-up " + note)
 
 
 def vibe_unknown_model(export):
@@ -1943,12 +2029,12 @@ def vibe_attempt(run, prompt_file, out_dir, model):
 ENGINES = {"doppio": doppio_engine, "vibe": vibe_engine}
 
 
-def task_workdir(t):
+def task_workdir(t, agent=None):
     """The task's repository directory (see prepare_task), or the workspace."""
     if t.get("source") and task_trigger(t):
         try:
             repo = parse_source(t["source"])[1]
-            d = os.path.join(WS, "repos", repo.split("/")[-1])
+            d = repo_path(agent or {}, repo)
             if os.path.isdir(d):
                 return d
         except Exception:
@@ -1978,7 +2064,7 @@ def run_task(mgr, agent, system, t):
             mgr.finish(tid, "failed", error=f"workspace preparation failed: {e}")
             return "error"
     mgr.emit("user", prompt, task_id=tid)
-    run = TaskRun(mgr, agent, system, t, prompt, task_workdir(t))
+    run = TaskRun(mgr, agent, system, t, prompt, task_workdir(t, agent))
     # A CLI engine logs in with the shared account, not with the agent's own
     # API token: without one it cannot authenticate at all. Engines that are
     # not built in (the tests register their own) are exempt.

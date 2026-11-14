@@ -77,6 +77,8 @@ export interface EngineInfo {
 	id: string;
 	label: string;
 	available: boolean;
+	/** The engine's own model names, when they differ from the provider's. */
+	models?: string[];
 }
 
 /** A kind of shared login (account). */

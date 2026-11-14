@@ -47,6 +47,15 @@
 		return hosted ? HOSTED_MAX_REPLY_TOKENS : LOCAL_MAX_REPLY_TOKENS;
 	});
 
+	// The models to pick from: the engine's own names when it has them (Vibe),
+	// otherwise the provider's API models.
+	function modelsFor(eng: string, prov: string): string[] {
+		const own = engines.find((e) => e.id === eng)?.models;
+		if (own?.length) return own;
+		return providers.find((x) => x.id === prov)?.models ?? [];
+	}
+	const modelChoices = $derived(modelsFor(engine, provider));
+
 	let error = $state('');
 	let saving = $state(false);
 
@@ -57,17 +66,22 @@
 		if (p.engines?.length) engines = p.engines;
 		accounts = await api.accounts();
 		if (!initial) {
-			model = providers.find((x) => x.id === provider)?.models[0] ?? '';
+			model = modelsFor(engine, provider)[0] ?? '';
 			apiBase = providers.find((x) => x.id === provider)?.apiBase ?? '';
 		} else {
-			customModel = !providers.find((x) => x.id === provider)?.models.includes(model);
+			customModel = !modelsFor(engine, provider).includes(model);
 		}
 	});
 
 	function onProviderChange() {
 		const p = providers.find((x) => x.id === provider);
 		apiBase = p?.apiBase ?? '';
-		if (!customModel) model = p?.models[0] ?? '';
+		if (!customModel) model = modelsFor(engine, provider)[0] ?? '';
+	}
+
+	// A model the new engine doesn't list is swapped for its first one.
+	function onEngineChange() {
+		if (!customModel && !modelsFor(engine, provider).includes(model)) model = modelsFor(engine, provider)[0] ?? '';
 	}
 
 	async function submit() {
@@ -122,7 +136,7 @@
 	<h2>Model</h2>
 	<div class="field">
 		<label for="f-engine">Engine</label>
-		<select id="f-engine" bind:value={engine}>
+		<select id="f-engine" bind:value={engine} onchange={onEngineChange}>
 			{#each engines as e}
 				<option value={e.id} disabled={!e.available}>{e.label}{e.available ? '' : ' (coming soon)'}</option>
 			{/each}
@@ -154,7 +168,7 @@
 				<input id="f-model" type="text" bind:value={model} placeholder="custom model id" required />
 			{:else}
 				<select id="f-model" bind:value={model}>
-					{#each providers.find((x) => x.id === provider)?.models ?? [] as m}
+					{#each modelChoices as m}
 						<option value={m}>{m}</option>
 					{/each}
 					<option value="__custom__" onclick={() => (customModel = true)}>(custom…)</option>

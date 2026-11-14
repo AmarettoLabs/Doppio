@@ -1110,14 +1110,20 @@ CLI_PR_LINE = ("open one with the `gh` CLI (GitHub: `gh pr create --repo {repo} 
 PLAYBOOKS = {
     "review_requests": """\
 Your job: review this pull request. The pull request's head is checked out in {repo_dir}.
-1. Read the repository guidance below and the files relevant to the change.
-2. Read the diff (`git -C {repo_dir} diff origin/{base}...HEAD`) and check it against the guidance and the description. Run the tests if useful.
+1. Read the repository guidance below, the changed files and the code that calls them.
+2. Read the diff (`git -C {repo_dir} diff origin/{base}...HEAD`). Check that it does what the description says, look for bugs (edge cases, error paths, concurrent use, secrets or security), check that tests cover the change and that it follows the guidance. Run the tests or the build when the change touches code.
 3. Do not commit, push or open pull requests, and do not post the review yourself.
-Your final answer is submitted for you as your review of the pull request, word for word: write it to the author (your findings, with file and line), with no notes about your process or tools.
-End it with one last line giving your verdict, exactly one of:
-VERDICT: approve (it can be merged as it is)
-VERDICT: request changes (something must be fixed first)
-VERDICT: comment (only questions or remarks, no decision)""",
+
+Your final answer is submitted for you as your review, word for word, so write it to the author:
+- Start with one sentence: your verdict and the main reason.
+- Then list only your findings, the most important first. For each: `path:line`, what is wrong, a concrete case where it breaks, and the fix. Mark each one "must fix" or "nit".
+- Do not retell the diff or go through the files one by one: the author knows what they changed. With no findings, say so in one sentence and say what you checked (for example the tests you ran).
+- Only claim what you checked. If you could not verify something, say so instead of guessing. Leave out test failures that have nothing to do with this change.
+- Keep it short and plain: no headings for a short review, no notes about your process or tools.
+End with one last line giving your verdict, exactly one of:
+VERDICT: approve (no "must fix" findings; nits alone don't block)
+VERDICT: request changes (at least one "must fix")
+VERDICT: comment (you have questions you need answered before you can decide)""",
     "mentions": """\
 Your job: answer the owner's latest mention. The repository is checked out in {repo_dir} if you need to look at the code.
 Only answer: do not change code, commit, push or open pull requests. If the owner asks for code changes, say that the issue should be assigned for implementation.

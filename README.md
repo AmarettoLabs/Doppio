@@ -60,7 +60,7 @@ ignored and logged in the agent's event stream.
 
 | Trigger | What the agent does |
 | --- | --- |
-| Review requests | Checks out the PR, reviews it against the repo's guidance and comments with a verdict. Never pushes. |
+| Review requests | Checks out the PR, reviews it against the repo's guidance and submits a GitHub review: approve, request changes or comment, from the verdict line the agent ends with (on GitLab, a note plus an approval). Never pushes. |
 | Mentions | Answers in a comment. Never changes code. |
 | Assigned issues | Works on a `<login>/<number>-<slug>` branch, implements and tests the change, pushes and opens a PR with `Closes #<number>`, then comments with the link. If the issue is blocked or unclear, it asks instead. |
 | Assigned PRs | Checks out the PR's branch, addresses the owner's review comments and pushes. |

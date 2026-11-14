@@ -864,6 +864,21 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(self.run_task(slow, taskMinutes=7), "error")
         self.assertIn("time limit (7 min)", self.mgr.finished[-1][2])
 
+    def test_review_task_answer_is_submitted_as_a_review(self):
+        calls = []
+        for name, fn in (("post_review", lambda a, src, ans: calls.append(("review", src, ans)) or "APPROVE"),
+                         ("post_comment", lambda a, src, ans: calls.append(("comment", src, ans))),
+                         ("prepare_task", lambda a, t: "context")):
+            orig = getattr(w, name)
+            setattr(w, name, fn)
+            self.addCleanup(setattr, w, name, orig)
+        w.ENGINES["fake"] = lambda run: w.EngineResult("done", answer="ok\nVERDICT: approve")
+        for kind in ("review", "mention"):
+            src = "github:o/r#pull_requests:5@x"
+            w.run_task(self.mgr, agent(engine="fake"), "sys",
+                       {"id": "t-" + kind, "kind": kind, "title": "x", "input": "go", "source": src})
+        self.assertEqual([c[0] for c in calls], ["review", "comment"])
+
     def test_unknown_engine_fails(self):
         out = w.run_task(self.mgr, agent(engine="nope"), "sys", {"id": "t1", "title": "x", "input": "hi"})
         self.assertEqual((out, self.mgr.finished[-1][1]), ("failed", "failed"))
@@ -965,6 +980,41 @@ class SourceTest(unittest.TestCase):
     def test_issue_branch(self):
         self.assertEqual(w.issue_branch(agent(gitLogin="@Bot"), 10, "CI checks for migrations!"),
                          "bot/10-ci-checks-for-migrations")
+
+
+class ReviewVerdictTest(Patched):
+    SRC = "github:o/r#pull_requests:31@abc"
+
+    def test_split_verdict(self):
+        self.assertEqual(w.split_verdict("Looks good.\n\nVERDICT: approve"), ("Looks good.", "APPROVE"))
+        self.assertEqual(w.split_verdict("Fix x.\n**Verdict:** request changes — see above"), ("Fix x.", "REQUEST_CHANGES"))
+        self.assertEqual(w.split_verdict("A question.\nverdict: comment"), ("A question.", "COMMENT"))
+        # No verdict: a plain comment review, body untouched.
+        self.assertEqual(w.split_verdict("Just notes.\n"), ("Just notes.", "COMMENT"))
+        # The last verdict line wins; earlier ones are kept in the body.
+        body, event = w.split_verdict("VERDICT: request changes was my first take.\nNow fine.\nVERDICT: approve")
+        self.assertEqual(event, "APPROVE")
+        self.assertIn("first take", body)
+
+    def test_review_is_submitted_with_the_verdict(self):
+        gh = self.use({r"/repos/o/r/pulls/31/reviews": {"id": 1}})
+        self.assertEqual(w.post_review(agent(), self.SRC, "All good.\nVERDICT: approve"), "APPROVE")
+        self.assertEqual(gh.calls, [("POST", API + "/repos/o/r/pulls/31/reviews",
+                                     {"body": "All good.", "event": "APPROVE"})])
+
+    def test_refused_approval_falls_back_to_a_comment_review(self):
+        def reviews(path, calls=[]):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("HTTP 422: Can not approve your own pull request")
+            return {"id": 2}
+        gh = self.use({r"/repos/o/r/pulls/31/reviews": reviews})
+        self.assertEqual(w.post_review(agent(), self.SRC, "Fine.\nVERDICT: approve"), "COMMENT")
+        self.assertEqual([c[2]["event"] for c in gh.calls], ["APPROVE", "COMMENT"])
+
+    def test_review_playbook_asks_for_a_verdict(self):
+        self.assertIn("VERDICT: approve", w.PLAYBOOKS["review_requests"])
+        self.assertIn("VERDICT: request changes", w.PLAYBOOKS["review_requests"])
 
 
 class RetryTest(unittest.TestCase):

@@ -793,6 +793,50 @@ def post_comment(agent, source, body):
         gl_req(agent, "POST", f"/api/v4/projects/{proj}/{kind}/{num}/notes", {"body": body})
 
 
+# A review's last line gives its verdict; the worker strips it and submits the
+# rest as a GitHub review with that event (a GitLab approval for "approve").
+VERDICT_RE = re.compile(r"^[\s*_`>-]*verdict\s*:\s*[*_`]*\s*(approve|request changes|comment)\b[^\n]*$",
+                        re.IGNORECASE | re.MULTILINE)
+REVIEW_EVENTS = {"approve": "APPROVE", "request changes": "REQUEST_CHANGES", "comment": "COMMENT"}
+
+
+def split_verdict(answer):
+    """(review body without the verdict line, GitHub review event). The last
+    verdict line wins; without one the review is a plain COMMENT."""
+    found = list(VERDICT_RE.finditer(answer))
+    if not found:
+        return answer.strip(), "COMMENT"
+    m = found[-1]
+    body = (answer[:m.start()] + answer[m.end():]).strip()
+    return body, REVIEW_EVENTS[m.group(1).lower()]
+
+
+def post_review(agent, source, answer):
+    """Submit a review task's answer as a pull request review whose event
+    follows its verdict line. Returns the event used. GitHub refuses
+    approving or requesting changes on one's own PR: that falls back to a
+    COMMENT review so the findings are still posted."""
+    body, event = split_verdict(answer)
+    provider, repo, kind, num = parse_source(source)
+    if provider == "github":
+        url = f"{gh_base(agent)}/repos/{repo}/pulls/{num}/reviews"
+        try:
+            gh_req(agent, "POST", url, {"body": body, "event": event})
+        except RuntimeError:
+            if event == "COMMENT":
+                raise
+            event = "COMMENT"
+            gh_req(agent, "POST", url, {"body": body, "event": event})
+        return event
+    if provider == "gitlab":
+        proj = urllib.parse.quote(repo, safe="")
+        gl_req(agent, "POST", f"/api/v4/projects/{proj}/{kind}/{num}/notes", {"body": body})
+        if event == "APPROVE":
+            gl_req(agent, "POST", f"/api/v4/projects/{proj}/{kind}/{num}/approve", {})
+        return event
+    raise ValueError(f"unknown provider in {source!r}")
+
+
 def item_noun(it):
     if it.get("_kind") == "merge_requests":
         return "merge request"
@@ -1068,12 +1112,16 @@ PLAYBOOKS = {
 Your job: review this pull request. The pull request's head is checked out in {repo_dir}.
 1. Read the repository guidance below and the files relevant to the change.
 2. Read the diff (`git -C {repo_dir} diff origin/{base}...HEAD`) and check it against the guidance and the description. Run the tests if useful.
-3. Do not commit, push or open pull requests.
-Your final answer is posted as a comment on the pull request: give your findings and end with whether it passes your review.""",
+3. Do not commit, push or open pull requests, and do not post the review yourself.
+Your final answer is submitted for you as your review of the pull request, word for word: write it to the author (your findings, with file and line), with no notes about your process or tools.
+End it with one last line giving your verdict, exactly one of:
+VERDICT: approve (it can be merged as it is)
+VERDICT: request changes (something must be fixed first)
+VERDICT: comment (only questions or remarks, no decision)""",
     "mentions": """\
 Your job: answer the owner's latest mention. The repository is checked out in {repo_dir} if you need to look at the code.
 Only answer: do not change code, commit, push or open pull requests. If the owner asks for code changes, say that the issue should be assigned for implementation.
-Your final answer is posted as a comment there. Be concise and lead with the answer.""",
+Your final answer is posted for you as a comment there, word for word: do not post it yourself, and leave out notes about your process or tools. Be concise and lead with the answer.""",
     "assigned_issues": """\
 Your job: implement this issue. The branch `{branch}` is checked out in {repo_dir}.{existing}
 1. Read the repository guidance below, the other documentation relevant to the change (see the list of Markdown files) and any file the issue refers to.
@@ -1081,14 +1129,14 @@ Your job: implement this issue. The branch `{branch}` is checked out in {repo_di
 3. Otherwise make the change on `{branch}`, add or update tests, and run the checks the guidance asks for (tests, linters, formatters). Fix failures before going on.
 4. Commit with clear messages and push: `git -C {repo_dir} push -u origin {branch}`. Never push to `{base}`, never force-push, never merge.
 5. If there is no pull request for `{branch}` yet, {pr_line}.
-Your final answer is posted as a comment on the issue: a short summary of what you did and the pull request link, or your questions.""",
+Your final answer is posted for you as a comment on the issue, word for word (do not post it yourself): a short summary of what you did and the pull request link, or your questions.""",
     "assigned_prs": """\
 Your job: follow up on this pull request. Its branch `{branch}` is checked out in {repo_dir}.{fork}
 1. Read the repository guidance below and the files relevant to the change.
 2. Address the owner's review comments and feedback in the discussion. If there is none, check that the pull request is complete (tests, the checks the guidance asks for, a description that matches the change) and fix what is missing.
 3. If feedback is unclear or needs a decision, ask instead of guessing.
 4. Commit with clear messages and push to `{branch}`. Never force-push, never merge.
-Your final answer is posted as a comment on the pull request: a short summary of what changed, or your questions.""",
+Your final answer is posted for you as a comment on the pull request, word for word (do not post it yourself): a short summary of what changed, or your questions.""",
 }
 
 
@@ -1949,8 +1997,12 @@ def run_task(mgr, agent, system, t):
     if t.get("source"):
         if res.answer.strip():
             try:
-                post_comment(agent, t["source"], res.answer)
-                mgr.emit("action", f"posted reply on {t['source']}", task_id=tid)
+                if t.get("kind") == "review":
+                    event = post_review(agent, t["source"], res.answer)
+                    mgr.emit("action", f"posted review ({event.lower().replace('_', ' ')}) on {t['source']}", task_id=tid)
+                else:
+                    post_comment(agent, t["source"], res.answer)
+                    mgr.emit("action", f"posted reply on {t['source']}", task_id=tid)
             except Exception as e:
                 mgr.emit("error", f"could not post reply on {t['source']}: {e}", task_id=tid)
         else:

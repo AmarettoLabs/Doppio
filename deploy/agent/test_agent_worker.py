@@ -1047,6 +1047,23 @@ class ReviewVerdictTest(Patched):
         self.assertEqual(event, "APPROVE")
         self.assertIn("first take", body)
 
+    def test_only_the_text_after_the_review_line_is_posted(self):
+        answer = ("Spot check passed. Review done.\n\nREVIEW:\nLooks good: the fix is tested.\n\n"
+                  "- `a.py:3` (nit): a typo.\n\nVERDICT: approve")
+        self.assertEqual(w.split_verdict(answer),
+                         ("Looks good: the fix is tested.\n\n- `a.py:3` (nit): a typo.", "APPROVE"))
+        # Text on the marker line itself is kept; markdown around the marker is fine.
+        self.assertEqual(w.split_verdict("notes\n**REVIEW:** Fine.\nVERDICT: approve"), ("Fine.", "APPROVE"))
+        # The last marker wins.
+        self.assertEqual(w.split_verdict("REVIEW: draft\nREVIEW:\nFinal.\nVERDICT: comment"),
+                         ("Final.", "COMMENT"))
+        # Only an upper-case marker line counts; prose mentioning a review doesn't.
+        self.assertEqual(w.split_verdict("Review: the code is fine.\nVERDICT: approve"),
+                         ("Review: the code is fine.", "APPROVE"))
+        # A marker with nothing after it doesn't throw the review away.
+        self.assertEqual(w.split_verdict("All good.\nREVIEW:\nVERDICT: approve"),
+                         ("All good.", "APPROVE"))
+
     def test_review_is_submitted_with_the_verdict(self):
         gh = self.use({r"/repos/o/r/pulls/31/reviews": {"id": 1}})
         self.assertEqual(w.post_review(agent(), self.SRC, "All good.\nVERDICT: approve"), "APPROVE")
@@ -1066,6 +1083,7 @@ class ReviewVerdictTest(Patched):
     def test_review_playbook_asks_for_a_verdict(self):
         self.assertIn("VERDICT: approve", w.PLAYBOOKS["review_requests"])
         self.assertIn("VERDICT: request changes", w.PLAYBOOKS["review_requests"])
+        self.assertIn("`REVIEW:`", w.PLAYBOOKS["review_requests"])
 
 
 class RetryTest(unittest.TestCase):

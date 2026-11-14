@@ -506,3 +506,18 @@ func TestUpdateAccountsConcurrently(t *testing.T) {
 	close(stop)
 	readers.Wait()
 }
+
+// An account no agent uses lists its agents as [] (never null): the portal's
+// Accounts page reads agents.length and crashed on null.
+func TestUnusedAccountListsEmptyAgents(t *testing.T) {
+	srv, _ := newTestServer(t, "")
+	h := srv.Handler()
+	_, m := createAccount(t, h, `{"name":"Vibe","kind":"vibe","secrets":{"apiKey":"k"}}`)
+	if a, ok := m["agents"].([]any); !ok || len(a) != 0 {
+		t.Fatalf("create: agents = %#v", m["agents"])
+	}
+	rec := do(h, "GET", "/api/accounts", "", "")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"agents":[]`) {
+		t.Fatalf("list: %d %s", rec.Code, rec.Body)
+	}
+}

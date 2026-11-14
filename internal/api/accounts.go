@@ -33,6 +33,9 @@ type AccountView struct {
 // toAccountView builds the view; agentsUsing lists the agents referencing it.
 func toAccountView(acc *model.Account, agentsUsing []string) AccountView {
 	info, _ := model.LookupAccountKind(acc.Kind)
+	if agentsUsing == nil {
+		agentsUsing = []string{} // "agents": [], never null: the portal reads .length
+	}
 	v := AccountView{
 		ID:           acc.ID,
 		Name:         acc.Name,

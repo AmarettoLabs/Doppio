@@ -103,7 +103,7 @@ func TestAgentEngine(t *testing.T) {
 	}
 
 	rec = do(h, "GET", "/api/providers", "", "")
-	if !strings.Contains(rec.Body.String(), `"engines":[{"id":"doppio","label":"Doppio loop","available":true},{"id":"vibe","label":"Mistral Vibe","available":true}`) {
+	if !strings.Contains(rec.Body.String(), `"engines":[{"id":"doppio","label":"Doppio loop","available":true},{"id":"vibe","label":"Mistral Vibe","available":true,"models":["mistral-large-4-0-3",`) {
 		t.Fatalf("providers: %s", rec.Body)
 	}
 

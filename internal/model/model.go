@@ -68,16 +68,24 @@ type EngineInfo struct {
 	// Available: the worker can run it. The CLI engines are being added one
 	// by one; until then they are listed but can't be picked.
 	Available bool `json:"available"`
+	// Models: the names the engine itself accepts, when they differ from the
+	// provider's API names (Vibe has its own aliases). Empty = the provider's
+	// list applies.
+	Models []string `json:"models,omitempty"`
 }
 
 // Engines lists every engine, the default (Doppio loop) first.
 func Engines() []EngineInfo {
 	return []EngineInfo{
-		{EngineDoppio, "Doppio loop", true},
-		{EngineVibe, "Mistral Vibe", true},
-		{EngineClaudeCode, "Claude Code", false},
-		{EngineCodex, "Codex CLI", false},
-		{EngineQwenCode, "Qwen Code", false},
+		{ID: EngineDoppio, Label: "Doppio loop", Available: true},
+		// Vibe's names for the models a Mistral subscription covers; Vibe
+		// refuses the API names (e.g. "mistral-large-4").
+		{ID: EngineVibe, Label: "Mistral Vibe", Available: true, Models: []string{
+			"mistral-large-4-0-3", "mistral-medium-3.5", "glm-5-3", "zai-glm-5-3-flash",
+		}},
+		{ID: EngineClaudeCode, Label: "Claude Code"},
+		{ID: EngineCodex, Label: "Codex CLI"},
+		{ID: EngineQwenCode, Label: "Qwen Code"},
 	}
 }
 
@@ -275,7 +283,7 @@ func Providers() []ProviderInfo {
 			"claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1",
 		}},
 		{ID: string(ProvMistral), Name: "Mistral AI", APIBase: "https://api.mistral.ai/v1", Models: []string{
-			"mistral-large-4", "mistral-medium-3", "codestral-2",
+			"mistral-large-4", "mistral-medium-3.5", "codestral-latest", "zai-glm-latest",
 		}},
 	}
 }

@@ -137,11 +137,14 @@ results), takes its final message as the task's answer, and reads Vibe's
 the task. Pull/merge requests are opened with `gh` / `glab` — the playbooks
 say so for CLI engines.
 
-Vibe runs the agent's model when it knows it, and its own default model
-otherwise: out of the box Vibe only knows its coding model
-(`mistral-medium-3.5`) and refuses any other name before calling the API, so
-the worker logs it and runs again without `--model`. The key stays in Vibe's
-own home (`~/.vibe/.env`) and the run's prompt and export in the workspace's
+Vibe has its own names for the models a Mistral subscription covers
+(`mistral-large-4-0-3`, `mistral-medium-3.5`, `glm-5-3`, `zai-glm-5-3-flash`;
+the portal lists them when the engine is Mistral Vibe) and refuses the API
+names such as `mistral-large-4` before calling the API. When it refuses the
+agent's model, the worker logs it and runs again without `--model`, on Vibe's
+default model. Without a valid key Vibe can't fetch the plan's list and only
+knows `mistral-medium-3.5`. The key stays in Vibe's own home
+(`~/.vibe/.env`) and the run's prompt and export in the workspace's
 `vibe-runs/`, never inside the repository checkout.
 
 Each task has a time limit (30 minutes by default, set per agent). A task

@@ -65,10 +65,13 @@ ignored and logged in the agent's event stream.
 | Assigned issues | Works on a `<login>/<number>-<slug>` branch, implements and tests the change, pushes and opens a PR with `Closes #<number>`, then comments with the link. If the issue is blocked or unclear, it asks instead. |
 | Assigned PRs | Checks out the PR's branch, addresses the owner's review comments and pushes. |
 
-Before reviews and assigned work, the worker clones or updates the repo and
-puts its guidance in the prompt: every `AGENTS.md`, `CLAUDE.md` and
-`CONTRIBUTING.md` plus the root `README.md`, and a list of the other Markdown
-files for the model to read as needed. New owner feedback (a comment or a
+Before reviews and assigned work, the worker updates the repo and puts its
+guidance in the prompt. Each repo is cloned once into the agent's workspace
+(`repos/<name>`, kept across restarts); a task only fetches, and the local
+default branch is fast-forwarded so it matches upstream. The guidance is
+every `AGENTS.md`, `CLAUDE.md` and `CONTRIBUTING.md` plus the root
+`README.md`, and a list of the other Markdown files for the model to read as
+needed. New owner feedback (a comment or a
 review) on assigned work starts a new pass, so an agent that asked a question
 picks the work up again once you answer. Each new mention is new work too,
 even on an item the agent already answered.
@@ -140,12 +143,16 @@ say so for CLI engines.
 Vibe has its own names for the models a Mistral subscription covers
 (`mistral-large-4-0-3`, `mistral-medium-3.5`, `glm-5-3`, `zai-glm-5-3-flash`;
 the portal lists them when the engine is Mistral Vibe) and refuses the API
-names such as `mistral-large-4` before calling the API. When it refuses the
-agent's model, the worker logs it and runs again without `--model`, on Vibe's
-default model. Without a valid key Vibe can't fetch the plan's list and only
-knows `mistral-medium-3.5`. The key stays in Vibe's own home
-(`~/.vibe/.env`) and the run's prompt and export in the workspace's
-`vibe-runs/`, never inside the repository checkout.
+names such as `mistral-large-4` before calling the API. It learns the plan's
+list during a run and caches it in its home, `~/.vibe`, which the worker keeps
+in the agent's workspace (`.vibe-home/`) so the cache survives container
+restarts; the image's `config.toml` (update checks off) replaces the stored
+one at each start. If Vibe still refuses the agent's model, the worker does a
+one-line warm-up run so Vibe fetches the list, then runs the task on the
+agent's model. Only a model that is still unknown after that (not in the
+plan, or a typo) runs on Vibe's default model, with an error on the task. The
+key (`.env`) and the run files (`vibe-runs/`) stay in the workspace, never
+inside a repository checkout.
 
 Each task has a time limit (30 minutes by default, set per agent). A task
 still running then is stopped and retried at a later git check, like other

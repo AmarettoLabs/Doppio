@@ -1179,12 +1179,17 @@ def repo_path(agent, repo):
     another repository (same name, other owner), this one goes to
     repos/<owner>-<name> instead."""
     owner, name = repo.split("/")[-2:] if "/" in repo else ("", repo)
-    d = os.path.join(WS, "repos", name)
-    if os.path.isdir(os.path.join(d, ".git")):
+    want = clone_url(agent, repo).lower()
+    # The fallback names are checked the same way: repos/<owner>-<name> may
+    # itself hold another repo's clone (say x/foo-bar for foo/bar).
+    for sub in [name, f"{owner}-{name}"] + [f"{owner}-{name}-{i}" for i in range(2, 10)]:
+        d = os.path.join(WS, "repos", sub)
+        if not os.path.isdir(os.path.join(d, ".git")):
+            return d
         url = git(d, "config", "--get", "remote.origin.url", check=False)
-        if url and url.lower() != clone_url(agent, repo).lower():
-            return os.path.join(WS, "repos", f"{owner}-{name}")
-    return d
+        if not url or url.lower() == want:
+            return d
+    raise RuntimeError(f"no free directory under repos/ for {repo}")
 
 
 def prepare_task(agent, t):
@@ -1531,14 +1536,14 @@ class TaskRun:
             raise TaskTimeout(f"time limit ({self.minutes} min) reached")
 
 
-def run_process(run, argv, stdin_text="", env=None, on_line=None):
+def run_process(run, argv, stdin_text="", env=None, on_line=None, cwd=None):
     """Run an engine's process in the task's directory, feeding stdin_text and
     handing each stdout line to on_line. The process (and its children) is
     killed at the task's time limit, raising TaskTimeout. Returns
     (exit code, last lines of stderr)."""
     import signal
     import threading
-    proc = subprocess.Popen(argv, cwd=run.workdir, env=env, text=True, start_new_session=True,
+    proc = subprocess.Popen(argv, cwd=cwd or run.workdir, env=env, text=True, start_new_session=True,
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     err_tail = []
 
@@ -1776,7 +1781,7 @@ def vibe_env(run):
     return env
 
 
-def vibe_argv(run, prompt_file, out_dir, model):
+def vibe_argv(run, prompt_file, out_dir, model, workdir=None, max_secs=None):
     """The headless vibe invocation for one task: the prompt from a file, the
     streamed output format, auto-approve (the container is the sandbox), the
     model (None: Vibe's default), the turn and time limits, and the export dir
@@ -1786,7 +1791,7 @@ def vibe_argv(run, prompt_file, out_dir, model):
         "--prompt-file", prompt_file,
         "--output", "streaming",
         "--agent", "auto-approve",
-        "--workdir", run.workdir,
+        "--workdir", workdir or run.workdir,
         "--output-dir", out_dir,
     ]
     if model:
@@ -1794,6 +1799,8 @@ def vibe_argv(run, prompt_file, out_dir, model):
     if run.max_turns is not None:
         argv += ["--max-turns", str(run.max_turns)]
     secs = int(run.remaining())
+    if max_secs is not None:
+        secs = min(secs, max_secs)
     if secs > 0:
         argv += ["--time-limit", str(secs)]
     return argv
@@ -1969,18 +1976,22 @@ def vibe_engine(run):
 
 
 WARMUP_PROMPT = "Reply with the single word OK."
+# The warm-up should take seconds; a hung one must not eat the task's time.
+WARMUP_SECONDS = 120
 
 
 def vibe_warmup(run, run_dir):
     """A tiny vibe run on the default model, its output not streamed to the
-    portal: Vibe fetches the plan's model list during it and caches it."""
+    portal: Vibe fetches the plan's model list during it and caches it. It
+    runs in the run's own directory, not the checkout (auto-approve would
+    let any tool call act on the repository), with a short time limit."""
     out_dir = os.path.join(run_dir, "out-warmup")
     os.makedirs(out_dir, exist_ok=True)
     prompt_file = os.path.join(run_dir, "warmup.md")
     with open(prompt_file, "w") as f:
         f.write(WARMUP_PROMPT + "\n")
-    argv = vibe_argv(run, prompt_file, out_dir, None)
-    run_process(run, argv, env=vibe_env(run), on_line=lambda line: None)
+    argv = vibe_argv(run, prompt_file, out_dir, None, workdir=run_dir, max_secs=WARMUP_SECONDS)
+    run_process(run, argv, env=vibe_env(run), on_line=lambda line: None, cwd=run_dir)
     note = vibe_usage_note(vibe_read_export(out_dir))
     if note:
         run.emit("log", "warm-up " + note)

@@ -818,6 +818,10 @@ class VibeEngineTest(unittest.TestCase):
         self.assertEqual(["--model" in a for a in argvs], [True, False, True])
         self.assertEqual((res.outcome, res.answer), ("done", "large"))
         self.assertTrue(any("warm-up" in c for _, c in events), events)
+        # The warm-up runs outside the checkout, with a short time limit.
+        warm = argvs[1]
+        self.assertNotEqual(warm[warm.index("--workdir") + 1], WS_DIR)
+        self.assertLessEqual(int(warm[warm.index("--time-limit") + 1]), w.WARMUP_SECONDS)
         self.assertFalse(any(k == "error" for k, _ in events), events)
         # The warm-up's own reply never reaches the portal.
         self.assertFalse(any(c == "OK" for _, c in events), events)
@@ -1176,6 +1180,15 @@ class PrepareTaskTest(Patched):
         self.assertTrue(os.path.exists(marker))  # same clone, not a new one
         self.assertEqual(w.git(repo_dir, "rev-parse", "main"), w.git(repo_dir, "rev-parse", "origin/main"))
 
+    def test_local_default_branch_fast_forwarded_when_checked_out(self):
+        self.use({r"/repos/o/r/issues/7": {"title": "Add CI"}, r"/repos/o/r/pulls\?.*": []})
+        w.prepare_task(agent(), {"id": "t1", "kind": "assigned", "source": "github:o/r#issues:7"})
+        repo_dir = os.path.join(WS_DIR, "repos", "r")
+        w.git(repo_dir, "checkout", "-q", "main")  # the agent left it on main
+        sh("git", "push", "-q", self.origin, "HEAD:main", cwd=os.path.join(self.tmp, "seed"))
+        w.prepare_task(agent(), {"id": "t2", "kind": "assigned", "source": "github:o/r#issues:7"})
+        self.assertEqual(w.git(repo_dir, "rev-parse", "main"), w.git(repo_dir, "rev-parse", "origin/main"))
+
     def test_same_name_other_owner_gets_its_own_clone(self):
         other = os.path.join(WS_DIR, "repos", "r")
         sh("git", "init", "-q", other)
@@ -1184,6 +1197,13 @@ class PrepareTaskTest(Patched):
         self.assertEqual(w.repo_path(agent(), "o/r"), os.path.join(WS_DIR, "repos", "o-r"))
         # Its own clone stays where it is.
         self.assertEqual(w.repo_path(agent(), "someone/r"), other)
+        # The fallback is checked too: repos/o-r holding x/o-r moves on to o-r-2.
+        taken = os.path.join(WS_DIR, "repos", "o-r")
+        sh("git", "init", "-q", taken)
+        self.addCleanup(shutil.rmtree, taken, True)
+        sh("git", "-C", taken, "remote", "add", "origin", "https://github.com/x/o-r.git")
+        self.assertEqual(w.repo_path(agent(), "o/r"), os.path.join(WS_DIR, "repos", "o-r-2"))
+        self.assertEqual(w.repo_path(agent(), "x/o-r"), taken)
 
     def test_review_checks_out_pr_head_and_stashes_leftovers(self):
         self.use({r"/repos/o/r/issues/7": {"title": "Add CI"}, r"/repos/o/r/pulls\?.*": []})

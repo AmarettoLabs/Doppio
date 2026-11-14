@@ -796,20 +796,30 @@ def post_comment(agent, source, body):
 
 # A review's last line gives its verdict; the worker strips it and submits the
 # rest as a GitHub review with that event (a GitLab approval for "approve").
+# The review itself starts after a "REVIEW:" line, so anything the model writes
+# before it in its final message (a last note about its checks) is not posted.
+REVIEW_START_RE = re.compile(r"^[ \t*_`>#-]*REVIEW[ \t]*:[*_`]*[ \t]*", re.MULTILINE)
 VERDICT_RE = re.compile(r"^[\s*_`>-]*verdict\s*:\s*[*_`]*\s*(approve|request changes|comment)\b[^\n]*$",
                         re.IGNORECASE | re.MULTILINE)
 REVIEW_EVENTS = {"approve": "APPROVE", "request changes": "REQUEST_CHANGES", "comment": "COMMENT"}
 
 
 def split_verdict(answer):
-    """(review body without the verdict line, GitHub review event). The last
-    verdict line wins; without one the review is a plain COMMENT."""
+    """(review body, GitHub review event). The body is what follows the last
+    "REVIEW:" line (the whole answer without one), minus the verdict line. The
+    last verdict line wins; without one the review is a plain COMMENT."""
     found = list(VERDICT_RE.finditer(answer))
-    if not found:
-        return answer.strip(), "COMMENT"
-    m = found[-1]
-    body = (answer[:m.start()] + answer[m.end():]).strip()
-    return body, REVIEW_EVENTS[m.group(1).lower()]
+    event = "COMMENT"
+    if found:
+        m = found[-1]
+        answer = answer[:m.start()] + answer[m.end():]
+        event = REVIEW_EVENTS[m.group(1).lower()]
+    starts = list(REVIEW_START_RE.finditer(answer))
+    if starts:
+        after = answer[starts[-1].end():]
+        # A marker with nothing after it: keep what came before rather than post nothing.
+        answer = after if after.strip() else answer[:starts[-1].start()]
+    return answer.strip(), event
 
 
 def post_review(agent, source, answer):
@@ -1129,6 +1139,7 @@ Your job: review this pull request. The pull request's head is checked out in {r
 3. Do not commit, push or open pull requests, and do not post the review yourself.
 
 Your final answer is submitted for you as your review, word for word, so write it to the author:
+- Begin it with a line `REVIEW:`. Only what follows that line is posted: put nothing before it.
 - Start with one sentence: your verdict and the main reason.
 - Then list only your findings, the most important first. For each: `path:line`, what is wrong, a concrete case where it breaks, and the fix. Mark each one "must fix" or "nit".
 - Do not retell the diff or go through the files one by one: the author knows what they changed. With no findings, say so in one sentence and say what you checked (for example the tests you ran).

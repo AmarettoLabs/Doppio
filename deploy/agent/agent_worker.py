@@ -1266,7 +1266,9 @@ def prepare_task(agent, t):
     vars_["pr_line"] = pr_line.format(**{k: v for k, v in vars_.items() if k != "pr_line"})
     parts = [PLAYBOOKS[trigger].format(**vars_),
              f"Workspace: {repo_dir} (default branch `{base}`, currently on "
-             f"`{git(repo_dir, 'rev-parse', '--abbrev-ref', 'HEAD', check=False)}`)."]
+             f"`{git(repo_dir, 'rev-parse', '--abbrev-ref', 'HEAD', check=False)}`). "
+             "Put scratch files (helper scripts, notes) under /tmp, not in the workspace "
+             "or the repository: the workspace is kept between tasks."]
     if trigger != "mentions":
         parts.append(repo_guidance(repo_dir))
     return "\n\n".join(parts)

@@ -98,30 +98,39 @@ func (s *Store) saveLocked() error {
 	return os.Rename(tmp, s.path)
 }
 
-// Agents returns all agents sorted by creation time.
+// Agents returns copies of all agents sorted by creation time.
 func (s *Store) Agents() []*model.Agent {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]*model.Agent, 0, len(s.data.Agents))
 	for _, a := range s.data.Agents {
-		out = append(out, a)
+		c := *a
+		out = append(out, &c)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
 	return out
 }
 
-// GetAgent returns the agent or nil.
+// GetAgent returns a copy of the agent, or nil. Callers change the copy and
+// save it with UpsertAgent: the stored agent is never shared, so a request
+// changing one can't race with another reading it or with saving the store.
 func (s *Store) GetAgent(id string) *model.Agent {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.data.Agents[id]
+	a := s.data.Agents[id]
+	if a == nil {
+		return nil
+	}
+	c := *a
+	return &c
 }
 
 // UpsertAgent inserts or replaces an agent.
 func (s *Store) UpsertAgent(a *model.Agent) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.data.Agents[a.ID] = a
+	c := *a
+	s.data.Agents[a.ID] = &c
 	return s.saveLocked()
 }
 

@@ -113,7 +113,7 @@
 					<tr>
 						<td>{a.name}</td>
 						<td>{a.kindLabel}</td>
-						<td class="muted">{a.secretFields.length ? a.secretFields.join(', ') + ' set' : 'none set'}</td>
+						<td class="muted">{a.secretFields?.length ? a.secretFields.join(', ') + ' set' : 'none set'}</td>
 						<td><span class="badge {a.status === 'configured' ? 'done' : 'error'}">{a.status}</span></td>
 						<td class="muted">{a.agents?.length ? a.agents.join(', ') : '—'}</td>
 						<td class="nowrap">

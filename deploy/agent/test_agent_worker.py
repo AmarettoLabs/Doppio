@@ -618,6 +618,12 @@ class VibeEngineTest(unittest.TestCase):
         # No leftover fake from another test: the real `vibe` must not run here.
         for k in ("FAKE_VIBE_SCRIPT", "FAKE_VIBE_CALLS"):
             os.environ.pop(k, None)
+        # The engine environment is a whitelist now; the fake vibe harness
+        # is shell on the other side of it.
+        p = unittest.mock.patch.object(w, "ENGINE_ENV_ALLOW",
+                                       w.ENGINE_ENV_ALLOW + ("FAKE_VIBE_CALLS", "FAKE_VIBE_SCRIPT"))
+        p.start()
+        self.addCleanup(p.stop)
         # Vibe's home and the run files go to temp dirs, never the real ones.
         for name, sub in (("VIBE_HOME", "vibe-home"), ("VIBE_RUN_DIR", "vibe-runs"),
                           ("VIBE_STATE", "ws-vibe-home")):
@@ -1155,11 +1161,26 @@ class EngineUserTest(unittest.TestCase):
 
     def test_engine_env_leaves_the_agent_secrets_paths_out(self):
         with unittest.mock.patch.dict(os.environ, {"AGENT_CONFIG": "/agent/state/config.json",
-                                                   "AGENT_ACCOUNT": "/agent/state/account.json"}):
+                                                   "AGENT_ACCOUNT": "/agent/state/account.json",
+                                                   "A_SECRET_HANDED_TO_THE_WORKER": "hush",
+                                                   "LC_ALL": "C.UTF-8"}):
             env = w.engine_env(self.task_run("assigned"))
         self.assertNotIn("AGENT_CONFIG", env)
         self.assertNotIn("AGENT_ACCOUNT", env)
+        self.assertNotIn("A_SECRET_HANDED_TO_THE_WORKER", env)  # a whitelist, not a deny list
         self.assertTrue(env["HOME"].startswith(w.ENGINE_HOME_ROOT))
+        for k in ("PATH", "LC_ALL"):
+            self.assertIn(k, env)  # what the engines run on comes through
+
+    def test_chown_to_engine_never_follows_the_engines_symlinks(self):
+        calls = []
+        orig_ids, orig_run = w.engine_uid_gid, w.subprocess.run
+        w.engine_uid_gid = lambda: (1000, 1000)
+        w.subprocess.run = lambda argv, **kw: calls.append(argv) or None
+        self.addCleanup(setattr, w, "engine_uid_gid", orig_ids)
+        self.addCleanup(setattr, w.subprocess, "run", orig_run)
+        w.chown_to_engine(os.path.join(WS_DIR, "repos", "r"))
+        self.assertEqual(calls, [["chown", "-R", "-h", "1000:1000", os.path.join(WS_DIR, "repos", "r")]])
 
     def test_engine_home_holds_credentials_only_when_the_task_may_push(self):
         home = self.task_run("assigned").engine_home()
@@ -1185,6 +1206,34 @@ class EngineUserTest(unittest.TestCase):
         self.assertFalse(w.can_push({"kind": "assigned"}))
         self.assertTrue(w.can_push({"kind": "assigned", "source": "github:o/r#issues:7@x"}))
         self.assertFalse(w.can_push({"kind": "assigned", "source": ""}))
+
+
+class SetupGitTest(unittest.TestCase):
+    def config(self, home):
+        out = subprocess.run(["git", "config", "--global", "--list"], check=True,
+                             capture_output=True, text=True, env=dict(os.environ, HOME=home))
+        return out.stdout
+
+    def test_a_token_configures_identity_and_credentials(self):
+        with tempfile.TemporaryDirectory() as home:
+            with unittest.mock.patch.dict(os.environ, {"HOME": home}):
+                w.setup_git(agent())
+            cfg = self.config(home)
+            self.assertIn("user.name=bot", cfg)
+            self.assertIn("credential.helper=store --file=", cfg)
+            self.assertIn("safe.directory=*", cfg)
+            cred = os.path.join(home, ".git-credentials")
+            self.assertIn("x-access-token:t@github.com", open(cred).read())
+
+    def test_without_a_token_no_credential_store_is_configured(self):
+        with tempfile.TemporaryDirectory() as home:
+            with unittest.mock.patch.dict(os.environ, {"HOME": home}):
+                w.setup_git(agent(gitToken=""))
+            cfg = self.config(home)
+            self.assertNotIn("credential.helper", cfg)
+            self.assertNotIn("user.name=", cfg)
+            self.assertFalse(os.path.exists(os.path.join(home, ".git-credentials")))
+            self.assertIn("safe.directory=*", cfg)  # the one unconditional setting
 
 
 

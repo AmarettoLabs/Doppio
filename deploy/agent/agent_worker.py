@@ -1444,9 +1444,9 @@ SHELL_TIMEOUT = 300
 TOOL_DEFS = {
     "shell": {
         "name": "shell",
-        "description": "Run a shell command in /agent/workspace (git is preconfigured with "
-                       "your credentials; for git tasks the repository is already cloned and "
-                       "checked out under repos/<name>, see the task — do NOT clone again).",
+        "description": "Run a shell command in /agent/workspace (the task says what git "
+                       "credentials it comes with; for git tasks the repository is already "
+                       "cloned and checked out under repos/<name>, see the task — do NOT clone again).",
         "parameters": {
             "type": "object",
             "properties": {
@@ -1501,7 +1501,7 @@ TOOL_DEFS = {
 TOOL_SPEC = """You can act with tools. Each turn, reply with EITHER:
 - a final plain-text answer (no JSON block), or
 - exactly one tool call in a ```json fenced block:
-  {"tool":"shell","command":"..."}                     run a shell command in /agent/workspace (git is preconfigured with your credentials; for git tasks the repository is already cloned and checked out under repos/<name>, see the task — do NOT clone again)
+  {"tool":"shell","command":"..."}                     run a shell command in /agent/workspace (the task says what git credentials it comes with; for git tasks the repository is already cloned and checked out under repos/<name>, see the task — do NOT clone again)
   {"tool":"read_file","path":"...","start_line":1,"end_line":400}   read a file under /agent/workspace (lines optional; long files are shown in parts)
   {"tool":"write_file","path":"...","content":"..."}   write a file under /agent/workspace
   {"tool":"create_pr","repo":"owner/repo","head":"your-branch","base":"main","title":"...","body":"..."}
@@ -1550,14 +1550,23 @@ def parse_tool_call(text):
 
 def setup_git(agent):
     """Configure git identity + credential store for the WORKER (root), whose
-    own clones/fetches need the token. The store lives in its home, not the
-    workspace: the engine user works there, and could read it if a recursive
-    chown ever handed it over. Engines get per-task credentials instead (see
-    engine_env)."""
+    own fetches need the token (it alone uses root_git; anything in a
+    checkout runs as the engine user). The store lives in the worker's home,
+    not the workspace: the engine user could read it there. Engines get
+    per-task credentials instead (see engine_env)."""
+    os.makedirs(WS, exist_ok=True)
     login = normalize_login(agent.get("gitLogin")) or "agent"
     email = (agent.get("emails") or [f"{login}@users.noreply.github.com"])[0]
-    os.makedirs(WS, exist_ok=True)
     cred = os.path.expanduser("~/.git-credentials")
+    # Without a token there is nothing to configure for fetches, and
+    # credential.helper = store would only gain an empty file on first use.
+    pairs = [
+        # The engine user owns the checkouts after a task; without
+        # this the worker (root) refuses to work on them ("detected
+        # dubious ownership"). The engine user owns its own.
+        ("safe.directory", "*"),
+        ("init.defaultBranch", "main"), ("push.default", "current"),
+    ]
     if agent.get("gitToken"):
         # A store left in the workspace by an older worker: remove it now that
         # the engine could otherwise end up reading it.
@@ -1575,13 +1584,9 @@ def setup_git(agent):
             with open(cred, "w") as f:
                 f.write("\n".join(entries) + "\n")
             os.chmod(cred, 0o600)
-    for k, v in (("user.name", login), ("user.email", email),
-                 ("credential.helper", f"store --file={cred}"),
-                 # The engine user owns the checkouts after a task; without
-                 # this the worker (root) refuses to work on them ("detected
-                 # dubious ownership"). The engine user owns its own.
-                 ("safe.directory", "*"),
-                 ("init.defaultBranch", "main"), ("push.default", "current")):
+        pairs = [("user.name", login), ("user.email", email),
+                 ("credential.helper", f"store --file={cred}"), *pairs]
+    for k, v in pairs:
         subprocess.run(["git", "config", "--global", k, v], check=False)
 
 
@@ -1746,7 +1751,9 @@ def chown_to_engine(path, recursive=True):
     if ids is None:
         return
     if recursive:
-        subprocess.run(["chown", "-R", f"{ids[0]}:{ids[1]}", path],
+        # -h: a checkout may hold symlinks the engine user planted; following
+        # them would hand root files (its .git-credentials...) to the engine.
+        subprocess.run(["chown", "-R", "-h", f"{ids[0]}:{ids[1]}", path],
                        capture_output=True, timeout=SHELL_TIMEOUT)
     else:
         os.chown(path, ids[0], ids[1])
@@ -1835,20 +1842,24 @@ def cleanup_engine_home(run):
         pass
 
 
-# Credentials never inherited by engine processes: the worker passes what a
-# task needs explicitly (engine_env adds GIT_TOKEN back, vibe_env the Mistral
-# key). Clearing these also keeps any secret ambient in the environment from
-# reaching a steered shell.
-ENGINE_ENV_DENY = ("AGENT_CONFIG", "AGENT_ACCOUNT",
-                   "GIT_TOKEN", "GH_TOKEN", "GITLAB_TOKEN", "MISTRAL_API_KEY")
+# What the engine inherits from the worker's environment: a whitelist, so a
+# secret that happens to sit there (now or by some later change) never
+# reaches a steered shell - the token a task needs is added back explicitly
+# by engine_env (git) and vibe_env (gh, glab, the account key). The CA
+# variables are set by setup_extra_ca; engines need them for git, the API
+# host and the Node-based CLIs.
+ENGINE_ENV_ALLOW = ("PATH", "HOME", "LANG", "TERM", "TZ", "TMPDIR",
+                    "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+                    "GIT_SSL_CAINFO", "NODE_EXTRA_CA_CERTS",
+                    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+                    "http_proxy", "https_proxy", "no_proxy")
 
 
 def engine_env(run):
     """The environment for the engine's processes: HOME is the per-task dir,
-    no credential variables (added back only where the task needs them: the
-    git token on tasks that may push), and build caches in the workspace so
-    they survive tasks."""
-    env = {k: v for k, v in os.environ.items() if k not in ENGINE_ENV_DENY}
+    nothing outside ENGINE_ENV_ALLOW comes through from the worker's own
+    environment, and the git token is added only where the task may push."""
+    env = {k: v for k, v in os.environ.items() if k in ENGINE_ENV_ALLOW or k.startswith("LC_")}
     env["HOME"] = run.engine_home()
     cache = os.path.join(WS, ".cache")
     env.setdefault("GOCACHE", os.path.join(cache, "go-build"))
@@ -2325,13 +2336,14 @@ def vibe_engine(run):
     the portal and maps its export to a task outcome."""
     run_dir = os.path.join(VIBE_RUN_DIR, str(run.task["id"]))
     os.makedirs(run_dir, exist_ok=True)
-    # The engine user writes its export there (the prompt stays readable).
-    chown_to_engine(run_dir)
     prompt_file = os.path.join(run_dir, "prompt.md")
     with open(prompt_file, "w") as f:
         # The persona and standing task go in the prompt, not in
         # --system-prompt-file: that flag replaces Vibe's own instructions.
         f.write((run.system or "").strip() + "\n\n" + run.prompt)
+    # The engine reads the prompt but does not get the run dir itself: only
+    # the export dirs are handed over (non-recursively, see the attempts).
+    os.chmod(prompt_file, 0o644)
     try:
         persist_vibe_home()
     except OSError as e:
@@ -2376,7 +2388,7 @@ def vibe_warmup(run, run_dir):
     let any tool call act on the repository), with a short time limit."""
     out_dir = os.path.join(run_dir, "out-warmup")
     os.makedirs(out_dir, exist_ok=True)
-    chown_to_engine(out_dir)  # the engine user writes the export there
+    chown_to_engine(out_dir, recursive=False)  # the engine user writes the export there
     prompt_file = os.path.join(run_dir, "warmup.md")
     with open(prompt_file, "w") as f:
         f.write(WARMUP_PROMPT + "\n")
@@ -2397,7 +2409,7 @@ def vibe_attempt(run, prompt_file, out_dir, model):
     """One vibe process: streams its output to the portal and returns (exit
     code, stderr tail, final answer, export)."""
     os.makedirs(out_dir, exist_ok=True)
-    chown_to_engine(out_dir)  # the engine user writes the export there
+    chown_to_engine(out_dir, recursive=False)  # the engine user writes the export there
     argv = vibe_argv(run, prompt_file, out_dir, model)
     run.emit("log", "running: " + " ".join(argv))
     answer = ""
@@ -2572,9 +2584,15 @@ def main():
     # not read the root-owned files (strictly not recursive, see
     # chown_to_engine). Older workspaces already have its caches.
     chown_to_engine(WS, recursive=False)
-    for sub in (".cache", "vibe-runs"):
-        if os.path.isdir(os.path.join(WS, sub)):
-            chown_to_engine(os.path.join(WS, sub))
+    # The engine's build caches live under the workspace. vibe-runs stays
+    # root's (its prompts too): only each run's export dir is handed over.
+    cache = os.path.join(WS, ".cache")
+    if os.path.isdir(cache):
+        chown_to_engine(cache)
+    # A worker killed mid-task leaves per-task engine homes - credentials
+    # included - behind: start from none.
+    shutil.rmtree(ENGINE_HOME_ROOT, ignore_errors=True)
+    os.makedirs(ENGINE_HOME_ROOT, exist_ok=True)
     state_path = os.path.join(WS, "worker-state.json")
     state = {}
     if os.path.exists(state_path):

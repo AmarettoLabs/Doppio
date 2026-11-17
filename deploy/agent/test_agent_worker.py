@@ -1466,6 +1466,36 @@ class PrepareTaskTest(Patched):
         self.assertEqual(w.repo_path(agent(), "o/r"), os.path.join(WS_DIR, "repos", "o-r-2"))
         self.assertEqual(w.repo_path(agent(), "x/o-r"), taken)
 
+    def test_git_in_checkouts_runs_as_the_engine_user_and_hooks_are_sanitized(self):
+        self.use({r"/repos/o/r/issues/7": {"title": "Add CI"}, r"/repos/o/r/pulls\?.*": []})
+        w.prepare_task(agent(), {"id": "t1", "kind": "assigned", "source": "github:o/r#issues:7"})
+        repo_dir = os.path.join(WS_DIR, "repos", "r")
+        # What a steered engine can plant in a checkout it owns: a hook
+        # (it would run as root with the old root git there).
+        hooks = os.path.join(repo_dir, ".git", "hooks")
+        hook = os.path.join(hooks, "post-checkout")
+        with open(hook, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(hook, 0o755)
+        seen = []
+        orig = w.engine_argv
+        w.engine_argv = lambda argv: seen.append(argv) or argv
+        self.addCleanup(setattr, w, "engine_argv", orig)
+        w.prepare_task(agent(), {"id": "t2", "kind": "assigned", "source": "github:o/r#issues:7"})
+        # The hooks are gone before root fetches from the checkout again.
+        self.assertFalse(os.path.exists(hook))
+        # The checkout-local git (fetches excepted) runs as the engine user.
+        self.assertTrue(all(a[0] == "git" for a in seen))
+        self.assertTrue(any(a[1] == "-C" for a in seen))
+
+    def test_git_in_a_checkout_runs_through_the_engine_drop(self):
+        seen = []
+        orig = w.engine_argv
+        w.engine_argv = lambda argv: seen.append(argv) or argv
+        self.addCleanup(setattr, w, "engine_argv", orig)
+        w.git(WS_DIR, "status", "--porcelain", check=False)  # not even a repo: must not raise
+        self.assertEqual(seen, [["git", "-C", WS_DIR, "status", "--porcelain"]])
+
     def test_review_checks_out_pr_head_and_stashes_leftovers(self):
         self.use({r"/repos/o/r/issues/7": {"title": "Add CI"}, r"/repos/o/r/pulls\?.*": []})
         w.prepare_task(agent(), {"id": "t1", "kind": "assigned", "source": "github:o/r#issues:7"})

@@ -1110,7 +1110,33 @@ MAX_LISTED_DOCS = 150
 
 
 def git(repo_dir, *args, check=True):
-    r = subprocess.run(["git", "-C", repo_dir, *args], capture_output=True, text=True, timeout=SHELL_TIMEOUT)
+    """git in a checkout, always as the engine user: after a task the
+    checkout and its .git belong to it, so the hooks, filters and config in
+    there are things the model can plant, and they must not run as root
+    (the token-needing fetches are the only exception, see root_git)."""
+    r = subprocess.run(engine_argv(["git", "-C", repo_dir, *args]),
+                       capture_output=True, text=True, timeout=SHELL_TIMEOUT,
+                       env=git_env())
+    if check and r.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)}: {(r.stderr or r.stdout).strip()[:500]}")
+    return r.stdout.strip()
+
+
+# The one git the worker runs as root in a checkout: a fetch, which needs
+# the root-only credential store. Hooks, fsmonitor and everything else the
+# engine user could have planted in .git must stay off for it, and the
+# remote is given as the explicit clone URL, never the `origin` name: both
+# remote.origin.url and core.sshCommand would come from config the engine
+# user can write.
+GIT_SAFE = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false")
+
+
+def root_git(repo_dir, *args, check=True):
+    """Fetch git as root, sanitized (see GIT_SAFE): run only on checkouts
+    prepare_task has taken back from the engine user (chown_back_to_root),
+    so nothing can change under it while it runs."""
+    argv = ["git", *GIT_SAFE, "-C", repo_dir, *args]
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=SHELL_TIMEOUT)
     if check and r.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)}: {(r.stderr or r.stdout).strip()[:500]}")
     return r.stdout.strip()
@@ -1157,12 +1183,13 @@ def open_pr_for_branch(agent, repo, branch):
 
 def checkout_branch(repo_dir, branch, default):
     """Check out branch: the local one if any, else the remote one, else a
-    new one from origin/default."""
+    new one from origin/default. Runs as the engine user (see git); the
+    remote-tracking refs come from the fetch prepare_task just did."""
     if git(repo_dir, "branch", "--list", branch):
         git(repo_dir, "checkout", branch)
-        if git(repo_dir, "ls-remote", "--heads", "origin", branch):
+        if git(repo_dir, "rev-parse", "--quiet", "--verify", f"refs/remotes/origin/{branch}", check=False):
             git(repo_dir, "merge", "--ff-only", f"origin/{branch}", check=False)
-    elif git(repo_dir, "ls-remote", "--heads", "origin", branch):
+    elif git(repo_dir, "rev-parse", "--quiet", "--verify", f"refs/remotes/origin/{branch}", check=False):
         git(repo_dir, "checkout", "-b", branch, "--track", f"origin/{branch}")
     else:
         git(repo_dir, "checkout", "-b", branch, f"origin/{default}")
@@ -1176,8 +1203,8 @@ def fast_forward_default(repo_dir, base):
         return
     if git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD", check=False) == base:
         git(repo_dir, "merge", "--ff-only", "-q", f"origin/{base}", check=False)
-    elif subprocess.run(["git", "-C", repo_dir, "merge-base", "--is-ancestor", base, f"origin/{base}"],
-                        capture_output=True, timeout=SHELL_TIMEOUT).returncode == 0:
+    elif subprocess.run(engine_argv(["git", "-C", repo_dir, "merge-base", "--is-ancestor", base, f"origin/{base}"]),
+                        capture_output=True, timeout=SHELL_TIMEOUT, env=git_env()).returncode == 0:
         git(repo_dir, "update-ref", f"refs/heads/{base}", f"origin/{base}", check=False)
 
 
@@ -1319,24 +1346,46 @@ def repo_path(agent, repo):
 def prepare_task(agent, t):
     """Clone/fetch the task's repository, check out what the trigger needs
     and return the playbook + workspace + guidance text that goes before
-    the task input."""
+    the task input. The token-needing fetches run as root, sanitized (see
+    root_git); everything else in the checkout runs as the engine user, so
+    no hook or config the engine planted in .git ever runs as root."""
     trigger = task_trigger(t)
     provider, repo, kind, num = parse_source(t["source"])
     repo_dir = repo_path(agent, repo)
+    url = clone_url(agent, repo)
     if not os.path.isdir(os.path.join(repo_dir, ".git")):
         os.makedirs(os.path.dirname(repo_dir), exist_ok=True)
-        r = subprocess.run(["git", "clone", "-q", clone_url(agent, repo), repo_dir],
+        r = subprocess.run(["git", *GIT_SAFE, "clone", "-q", url, repo_dir],
                            capture_output=True, text=True, timeout=SHELL_TIMEOUT)
         if r.returncode != 0:
             raise RuntimeError(f"git clone {repo}: {r.stderr.strip()[:500]}")
-    git(repo_dir, "fetch", "-q", "--prune", "origin")
-    git(repo_dir, "remote", "set-head", "origin", "--auto", check=False)
-    base = git(repo_dir, "symbolic-ref", "--short", "refs/remotes/origin/HEAD", check=False).removeprefix("origin/") or "main"
+    else:
+        # The engine user owns .git here since the last task worked it: its
+        # hooks and config run with whoever runs git. Take the checkout back
+        # and drop the hooks before root fetches from it.
+        chown_back_to_root(repo_dir)
+        shutil.rmtree(os.path.join(repo_dir, ".git", "hooks"), ignore_errors=True)
+    root_git(repo_dir, "fetch", "-q", "--prune", url, "+refs/heads/*:refs/remotes/origin/*")
+    pr_ref = f"merge-requests/{num}/head" if provider == "gitlab" else f"pull/{num}/head"
+    if trigger in ("review_requests", "assigned_prs") or (trigger == "mentions" and kind != "issues"):
+        root_git(repo_dir, "fetch", "-q", url, pr_ref)  # FETCH_HEAD for this item's head
+    base = "main"
+    m = re.search(r"ref:\s*refs/heads/(\S+)",
+                  root_git(repo_dir, "ls-remote", "--symref", url, "HEAD", check=False))
+    if m:
+        base = m.group(1)
+    # From here on the checkout is the engine user's: git in it (hooks,
+    # filters, config included) runs as the engine user too.
+    chown_to_engine(repo_dir)
+    git(repo_dir, "symbolic-ref", "refs/remotes/origin/HEAD", f"refs/remotes/origin/{base}", check=False)
     if git(repo_dir, "status", "--porcelain"):
         # Leftovers from an earlier task: keep them in a stash, start clean.
-        git(repo_dir, "stash", "push", "-u", "-m", f"doppio: leftovers before task {t['id']}")
+        # The engine user's git has no global config: pass the identity along.
+        login = normalize_login(agent.get("gitLogin")) or "agent"
+        email = (agent.get("emails") or [f"{login}@users.noreply.github.com"])[0]
+        git(repo_dir, "-c", f"user.name={login}", "-c", f"user.email={email}",
+            "stash", "push", "-u", "-m", f"doppio: leftovers before task {t['id']}")
     fast_forward_default(repo_dir, base)
-    pr_ref = f"merge-requests/{num}/head" if provider == "gitlab" else f"pull/{num}/head"
     # A CLI engine has no create_pr tool: its playbook opens the PR with gh/glab.
     cli = (agent.get("engine") or "doppio") != "doppio"
     pr_line = CLI_PR_LINE if cli else ("open one with create_pr (repo {repo}, head `{branch}`, base "
@@ -1346,7 +1395,6 @@ def prepare_task(agent, t):
     if trigger == "review_requests" or (trigger == "mentions" and kind != "issues"):
         item = fetch_item(agent, repo, kind, num)
         vars_["base"] = (item.get("base") or {}).get("ref") or item.get("target_branch") or base
-        git(repo_dir, "fetch", "-q", "origin", pr_ref)
         git(repo_dir, "checkout", "-q", "--detach", "FETCH_HEAD")
     elif trigger == "assigned_issues":
         item = fetch_item(agent, repo, kind, num)
@@ -1365,7 +1413,6 @@ def prepare_task(agent, t):
             head_repo = "a fork"
         vars_["base"] = (item.get("base") or {}).get("ref") or item.get("target_branch") or base
         if head_repo.lower() != repo.lower():
-            git(repo_dir, "fetch", "-q", "origin", pr_ref)
             git(repo_dir, "checkout", "-q", "-B", branch or f"pr-{num}", "FETCH_HEAD")
             vars_["fork"] = (f" It comes from {head_repo}, so you cannot push to it: "
                              "describe the changes needed in your answer instead.")
@@ -1384,8 +1431,6 @@ def prepare_task(agent, t):
              "or the repository: the workspace is kept between tasks."]
     if trigger != "mentions":
         parts.append(repo_guidance(repo_dir))
-    # The engine user (not the root worker) works the checkout: hand it over.
-    chown_to_engine(repo_dir)
     return "\n\n".join(parts)
 
 
@@ -1704,6 +1749,28 @@ def chown_to_engine(path, recursive=True):
                        capture_output=True, timeout=SHELL_TIMEOUT)
     else:
         os.chown(path, ids[0], ids[1])
+
+
+def chown_back_to_root(path):
+    """Take a checkout back from the engine user (see chown_to_engine), so
+    the root git below it (root_git) cannot have its .git rewritten or
+    swapped under it while it runs. No-op unless the worker drops
+    privileges."""
+    if engine_uid_gid() is None:
+        return
+    subprocess.run(["chown", "-R", "-h", "0:0", path],
+                   capture_output=True, timeout=SHELL_TIMEOUT)
+
+
+def git_env():
+    """The environment for engine-user git. With the drop, the worker's own
+    HOME is unreadable to it and git would die on /root/.gitconfig; there is
+    no global config then (identity is passed with -c where a commit is
+    made). Without the drop (tests, a dev checkout) the worker's own
+    environment is kept."""
+    if engine_uid_gid() is None:
+        return None
+    return {"PATH": os.environ.get("PATH", ""), "HOME": "/nonexistent"}
 
 
 def can_push(t):

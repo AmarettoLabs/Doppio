@@ -1604,9 +1604,15 @@ def execute_tool(run, name, args):
         return read_file_part(ws_path(args.get("path", "")), args.get("start_line"), args.get("end_line"))
     if name == "write_file":
         p = ws_path(args.get("path", ""))
-        os.makedirs(os.path.dirname(p), exist_ok=True)
+        d = os.path.dirname(p)
+        os.makedirs(d, exist_ok=True)
         with open(p, "w") as f:
             f.write(args.get("content", ""))
+        # The engine's shell edits these too: hand them over (the workspace
+        # itself is never recursively chowned, see chown_to_engine).
+        if d != WS:
+            chown_to_engine(d)
+        chown_to_engine(p, recursive=False)
         return f"wrote {len(args.get('content', ''))} bytes to {args.get('path')}"
     if name == "create_pr":
         repo = normalize_repo(args.get("repo", ""))
@@ -1629,7 +1635,9 @@ def execute_tool(run, name, args):
 # returns an EngineResult. The git side stays in run_task for every engine:
 # workspace preparation before, posting the answer and the retry policy after.
 
-DEFAULT_TASK_MINUTES = 30# Task outcomes: "done"; "failed" (it ran but didn't succeed: turn limit,
+DEFAULT_TASK_MINUTES = 30
+
+# Task outcomes: "done"; "failed" (it ran but didn't succeed: turn limit,
 # unusable replies); "error" (something around it broke: the model API, the
 # network, the workspace, the time limit) and "limit" (the account's usage
 # limit), both retried at a later git check (see after_git_task).

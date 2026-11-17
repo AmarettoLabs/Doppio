@@ -1269,6 +1269,17 @@ That line sets the status label for you and is not posted. Do not add or remove 
 }
 
 
+# A task typed in the portal ("manual") is a message from the owner, not git
+# work. Without this, the model gets only the agent's standing instructions
+# ("Work on the assigned task...") and a bare "Hello" sends it hunting for
+# work, through credential files and the git host's API.
+CHAT_PLAYBOOK = """\
+This is a message from your owner, sent from the Doppio portal. It is not a git task: no repository is checked out for it and no issue or pull request comes with it.
+Do what the message asks and nothing more. If it is a greeting or a question, just answer it. Do not go looking for assigned issues, pull requests or other work on your own: the worker picks up git work by itself and gives it to you as separate tasks.
+Do not read credentials (files under /agent/state, .git-credentials, tokens in the environment) and never put a secret in your answer.
+Your final answer is shown to your owner in the portal, word for word."""
+
+
 def task_trigger(t):
     """The trigger a git task came from, from its kind and source."""
     kind = t.get("kind")
@@ -2185,6 +2196,8 @@ def run_task(mgr, agent, system, t):
             mgr.emit("error", f"could not prepare the workspace: {type(e).__name__}: {e}", task_id=tid)
             mgr.finish(tid, "failed", error=f"workspace preparation failed: {e}")
             return "error"
+    elif not t.get("source"):
+        prompt = CHAT_PLAYBOOK + "\n\nThe message:\n" + prompt
     mgr.emit("user", prompt, task_id=tid)
     assigned = t.get("kind") == "assigned" and t.get("source")
     if assigned:

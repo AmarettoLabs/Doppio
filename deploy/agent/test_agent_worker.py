@@ -895,8 +895,8 @@ class EngineTest(unittest.TestCase):
                         minutes=run.minutes, turns=run.max_turns)
             return w.EngineResult("done", answer="all good")
         self.assertEqual(self.run_task(fake, maxTurns=-1, taskMinutes=5), "done")
-        self.assertEqual(seen, {"prompt": "do it", "system": "sys", "workdir": WS_DIR,
-                                "minutes": 5, "turns": None})
+        self.assertEqual(seen, {"prompt": w.CHAT_PLAYBOOK + "\n\nThe message:\ndo it", "system": "sys",
+                                "workdir": WS_DIR, "minutes": 5, "turns": None})
         self.assertEqual(self.mgr.finished[-1][1], "done")
 
     def test_outcomes(self):
@@ -929,6 +929,24 @@ class EngineTest(unittest.TestCase):
             w.run_task(self.mgr, agent(engine="fake"), "sys",
                        {"id": "t-" + kind, "kind": kind, "title": "x", "input": "go", "source": src})
         self.assertEqual([c[0] for c in calls], ["review", "comment"])
+
+    def test_portal_messages_get_the_chat_playbook_and_git_tasks_do_not(self):
+        prompts = []
+        orig = w.prepare_task
+        w.prepare_task = lambda a, t: "GIT CONTEXT"
+        self.addCleanup(setattr, w, "prepare_task", orig)
+        for name in ("post_comment", "post_review"):
+            orig_fn = getattr(w, name)
+            setattr(w, name, lambda *a: "COMMENT")
+            self.addCleanup(setattr, w, name, orig_fn)
+        w.ENGINES["fake"] = lambda run: prompts.append(run.prompt) or w.EngineResult("done", answer="hi")
+        w.run_task(self.mgr, agent(engine="fake"), "sys", {"id": "c", "kind": "manual", "title": "Hello", "input": "Hello"})
+        w.run_task(self.mgr, agent(engine="fake"), "sys", {"id": "m", "kind": "mention", "title": "x", "input": "ctx",
+                                                           "source": "github:o/r#issues:3@t"})
+        self.assertTrue(prompts[0].startswith(w.CHAT_PLAYBOOK) and prompts[0].endswith("The message:\nHello"))
+        self.assertIn("Do not go looking for assigned issues", prompts[0])
+        self.assertIn("Do not read credentials", prompts[0])
+        self.assertEqual(prompts[1], "GIT CONTEXT\n\nctx")
 
     def test_unknown_engine_fails(self):
         out = w.run_task(self.mgr, agent(engine="nope"), "sys", {"id": "t1", "title": "x", "input": "hi"})

@@ -65,6 +65,10 @@ ignored and logged in the agent's event stream.
 | Assigned issues | Works on a `<login>/<number>-<slug>` branch, implements and tests the change, pushes and opens a PR with `Closes #<number>`, then comments with the link. If the issue is blocked or unclear, it asks instead. |
 | Assigned PRs | Checks out the PR's branch, addresses the owner's review comments and pushes. |
 
+A task typed in the portal reaches the model as a message from the owner, not
+as git work. The agent answers it and does only what it asks. It doesn't go
+looking for assigned issues or PRs, and it doesn't read credentials.
+
 Before reviews and assigned work, the worker updates the repo and puts its
 guidance in the prompt. Each repo is cloned once into the agent's workspace
 (`repos/<name>`, kept across restarts); a task only fetches, and the local

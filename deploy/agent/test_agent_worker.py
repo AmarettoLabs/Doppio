@@ -842,9 +842,11 @@ class VibeEngineTest(unittest.TestCase):
 
     def test_vibe_home_is_kept_in_the_workspace(self):
         home, state = w.VIBE_HOME, w.VIBE_STATE
-        # A previous container left a cached model list and an old config.
+        # A previous container left a cached model list, an old config and a
+        # key file from a task that was killed.
         os.makedirs(state)
-        for name, text in (("experiment_eval_cache.json", "plan"), ("config.toml", "old")):
+        for name, text in (("experiment_eval_cache.json", "plan"), ("config.toml", "old"),
+                            (".env", "MISTRAL_API_KEY=stale\n")):
             with open(os.path.join(state, name), "w") as f:
                 f.write(text)
         # The new container's image ships ~/.vibe with its config.
@@ -858,8 +860,10 @@ class VibeEngineTest(unittest.TestCase):
         self.assertEqual(read("config.toml"), "image")               # the image's config wins
         self.assertEqual(read("experiment_eval_cache.json"), "plan")  # the cache survives
         self.assertTrue(os.path.isdir(os.path.join(home, "logs")))
+        self.assertFalse(os.path.exists(os.path.join(home, ".env")))  # a stale key never reaches the engine
         w.persist_vibe_home()  # idempotent
         self.assertTrue(os.path.islink(home))
+        self.assertFalse(os.path.exists(os.path.join(state, ".env")))
 
     def test_nothing_is_written_into_the_repository(self):
         repo = os.path.join(self.tmp, "repo")
@@ -880,6 +884,30 @@ class VibeEngineTest(unittest.TestCase):
         self.assertNotIn("VIBE_HOME", env)
         self.assertFalse(os.path.exists(os.path.join(w.VIBE_HOME, ".env")))
 
+    def test_key_file_is_written_for_push_tasks_only_and_goes_with_the_task(self):
+        os.makedirs(w.VIBE_STATE)
+        w.persist_vibe_home()  # ~/.vibe → Vibe's shared home, as in the container
+        key = "vibe-key"
+        # A task that may push: the key file exists, the way `vibe --setup`
+        # saves a login, and the env var carries the same key.
+        a = agent(engine="vibe", accountToken=key, gitToken="gt")
+        t = {"id": "t-p", "kind": "assigned", "title": "x", "input": "i",
+             "source": "github:o/r#issues:7@assigned"}
+        run = w.TaskRun(self.mgr, a, "sys", t, t["input"], WS_DIR)
+        env = w.vibe_env(run)
+        self.assertEqual(env["MISTRAL_API_KEY"], key)
+        self.assertEqual(open(os.path.join(w.VIBE_HOME, ".env")).read(), f"MISTRAL_API_KEY={key}\n")
+        w.cleanup_engine_home(run)
+        self.assertFalse(os.path.exists(os.path.join(w.VIBE_STATE, ".env")))
+        # Reviews and mentions: the env var still logs the engine in, but no
+        # key file anywhere the engine user could keep reading.
+        t = {"id": "t-r", "kind": "review", "title": "x", "input": "i",
+             "source": "github:o/r#pull_requests:8@abc"}
+        run = w.TaskRun(self.mgr, a, "sys", t, t["input"], WS_DIR)
+        env = w.vibe_env(run)
+        self.assertEqual(env["MISTRAL_API_KEY"], key)
+        self.assertFalse(os.path.exists(os.path.join(w.VIBE_HOME, ".env")))
+
     def test_review_task_gets_no_git_credentials(self):
         self.fake([(['{"type":"message","role":"assistant","content":[{"type":"text","text":"ok"}]}'],
                     0, {"outcome": "finished"})])
@@ -890,6 +918,8 @@ class VibeEngineTest(unittest.TestCase):
         self.assertEqual((res.outcome, res.answer), ("done", "ok"))
         self.assertIsNone(call["gh_token"])  # only the engine's own login is passed
         self.assertEqual(call["key"], "k")
+        # No account key file either: the env var alone authenticates it.
+        self.assertFalse(os.path.exists(os.path.join(w.VIBE_HOME, ".env")))
 
 
 class EngineTest(unittest.TestCase):

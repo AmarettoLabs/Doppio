@@ -1826,6 +1826,12 @@ def cleanup_engine_home(run):
     if home:
         shutil.rmtree(home, ignore_errors=True)
         run._home = None
+    # The key file vibe_env writes into Vibe's shared home goes with the
+    # task too: it is handed back through the env var on the next one.
+    try:
+        os.remove(os.path.join(VIBE_STATE, ".env"))
+    except OSError:
+        pass
 
 
 # Credentials never inherited by engine processes: the worker passes what a
@@ -2095,6 +2101,14 @@ def persist_vibe_home():
     """Make ~/.vibe a link to VIBE_STATE. The image's fresh ~/.vibe is merged
     in first: its config.toml (update checks off) replaces the stored one,
     other files only fill gaps."""
+    # A key file a crashed task left behind must not reach the engine: this
+    # runs even when the link is already in place (then only the chown
+    # below would run and hand it over), and the key comes back per task
+    # through the env var anyway (see vibe_env).
+    try:
+        os.remove(os.path.join(VIBE_STATE, ".env"))
+    except OSError:
+        pass
     if os.path.islink(VIBE_HOME) and os.path.realpath(VIBE_HOME) == os.path.realpath(VIBE_STATE):
         return
     os.makedirs(VIBE_STATE, exist_ok=True)
@@ -2131,18 +2145,22 @@ def vibe_env(run):
     env = engine_env(run)
     key = run.agent.get("accountToken") or run.agent.get("apiToken") or ""
     if key:
-        # Vibe reads MISTRAL_API_KEY from the environment first and from
-        # ~/.vibe/.env otherwise; write it there too, the way `vibe --setup`
-        # saves a login, so a key Vibe itself asks for is the same one.
-        os.makedirs(VIBE_HOME, exist_ok=True)
-        env_file = os.path.join(VIBE_HOME, ".env")
-        try:
-            with open(env_file, "w") as f:
-                f.write(f"MISTRAL_API_KEY={key}\n")
-            os.chmod(env_file, 0o600)
-        except OSError as e:
-            run.emit("log", f"could not write {env_file}: {e}")
+        # The engine gets the key through env["MISTRAL_API_KEY"] (Vibe reads
+        # it from the environment first); ~/.vibe/.env is the way
+        # `vibe --setup` saves a login. Written only on tasks that may push
+        # and removed when the task ends (cleanup_engine_home): the file
+        # lives in Vibe's shared home, which the engine user owns, so a
+        # steered review shell must never find a key there.
         env["MISTRAL_API_KEY"] = key
+        if can_push(run.task):
+            os.makedirs(VIBE_HOME, exist_ok=True)
+            env_file = os.path.join(VIBE_HOME, ".env")
+            try:
+                with open(env_file, "w") as f:
+                    f.write(f"MISTRAL_API_KEY={key}\n")
+                os.chmod(env_file, 0o600)
+            except OSError as e:
+                run.emit("log", f"could not write {env_file}: {e}")
     if can_push(run.task) and run.agent.get("gitToken"):
         env["GH_TOKEN"] = run.agent["gitToken"]
         env["GITLAB_TOKEN"] = run.agent["gitToken"]

@@ -174,6 +174,17 @@ Each task has a time limit (30 minutes by default, set per agent). A task
 still running then is stopped and retried at a later git check, like other
 infrastructure failures.
 
+The agent's container is the sandbox, hardened: it runs with no capabilities,
+without the ability to gain any, and under memory, CPU and process limits
+(`AGENT_MEMORY`/`AGENT_CPUS`/`AGENT_PIDS_LIMIT`, see Configuration; a
+capability can be handed back with `AGENT_CAP_ADD`). Inside it, only the
+worker runs privileged; every engine — the Doppio loop's shell tool, the CLIs —
+runs as an unprivileged user that cannot read the agent's own tokens in
+`/agent/state` and gets a per-task HOME with only what the task needs:
+reviews, mentions and portal messages no git token at all, assigned issues
+and PRs the git token to push with. The worker reads the config itself and
+posts the answers.
+
 ## Configuration
 
 Manager environment variables:

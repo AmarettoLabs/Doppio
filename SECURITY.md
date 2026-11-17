@@ -32,13 +32,23 @@ item's description and the repository's files, which other people can write.
 can steer the model through that content**, and the model has a `shell` tool
 inside its container. Assume that such a person can:
 
-- read everything in the agent container, including its config
-  (`/agent/state/config.json`: model API token, git token, internal token)
-  and its workspace;
-- push, comment and open PRs with the agent's git account;
+- read and change everything in the agent's own workspace (checkouts,
+  caches, scratch files);
+- push, comment and open PRs **on tasks it was assigned** (that engine holds
+  the agent's git token, because pushing is the job);
 - spend the agent's model API budget;
 - reach anything on the network the container can reach (the shared
   `doppio_agents` network and, through `host.docker.internal`, the host).
+
+What they can no longer reach: the engine (the Doppio loop's shell tool, the
+CLI engines) runs as an unprivileged user, which cannot read `/agent/state`
+— the agent's config with its model API token, git token and internal token —
+nor the worker's own files. Its HOME is rebuilt per task and removed at the
+end, so no credential outlives a task. Review and mention tasks give the
+engine no git token at all (the worker posts the answer itself, and the
+Doppio loop refuses its write tools there); portal messages too. Agent
+containers also drop every capability, cannot gain new privileges
+(`no-new-privileges`) and run under memory, CPU and process limits.
 
 Mitigations you should apply:
 
@@ -55,9 +65,11 @@ Each container receives only its own internal token (an HMAC of the manager's
 master token and the agent ID). With it, an agent can only post events,
 create/claim tasks and finish tasks for itself; it cannot act for other
 agents, and it cannot reach the portal API when `PORTAL_PASSWORD` is set.
-Agent containers do share one Docker network and are not hardened beyond
-Docker's defaults (they run as root inside the container, with no resource
-limits).
+Agent containers do share one Docker network. They are hardened (no
+capabilities, no-new-privileges, resource limits), and inside them only the
+worker runs privileged; the engines, which execute what the model asks, run
+as an unprivileged user that cannot read the agent's or any account's
+credentials.
 
 ### Data at rest
 

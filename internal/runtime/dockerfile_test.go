@@ -58,6 +58,11 @@ func TestAgentImageShipsTools(t *testing.T) {
 	if !strings.Contains(f, "COPY deploy/agent/agent_worker.py /agent/agent_worker.py") {
 		t.Error("the agent worker is not copied into the image")
 	}
+	// The worker runs engines as an unprivileged user, which cannot read the
+	// agent's secrets in /agent/state: the image must create it.
+	if !regexp.MustCompile(`RUN groupadd -g 1000 agent && useradd -u 1000 -g 1000`).MatchString(f) {
+		t.Error("the unprivileged engine user is not created in deploy/Dockerfile.agent")
+	}
 	// vibe's entry points are thin scripts that import its Python package, so
 	// its venv must come along or `vibe` exits with ModuleNotFoundError; the
 	// system site-packages must not be overwritten with vibe's dependencies.

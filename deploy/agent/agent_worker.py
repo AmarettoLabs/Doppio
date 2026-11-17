@@ -1653,11 +1653,12 @@ def execute_tool(run, name, args):
         os.makedirs(d, exist_ok=True)
         with open(p, "w") as f:
             f.write(args.get("content", ""))
-        # The engine's shell edits these too: hand them over (the workspace
-        # itself is never recursively chowned, see chown_to_engine).
+        # The engine's shell edits these too: hand the file over wherever it
+        # landed, and its new directory too - unless that is the workspace
+        # itself, which is never recursively chowned (see chown_to_engine).
+        chown_to_engine(p, recursive=False)
         if d != WS:
             chown_to_engine(d)
-        chown_to_engine(p, recursive=False)
         return f"wrote {len(args.get('content', ''))} bytes to {args.get('path')}"
     if name == "create_pr":
         repo = normalize_repo(args.get("repo", ""))

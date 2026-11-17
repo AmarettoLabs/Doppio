@@ -1106,10 +1106,17 @@ class ToolsTest(unittest.TestCase):
 
     def test_write_file_still_works_on_assigned_tasks(self):
         run = w.TaskRun(MgrStub(), agent(), "sys", {"id": "t-w"}, "p", WS_DIR)
-        out = w.execute_tool(run, "write_file", {"path": "tools-written.txt", "content": "ok"})
-        self.assertIn("wrote 2 bytes", out)
-        with open(os.path.join(WS_DIR, "tools-written.txt")) as f:
-            self.assertEqual(f.read(), "ok")
+        for path in ("tools-written.txt", os.path.join("nested", "tools-written.txt")):
+            out = w.execute_tool(run, "write_file", {"path": path, "content": "ok"})
+            self.assertIn("wrote 2 bytes", out)
+            p = os.path.join(WS_DIR, path)
+            with open(p) as f:
+                self.assertEqual(f.read(), "ok")
+            # At the workspace root too: the file must be the engine user's,
+            # or its own shell cannot edit it.
+            ids = w.engine_uid_gid()
+            if ids:
+                self.assertEqual(os.stat(p).st_uid, ids[0], path)
 
 
 class EngineUserTest(unittest.TestCase):

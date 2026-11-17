@@ -50,6 +50,14 @@ services:
       # self-signed local inference server). Must be readable inside this
       # container, so put it under DATA_DIR, e.g. ${DATA_DIR}/ca/local-ca.pem.
       AGENT_CA_BUNDLE: ${AGENT_CA_BUNDLE:-}
+      # Hardening of agent containers: all capabilities dropped, no way to
+      # gain new ones, and resource limits (docker's --memory/--cpus/
+      # --pids-limit syntax). Empty disables a limit; AGENT_CAP_ADD hands a
+      # capability back, comma-separated, only after proving it necessary.
+      AGENT_CAP_ADD: ${AGENT_CAP_ADD:-}
+      AGENT_MEMORY: ${AGENT_MEMORY:-}
+      AGENT_CPUS: ${AGENT_CPUS:-}
+      AGENT_PIDS_LIMIT: ${AGENT_PIDS_LIMIT:-}
     networks:
       - agents
     restart: unless-stopped

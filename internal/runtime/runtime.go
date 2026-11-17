@@ -38,6 +38,16 @@ type Runtime struct {
 	// CA certificates agents should trust on top of the system ones, e.g. the
 	// CA of a self-signed local inference server.
 	CABundle string
+	// CapAdd are capabilities handed back to agent containers on top of the
+	// ALL they drop. Empty by default: add one only when proven necessary.
+	CapAdd []string
+	// Memory, CPUs and PIDsLimit are the docker run resource limits for
+	// agent containers (docker's --memory/--cpus/--pids-limit syntax). A
+	// steered model runs builds and tests, so these contain it without
+	// starving the host. Empty disables a limit.
+	Memory    string
+	CPUs      string
+	PIDsLimit string
 }
 
 // extraCAFile is the extra CA bundle's name in the per-agent state dir,
@@ -71,7 +81,8 @@ func validHostname(h string) bool {
 }
 
 // NewFromEnv builds a Runtime from the environment: DOCKER_BIN, AGENT_IMAGE,
-// AGENT_NETWORK, MANAGER_URL, AGENT_EXTRA_HOSTS, AGENT_CA_BUNDLE plus
+// AGENT_NETWORK, MANAGER_URL, AGENT_EXTRA_HOSTS, AGENT_CA_BUNDLE,
+// AGENT_CAP_ADD, AGENT_MEMORY, AGENT_CPUS, AGENT_PIDS_LIMIT plus
 // dataDir/token.
 func NewFromEnv(dataDir, managerToken string) *Runtime {
 	get := func(k, def string) string {
@@ -93,6 +104,10 @@ func NewFromEnv(dataDir, managerToken string) *Runtime {
 	return &Runtime{
 		ExtraHosts:   hosts,
 		CABundle:     os.Getenv("AGENT_CA_BUNDLE"),
+		CapAdd:       parseCapAdd(os.Getenv("AGENT_CAP_ADD")),
+		Memory:       get("AGENT_MEMORY", "4g"),
+		CPUs:         get("AGENT_CPUS", "2"),
+		PIDsLimit:    get("AGENT_PIDS_LIMIT", "512"),
 		DockerBin:    get("DOCKER_BIN", "docker"),
 		Image:        get("AGENT_IMAGE", "doppio-agent:latest"),
 		Network:      get("AGENT_NETWORK", "doppio_agents"),
@@ -100,6 +115,38 @@ func NewFromEnv(dataDir, managerToken string) *Runtime {
 		ManagerURL:   get("MANAGER_URL", "http://manager:8080"),
 		ManagerToken: managerToken,
 	}
+}
+
+// parseCapAdd splits a comma- or whitespace-separated list of capabilities
+// (e.g. "SYS_PTRACE, NET_RAW") into clean names.
+func parseCapAdd(s string) []string {
+	var out []string
+	for _, e := range strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' || r == '\n' }) {
+		if e = strings.TrimSpace(e); e != "" {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// hardeningArgs are the docker run options every agent container gets: no
+// capabilities, no way to gain any (setuid/sudo included), and resource
+// limits, each configurable per install (see NewFromEnv).
+func (r *Runtime) hardeningArgs() []string {
+	args := []string{"--cap-drop", "ALL", "--security-opt", "no-new-privileges"}
+	for _, c := range r.CapAdd {
+		args = append(args, "--cap-add", c)
+	}
+	for _, opt := range []struct{ flag, value string }{
+		{"--memory", r.Memory},
+		{"--cpus", r.CPUs},
+		{"--pids-limit", r.PIDsLimit},
+	} {
+		if opt.value != "" {
+			args = append(args, opt.flag, opt.value)
+		}
+	}
+	return args
 }
 
 func (r *Runtime) run(args ...string) (string, error) {
@@ -248,6 +295,7 @@ func (r *Runtime) StartWithAccounts(a *model.Agent, accountSecrets map[string]st
 		"-e", "AGENT_CONFIG=/agent/state/config.json",
 		"-e", "AGENT_WORKSPACE=/agent/workspace",
 	}
+	args = append(args, r.hardeningArgs()...)
 	for _, h := range r.ExtraHosts {
 		args = append(args, "--add-host", h)
 	}

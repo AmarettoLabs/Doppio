@@ -191,6 +191,10 @@ Manager environment variables:
 | `DOCKER_BIN` | `docker` | Docker CLI binary |
 | `AGENT_EXTRA_HOSTS` | _(empty)_ | Comma-separated `name:ip` entries added to every agent's `/etc/hosts` |
 | `AGENT_CA_BUNDLE` | _(empty)_ | PEM file of extra CA certificates agents trust, on top of the system ones |
+| `AGENT_MEMORY` | `4g` | Memory limit per agent container (docker `--memory` syntax; empty = no limit) |
+| `AGENT_CPUS` | `2` | CPU limit per agent container (docker `--cpus` syntax; empty = no limit) |
+| `AGENT_PIDS_LIMIT` | `512` | Process limit per agent container (docker `--pids-limit`; empty = no limit) |
+| `AGENT_CAP_ADD` | _(empty)_ | Capabilities given back to agent containers, which drop all others |
 
 ### Local / self-hosted model servers
 

@@ -20,6 +20,9 @@ os.environ["AGENT_WORKSPACE"] = WS_DIR
 sys.path.insert(0, os.path.dirname(__file__))
 import agent_worker as w  # noqa: E402
 
+# Engine HOMEs stay in the throwaway workspace, like everything else.
+w.ENGINE_HOME_ROOT = os.path.join(WS_DIR, "engine-home")
+
 API = "https://api.github.com"
 REPO = "o/r"
 
@@ -595,7 +598,8 @@ def vibe_run(mgr, tmp, agent_cfg=None, task=None, system="sys persona"):
     if os.environ.get("FAKE_VIBE_CALLS") and os.path.exists(os.environ["FAKE_VIBE_CALLS"]):
         os.unlink(os.environ["FAKE_VIBE_CALLS"])
     a = agent(engine="vibe", **(agent_cfg or {}))
-    t = task or {"id": "t9", "title": "x", "input": "do it"}
+    t = task or {"id": "t9", "kind": "assigned", "title": "x", "input": "do it",
+                 "source": "github:o/r#issues:7@assigned"}
     run = w.TaskRun(mgr, a, system, t, t["input"], WS_DIR, minutes=5)
     res = w.vibe_engine(run)
     calls = []
@@ -876,6 +880,17 @@ class VibeEngineTest(unittest.TestCase):
         self.assertNotIn("VIBE_HOME", env)
         self.assertFalse(os.path.exists(os.path.join(w.VIBE_HOME, ".env")))
 
+    def test_review_task_gets_no_git_credentials(self):
+        self.fake([(['{"type":"message","role":"assistant","content":[{"type":"text","text":"ok"}]}'],
+                    0, {"outcome": "finished"})])
+        task = {"id": "t-rev", "kind": "review", "title": "x", "input": "do it",
+                "source": "github:o/r#pull_requests:8@abc"}
+        res, _, call = vibe_run(self.mgr, self.tmp,
+                                agent_cfg={"gitToken": "gt", "accountToken": "k"}, task=task)
+        self.assertEqual((res.outcome, res.answer), ("done", "ok"))
+        self.assertIsNone(call["gh_token"])  # only the engine's own login is passed
+        self.assertEqual(call["key"], "k")
+
 
 class EngineTest(unittest.TestCase):
     def setUp(self):
@@ -1014,14 +1029,20 @@ class ToolsTest(unittest.TestCase):
         with open(self.path, "w") as f:
             f.write("".join(f"line {i:04d} " + "x" * 40 + "\n" for i in range(1, 501)))
 
+    def run_obj(self, kind="assigned"):
+        t = {"id": "t-" + (kind or "plain"), "kind": kind, "title": "x", "input": "i",
+             "source": "github:o/r#issues:7@assigned"}
+        return w.TaskRun(MgrStub(), agent(), "sys", t, "p", WS_DIR)
+
     def test_read_file_in_parts(self):
-        out = w.execute_tool(agent(), "read_file", {"path": "long.txt"})
+        run = self.run_obj()
+        out = w.execute_tool(run, "read_file", {"path": "long.txt"})
         self.assertIn("line 0001", out)
         self.assertRegex(out, r"\[lines 1-(\d+) of 500\. Read more with start_line=\d+\.\]$")
         nxt = int(re.search(r"start_line=(\d+)", out).group(1))
-        out2 = w.execute_tool(agent(), "read_file", {"path": "long.txt", "start_line": nxt})
+        out2 = w.execute_tool(run, "read_file", {"path": "long.txt", "start_line": nxt})
         self.assertTrue(out2.startswith(f"line {nxt:04d}"))
-        tail = w.execute_tool(agent(), "read_file", {"path": "long.txt", "start_line": 495, "end_line": 600})
+        tail = w.execute_tool(run, "read_file", {"path": "long.txt", "start_line": 495, "end_line": 600})
         self.assertIn("line 0500", tail)
         self.assertTrue(tail.endswith("[lines 495-500 of 500.]"))
 
@@ -1029,10 +1050,105 @@ class ToolsTest(unittest.TestCase):
         p = os.path.join(WS_DIR, "short.txt")
         with open(p, "w") as f:
             f.write("a\nb\n")
-        self.assertEqual(w.execute_tool(agent(), "read_file", {"path": "short.txt"}), "a\nb\n")
+        self.assertEqual(w.execute_tool(self.run_obj(), "read_file", {"path": "short.txt"}), "a\nb\n")
 
     def test_bash_is_an_alias_of_shell(self):
-        self.assertIn("hi", w.execute_tool(agent(), "bash", {"command": "echo hi"}))
+        self.assertIn("hi", w.execute_tool(self.run_obj(), "bash", {"command": "echo hi"}))
+
+    def test_shell_runs_through_the_user_drop(self):
+        seen = []
+        orig = w.engine_argv
+        w.engine_argv = lambda argv: seen.append(argv) or argv
+        self.addCleanup(setattr, w, "engine_argv", orig)
+        w.execute_tool(self.run_obj(), "shell", {"command": "echo hi"})
+        self.assertIn(["sh", "-c", "echo hi"], seen)
+
+    def test_write_tools_are_refused_on_reviews_and_mentions(self):
+        for kind in ("review", "mention"):
+            for tool in ("write_file", "create_pr"):
+                out = w.execute_tool(self.run_obj(kind), tool,
+                                     {"path": "a.txt", "content": "x"}) if tool == "write_file" else \
+                                     w.execute_tool(self.run_obj(kind), tool,
+                                                    {"repo": "o/r", "head": "b", "base": "main",
+                                                     "title": "t", "body": "b"})
+                self.assertIn(tool, out)
+                self.assertIn("not available for this task", out)
+
+    def test_write_file_still_works_on_assigned_tasks(self):
+        run = w.TaskRun(MgrStub(), agent(), "sys", {"id": "t-w"}, "p", WS_DIR)
+        out = w.execute_tool(run, "write_file", {"path": "tools-written.txt", "content": "ok"})
+        self.assertIn("wrote 2 bytes", out)
+        with open(os.path.join(WS_DIR, "tools-written.txt")) as f:
+            self.assertEqual(f.read(), "ok")
+
+
+class EngineUserTest(unittest.TestCase):
+    """The worker hands the engine per-task secrets: nothing on reviews and
+    mentions, the git token on assigned issues and PRs."""
+
+    def task_run(self, kind, **cfg):
+        t = {"id": "t-" + (kind or "plain").lower(), "kind": kind, "title": "x", "input": "i",
+             "source": "github:o/r#issues:7@assigned"}
+        return w.TaskRun(MgrStub(), agent(**cfg), "sys", t, "p", WS_DIR)
+
+    def test_engine_argv_drops_to_the_unprivileged_user(self):
+        orig = w.engine_uid_gid
+        w.engine_uid_gid = lambda: (1000, 1000)
+        self.addCleanup(setattr, w, "engine_uid_gid", orig)
+        self.assertEqual(w.engine_argv(["sh", "-c", "ls"]),
+                         ["setpriv", "--reuid=1000", "--regid=1000", "--init-groups",
+                          "--", "sh", "-c", "ls"])
+
+    def test_engine_argv_is_plain_without_a_drop(self):
+        orig = w.engine_uid_gid
+        w.engine_uid_gid = lambda: None
+        self.addCleanup(setattr, w, "engine_uid_gid", orig)
+        self.assertEqual(w.engine_argv(["sh", "-c", "ls"]), ["sh", "-c", "ls"])
+
+    def test_review_and_mention_tasks_are_readonly(self):
+        for kind in ("review", "mention"):
+            self.assertTrue(self.task_run(kind).readonly)
+        for kind in ("assigned", "manual", None):
+            self.assertFalse(self.task_run(kind).readonly)
+
+    def test_engine_env_has_the_git_token_only_on_assigned_tasks(self):
+        for kind, want in (("assigned", "t"), ("review", None), ("mention", None)):
+            env = w.engine_env(self.task_run(kind))
+            self.assertEqual(env.get("GIT_TOKEN"), want, kind)
+
+    def test_engine_env_leaves_the_agent_secrets_paths_out(self):
+        with unittest.mock.patch.dict(os.environ, {"AGENT_CONFIG": "/agent/state/config.json",
+                                                   "AGENT_ACCOUNT": "/agent/state/account.json"}):
+            env = w.engine_env(self.task_run("assigned"))
+        self.assertNotIn("AGENT_CONFIG", env)
+        self.assertNotIn("AGENT_ACCOUNT", env)
+        self.assertTrue(env["HOME"].startswith(w.ENGINE_HOME_ROOT))
+
+    def test_engine_home_holds_credentials_only_when_the_task_may_push(self):
+        home = self.task_run("assigned").engine_home()
+        gitconfig = open(os.path.join(home, ".gitconfig")).read()
+        self.assertIn("helper = store", gitconfig)
+        with open(os.path.join(home, ".git-credentials")) as f:
+            self.assertIn("x-access-token:t@github.com", f.read())
+        self.assertEqual(os.stat(os.path.join(home, ".git-credentials")).st_mode & 0o777, 0o600)
+        # Reviews and mentions: no credentials anywhere in the home.
+        home = self.task_run("review").engine_home()
+        self.assertFalse(os.path.exists(os.path.join(home, ".git-credentials")))
+        self.assertNotIn("helper = store", open(os.path.join(home, ".gitconfig")).read())
+
+    def test_cleanup_removes_the_home_and_its_credentials(self):
+        run = self.task_run("assigned")
+        home = run.engine_home()
+        self.assertTrue(os.path.exists(os.path.join(home, ".git-credentials")))
+        w.cleanup_engine_home(run)
+        self.assertFalse(os.path.exists(home))
+        w.cleanup_engine_home(run)  # twice: no error
+
+    def test_can_push_needs_a_source(self):
+        self.assertFalse(w.can_push({"kind": "assigned"}))
+        self.assertTrue(w.can_push({"kind": "assigned", "source": "github:o/r#issues:7@x"}))
+        self.assertFalse(w.can_push({"kind": "assigned", "source": ""}))
+
 
 
 class SourceTest(unittest.TestCase):

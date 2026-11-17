@@ -848,6 +848,92 @@ def post_review(agent, source, answer):
     raise ValueError(f"unknown provider in {source!r}")
 
 
+# ---------- status labels ----------
+# Some repos track an assigned item's progress with labels: the owner adds
+# `ready` when assigning it, the worker puts `in-progress` on it when a task
+# starts and the agent's final status (`needs-review`, `question`, `on-hold`,
+# `blocked`) when it ends, removing the item's other status labels. A repo
+# names them plainly (`ready`) or with a `status:` prefix (`status:ready`):
+# the worker writes whichever names the repo has, preferring plain ones. A
+# repo without a ready label does not track status this way and is left alone.
+STATUSES = ("ready", "in-progress", "needs-review", "question", "on-hold", "blocked")
+STATUS_PREFIX = "status:"
+STATUS_RE = re.compile(r"^[\s*_`>-]*status\s*:\s*[*_`]*\s*(needs[ -]review|question|on[ -]hold|blocked)\b[^\n]*$",
+                       re.IGNORECASE | re.MULTILINE)
+PR_LINK_RE = re.compile(r"/(pull|merge_requests)/\d+")
+
+
+def label_status(name):
+    """The status a label stands for ("ready" for `ready` or `status:ready`), or None."""
+    n = (name or "").strip().lower()
+    if n.startswith(STATUS_PREFIX):
+        n = n[len(STATUS_PREFIX):].strip()
+    return n if n in STATUSES else None
+
+
+def split_status(answer):
+    """(answer without its status line, status). The last `STATUS:` line wins.
+    Without one: "needs-review" when the answer links a pull request, else
+    "question" (the answer is waiting on the owner)."""
+    found = list(STATUS_RE.finditer(answer))
+    if found:
+        m = found[-1]
+        status = m.group(1).lower().replace(" ", "-")
+        return (answer[:m.start()] + answer[m.end():]).strip(), status
+    return answer.strip(), "needs-review" if PR_LINK_RE.search(answer) else "question"
+
+
+def repo_status_labels(agent, repo):
+    """{status: label name} of the repo's status labels; {} when the repo has
+    no ready label."""
+    if agent.get("gitProvider") == "github":
+        names = [lb.get("name") or "" for lb in gh_list(agent, f"{gh_base(agent)}/repos/{repo}/labels")]
+    else:
+        proj = urllib.parse.quote(repo, safe="")
+        names = [lb.get("name") or "" for lb in gl_list(agent, f"/api/v4/projects/{proj}/labels")]
+    found = {}
+    for n in names:
+        s = label_status(n)
+        if s and (s not in found or not n.lower().startswith(STATUS_PREFIX)):
+            found[s] = n
+    return found if "ready" in found else {}
+
+
+def set_status(agent, source, status):
+    """Put the repo's label for status on the source item and take its other
+    status labels (of either naming) off. Returns the label, or "" when the
+    repo has none for status (nothing is changed then)."""
+    provider, repo, kind, num = parse_source(source)
+    want = repo_status_labels(agent, repo).get(status)
+    if not want:
+        return ""
+    labels = fetch_item(agent, repo, kind, num).get("labels") or []
+    current = [lb if isinstance(lb, str) else lb.get("name") or "" for lb in labels]
+    drop = [n for n in current if label_status(n) and n.lower() != want.lower()]
+    has = any(n.lower() == want.lower() for n in current)
+    if provider == "github":
+        base = f"{gh_base(agent)}/repos/{repo}/issues/{num}/labels"
+        if not has:
+            gh_req(agent, "POST", base, {"labels": [want]})
+        for n in drop:
+            gh_req(agent, "DELETE", f"{base}/{urllib.parse.quote(n, safe='')}")
+    else:
+        proj = urllib.parse.quote(repo, safe="")
+        gl_req(agent, "PUT", f"/api/v4/projects/{proj}/{kind}/{num}",
+               {"add_labels": want, "remove_labels": ",".join(drop)})
+    return want
+
+
+def report_status(mgr, agent, t, status):
+    """set_status for a task's item; failures are logged, never fatal."""
+    try:
+        label = set_status(agent, t["source"], status)
+        if label:
+            mgr.emit("action", f"labeled {t['source']} {label}", task_id=t["id"])
+    except Exception as e:
+        mgr.emit("error", f"could not set the {status} label on {t['source']}: {e}", task_id=t["id"])
+
+
 def item_noun(it):
     if it.get("_kind") == "merge_requests":
         return "merge request"
@@ -1160,14 +1246,26 @@ Your job: implement this issue. The branch `{branch}` is checked out in {repo_di
 3. Otherwise make the change on `{branch}`, add or update tests, and run the checks the guidance asks for (tests, linters, formatters). Fix failures before going on.
 4. Commit with clear messages and push: `git -C {repo_dir} push -u origin {branch}`. Never push to `{base}`, never force-push, never merge.
 5. If there is no pull request for `{branch}` yet, {pr_line}.
-Your final answer is posted for you as a comment on the issue, word for word (do not post it yourself): a short summary of what you did and the pull request link, or your questions.""",
+Your final answer is posted for you as a comment on the issue, word for word (do not post it yourself): a short summary of what you did and the pull request link, or your questions.
+End your final answer with one last line giving the status, exactly one of:
+STATUS: needs-review (the pull request is ready for the owner's review)
+STATUS: question (you need an answer from the owner)
+STATUS: on-hold (you are waiting on an owner decision asked elsewhere)
+STATUS: blocked (you could not finish: say why)
+That line sets the status label for you and is not posted. Do not add or remove status labels (ready, in-progress, needs-review, question, on-hold, blocked) yourself.""",
     "assigned_prs": """\
 Your job: follow up on this pull request. Its branch `{branch}` is checked out in {repo_dir}.{fork}
 1. Read the repository guidance below and the files relevant to the change.
 2. Address the owner's review comments and feedback in the discussion. If there is none, check that the pull request is complete (tests, the checks the guidance asks for, a description that matches the change) and fix what is missing.
 3. If feedback is unclear or needs a decision, ask instead of guessing.
 4. Commit with clear messages and push to `{branch}`. Never force-push, never merge.
-Your final answer is posted for you as a comment on the pull request, word for word (do not post it yourself): a short summary of what changed, or your questions.""",
+Your final answer is posted for you as a comment on the pull request, word for word (do not post it yourself): a short summary of what changed, or your questions.
+End your final answer with one last line giving the status, exactly one of:
+STATUS: needs-review (the pull request is ready for the owner's review)
+STATUS: question (you need an answer from the owner)
+STATUS: on-hold (you are waiting on an owner decision asked elsewhere)
+STATUS: blocked (you could not finish: say why)
+That line sets the status label for you and is not posted. Do not add or remove status labels (ready, in-progress, needs-review, question, on-hold, blocked) yourself.""",
 }
 
 
@@ -2088,6 +2186,9 @@ def run_task(mgr, agent, system, t):
             mgr.finish(tid, "failed", error=f"workspace preparation failed: {e}")
             return "error"
     mgr.emit("user", prompt, task_id=tid)
+    assigned = t.get("kind") == "assigned" and t.get("source")
+    if assigned:
+        report_status(mgr, agent, t, "in-progress")
     run = TaskRun(mgr, agent, system, t, prompt, task_workdir(t, agent))
     # A CLI engine logs in with the shared account, not with the agent's own
     # API token: without one it cannot authenticate at all. Engines that are
@@ -2109,7 +2210,10 @@ def run_task(mgr, agent, system, t):
     if res.outcome != "done":
         mgr.emit("error", res.error or f"task {res.outcome}", task_id=tid)
         mgr.finish(tid, "failed", error=res.error or res.outcome)
+        if assigned and res.outcome not in RETRIED_OUTCOMES:
+            report_status(mgr, agent, t, "blocked")
         return res.outcome
+    answer, status = split_status(res.answer) if assigned else (res.answer, "")
     if t.get("source"):
         if res.answer.strip():
             try:
@@ -2117,12 +2221,14 @@ def run_task(mgr, agent, system, t):
                     event = post_review(agent, t["source"], res.answer)
                     mgr.emit("action", f"posted review ({event.lower().replace('_', ' ')}) on {t['source']}", task_id=tid)
                 else:
-                    post_comment(agent, t["source"], res.answer)
+                    post_comment(agent, t["source"], answer)
                     mgr.emit("action", f"posted reply on {t['source']}", task_id=tid)
             except Exception as e:
                 mgr.emit("error", f"could not post reply on {t['source']}: {e}", task_id=tid)
         else:
             mgr.emit("error", f"empty answer; nothing posted on {t['source']}", task_id=tid)
+    if assigned:
+        report_status(mgr, agent, t, status)
     mgr.finish(tid, "done", output=res.answer)
     return "done"
 
@@ -2130,7 +2236,7 @@ def run_task(mgr, agent, system, t):
 MAX_TASK_ATTEMPTS = 3
 
 
-def after_git_task(mgr, state, state_path, t, outcome):
+def after_git_task(mgr, state, state_path, t, outcome, agent=None):
     """Retry policy for tasks created from git activity. A task that broke
     because of the model API, the network, the workspace or a usage limit
     ("error", "limit") is
@@ -2154,6 +2260,8 @@ def after_git_task(mgr, state, state_path, t, outcome):
     else:
         mgr.emit("error", f"giving up on {src} after {n} attempts; restart the agent to try again",
                  task_id=t["id"])
+        if agent and t.get("kind") == "assigned":
+            report_status(mgr, agent, t, "blocked")
     save_state(state_path, state)
 
 
@@ -2198,7 +2306,7 @@ def main():
         try:
             t = mgr.next_task()
             if t:
-                after_git_task(mgr, state, state_path, t, run_task(mgr, agent, system, t))
+                after_git_task(mgr, state, state_path, t, run_task(mgr, agent, system, t), agent)
             if time.time() - last_git >= poll_every:
                 last_git = time.time()
                 poll_git(mgr, agent, state, state_path)

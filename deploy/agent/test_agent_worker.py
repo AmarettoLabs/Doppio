@@ -1086,6 +1086,99 @@ class ReviewVerdictTest(Patched):
         self.assertIn("`REVIEW:`", w.PLAYBOOKS["review_requests"])
 
 
+class StatusLabelTest(Patched):
+    SRC = "github:o/r#issues:84@2026-11-17T03:26:49Z"
+    PALAZZO = ["bug", "question", "ready", "in-progress", "needs-review", "blocked", "on-hold"]
+    LAGUNA = ["status:ready", "status:triage", "status:in-progress", "status:blocked"]
+
+    def repo(self, labels, on_item):
+        return self.use({
+            r"/repos/o/r/labels\?.*": lambda p: [{"name": n} for n in labels] if p.endswith("page=1") else [],
+            r"/repos/o/r/issues/84": {"labels": [{"name": n} for n in on_item]},
+            r"/repos/o/r/issues/84/labels(/.*)?": [],
+        })
+
+    def changes(self, gh):
+        return [(m, u.replace(API + "/repos/o/r/issues/84/labels", ""), b) for m, u, b in gh.calls
+                if m in ("POST", "DELETE")]
+
+    def test_label_status_reads_both_namings(self):
+        self.assertEqual([w.label_status(n) for n in ("ready", "status:ready", "Status: In-Progress", "status:triage", "bug")],
+                         ["ready", "ready", "in-progress", None, None])
+
+    def test_plain_labels_are_written_and_other_status_labels_removed(self):
+        gh = self.repo(self.PALAZZO, ["milestone", "ready", "status:ready"])
+        self.assertEqual(w.set_status(agent(), self.SRC, "in-progress"), "in-progress")
+        self.assertEqual(self.changes(gh), [("POST", "", {"labels": ["in-progress"]}),
+                                            ("DELETE", "/ready", None), ("DELETE", "/status%3Aready", None)])
+
+    def test_prefixed_labels_are_written_when_that_is_what_the_repo_has(self):
+        gh = self.repo(self.LAGUNA, ["status:in-progress"])
+        self.assertEqual(w.set_status(agent(), self.SRC, "blocked"), "status:blocked")
+        self.assertEqual(self.changes(gh), [("POST", "", {"labels": ["status:blocked"]}),
+                                            ("DELETE", "/status%3Ain-progress", None)])
+
+    def test_plain_names_win_when_a_repo_has_both(self):
+        self.repo(["status:ready", "ready", "blocked", "status:blocked"], [])
+        self.assertEqual(w.repo_status_labels(agent(), "o/r"), {"ready": "ready", "blocked": "blocked"})
+
+    def test_repos_without_status_labels_are_left_alone(self):
+        # GitHub's default labels include "question": without a ready label it is not a status label.
+        gh = self.repo(["bug", "question", "enhancement"], [])
+        self.assertEqual(w.set_status(agent(), self.SRC, "question"), "")
+        # A status the repo has no label for changes nothing either.
+        gh2 = self.repo(self.LAGUNA, ["status:in-progress"])
+        self.assertEqual(w.set_status(agent(), self.SRC, "needs-review"), "")
+        self.assertEqual(self.changes(gh) + self.changes(gh2), [])
+
+    def test_split_status(self):
+        self.assertEqual(w.split_status("Done: https://github.com/o/r/pull/9\n\nSTATUS: needs-review"),
+                         ("Done: https://github.com/o/r/pull/9", "needs-review"))
+        self.assertEqual(w.split_status("Which one?\n**Status:** on hold"), ("Which one?", "on-hold"))
+        self.assertEqual(w.split_status("STATUS: question at first\nNo, stuck.\nSTATUS: blocked")[1], "blocked")
+        # No status line: a pull request link means it is ready for review, otherwise it waits on the owner.
+        self.assertEqual(w.split_status("Opened https://github.com/o/r/pull/9"),
+                         ("Opened https://github.com/o/r/pull/9", "needs-review"))
+        self.assertEqual(w.split_status("Should this go in contract/?"), ("Should this go in contract/?", "question"))
+
+    def test_assigned_task_labels_in_progress_then_its_status(self):
+        calls = []
+        for name, fn in (("set_status", lambda a, src, st: calls.append(st) or st),
+                         ("post_comment", lambda a, src, ans: calls.append(("comment", ans))),
+                         ("prepare_task", lambda a, t: "context")):
+            orig = getattr(w, name)
+            setattr(w, name, fn)
+            self.addCleanup(setattr, w, name, orig)
+        orig = dict(w.ENGINES)
+        self.addCleanup(lambda: (w.ENGINES.clear(), w.ENGINES.update(orig)))
+        mgr = RunTaskMgr()
+        task = {"id": "t", "kind": "assigned", "title": "x", "input": "go", "source": self.SRC}
+        w.ENGINES["fake"] = lambda run: w.EngineResult("done", answer="Which file?\nSTATUS: question")
+        self.assertEqual(w.run_task(mgr, agent(engine="fake"), "sys", task), "done")
+        self.assertEqual(calls, ["in-progress", ("comment", "Which file?"), "question"])
+        # A task that ran and failed is blocked; one that will be retried stays in progress.
+        for outcome, want in (("failed", ["in-progress", "blocked"]), ("error", ["in-progress"])):
+            calls.clear()
+            w.ENGINES["fake"] = lambda run, o=outcome: w.EngineResult(o, error="nope")
+            w.run_task(mgr, agent(engine="fake"), "sys", task)
+            self.assertEqual(calls, want)
+        # Giving up after the last retry blocks it too.
+        calls.clear()
+        state = {"retries": {self.SRC: w.MAX_TASK_ATTEMPTS - 1}}
+        w.after_git_task(MgrStub(), state, os.path.join(WS_DIR, "label-state.json"), task, "error", agent())
+        self.assertEqual(calls, ["blocked"])
+        # Reviews and mentions don't touch labels.
+        calls.clear()
+        w.ENGINES["fake"] = lambda run: w.EngineResult("done", answer="Sure.")
+        w.run_task(mgr, agent(engine="fake"), "sys", dict(task, kind="mention"))
+        self.assertEqual(calls, [("comment", "Sure.")])
+
+    def test_assigned_playbooks_ask_for_a_status(self):
+        for trigger in ("assigned_issues", "assigned_prs"):
+            self.assertIn("STATUS: needs-review", w.PLAYBOOKS[trigger])
+            self.assertIn("STATUS: blocked", w.PLAYBOOKS[trigger])
+
+
 class RetryTest(unittest.TestCase):
     def setUp(self):
         orig = w.llm_call

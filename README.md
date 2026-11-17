@@ -74,7 +74,19 @@ every `AGENTS.md`, `CLAUDE.md` and `CONTRIBUTING.md` plus the root
 needed. New owner feedback (a comment or a
 review) on assigned work starts a new pass, so an agent that asked a question
 picks the work up again once you answer. Each new mention is new work too,
-even on an item the agent already answered.
+even on an item the agent already answered. Assigning the item is what starts
+the work; labels don't.
+
+Repos that track progress with status labels get them kept up to date on
+assigned work. When a task starts, the worker labels the item `in-progress`.
+When it ends, the worker applies the status from the agent's last
+`STATUS:` line: `needs-review`, `question`, `on-hold` or `blocked`. It then
+removes the item's other status labels, including `ready`. A task that fails
+is labeled `blocked`. A task that will be retried keeps `in-progress`. Labels
+may be plain (`ready`) or prefixed (`status:ready`). The worker uses
+whichever names the repo has, and plain names win if it has both. A repo
+without a `ready` label is left alone, and so is a status the repo has no
+label for.
 
 If a task breaks because of something around it (the model API, the network,
 the workspace), the agent retries it at the next git check, up to 3 attempts.

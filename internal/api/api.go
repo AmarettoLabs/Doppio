@@ -44,8 +44,10 @@ type Server struct {
 	managerToken   string
 	broker         *broker
 
-	// restartMu serializes restarts that apply saved settings; restarts
-	// tracks the ones running in the background (tests wait on it).
+	// restartMu serializes container starts, stops and restarts, from the
+	// portal and from applying saved settings: two at once for one agent
+	// race on its container name ("already in use"). restarts tracks the
+	// restarts running in the background (tests wait on it).
 	restartMu sync.Mutex
 	restarts  sync.WaitGroup
 }
@@ -182,10 +184,10 @@ func toView(a *model.Agent) AgentView {
 	return AgentView{
 		ID: a.ID, Name: a.Name, Persona: a.Persona, Task: a.Task,
 		Provider: string(a.Provider), Model: a.Model, APIBase: a.APIBase,
-		HasAPIToken: a.APIToken != "", Emails: a.Emails,
+		HasAPIToken: a.APIToken != "", Emails: orEmpty(a.Emails),
 		GitProvider: string(a.GitProvider), GitBaseURL: a.GitBaseURL,
-		HasGitToken: a.GitToken != "", GitLogin: a.GitLogin, GitRepos: a.GitRepos,
-		OwnerLogin: a.OwnerLogin, PeerLogins: a.PeerLogins, Triggers: triggerStrings(a.EffectiveTriggers()),
+		HasGitToken: a.GitToken != "", GitLogin: a.GitLogin, GitRepos: orEmpty(a.GitRepos),
+		OwnerLogin: a.OwnerLogin, PeerLogins: orEmpty(a.PeerLogins), Triggers: triggerStrings(a.EffectiveTriggers()),
 		PollSeconds: a.PollSeconds,
 		MaxTurns:    maxTurnsOrDefault(a.MaxTurns),
 		Engine:      string(a.EffectiveEngine()), TaskMinutes: a.EffectiveTaskMinutes(),
@@ -231,6 +233,15 @@ type agentInput struct {
 	MaxReplyTokens int `json:"maxReplyTokens"`
 	// ToolCallMode: "" = detect automatically.
 	ToolCallMode string `json:"toolCallMode"`
+}
+
+// orEmpty returns s, or an empty slice for nil, so list fields are JSON []
+// rather than null: the portal reads their .length and calls .join on them.
+func orEmpty(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
 }
 
 func triggerStrings(ts []model.Trigger) []string {
@@ -706,7 +717,9 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "agent not found")
 		return
 	}
+	s.restartMu.Lock()
 	_ = s.rt.Stop(id)
+	s.restartMu.Unlock()
 	if err := s.store.DeleteAgent(id); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -724,7 +737,9 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
+	s.restartMu.Lock()
 	a, code, err := s.restart(r.PathValue("id"), "")
+	s.restartMu.Unlock()
 	if err != nil {
 		writeErr(w, code, err.Error())
 		return
@@ -733,7 +748,7 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 }
 
 // restart stops the agent's container and starts a new one, with an event
-// saying why when reason is set.
+// saying why when reason is set. The caller holds restartMu.
 func (s *Server) restart(id, reason string) (*model.Agent, int, error) {
 	if reason != "" && s.store.GetAgent(id) != nil {
 		s.event(id, "status", reason)
@@ -743,7 +758,9 @@ func (s *Server) restart(id, reason string) (*model.Agent, int, error) {
 }
 
 func (s *Server) startAgent(w http.ResponseWriter, id string) {
+	s.restartMu.Lock()
 	a, code, err := s.start(id)
+	s.restartMu.Unlock()
 	if err != nil {
 		writeErr(w, code, err.Error())
 		return
@@ -752,7 +769,7 @@ func (s *Server) startAgent(w http.ResponseWriter, id string) {
 }
 
 // start starts the agent's container with its saved settings. On failure it
-// returns the HTTP status to report.
+// returns the HTTP status to report. The caller holds restartMu.
 func (s *Server) start(id string) (*model.Agent, int, error) {
 	a := s.store.GetAgent(id)
 	if a == nil {
@@ -811,6 +828,8 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "agent not found")
 		return
 	}
+	s.restartMu.Lock()
+	defer s.restartMu.Unlock()
 	if err := s.rt.Stop(id); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return

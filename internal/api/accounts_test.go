@@ -521,3 +521,13 @@ func TestUnusedAccountListsEmptyAgents(t *testing.T) {
 		t.Fatalf("list: %d %s", rec.Code, rec.Body)
 	}
 }
+
+// An account of a kind this build doesn't know (a store written by a newer
+// version) lists "secretFields": [], not null.
+func TestUnknownKindListsEmptySecretFields(t *testing.T) {
+	v := toAccountView(&model.Account{ID: "x", Name: "Old", Kind: "no-such-kind"}, nil)
+	b, _ := json.Marshal(v)
+	if !strings.Contains(string(b), `"secretFields":[]`) || !strings.Contains(string(b), `"agents":[]`) {
+		t.Fatalf("view: %s", b)
+	}
+}

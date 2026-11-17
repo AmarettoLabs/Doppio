@@ -198,3 +198,23 @@ func TestMaxReplyTokens(t *testing.T) {
 		t.Fatalf("reset: %d", v.MaxReplyTokens)
 	}
 }
+
+// List fields are [] rather than null when unset (an agent stored without
+// them, e.g. by an older version): the portal reads .length and calls .join.
+func TestAgentListFieldsAreNeverNull(t *testing.T) {
+	srv, st := newTestServer(t, "")
+	h := srv.Handler()
+	addAgent(t, st, "bare")
+	for _, path := range []string{"/api/agents/bare", "/api/agents"} {
+		rec := do(h, "GET", path, "", "")
+		body := rec.Body.String()
+		for _, f := range []string{`"emails":[]`, `"gitRepos":[]`, `"peerLogins":[]`} {
+			if rec.Code != http.StatusOK || !strings.Contains(body, f) {
+				t.Errorf("GET %s: want %s in %d %s", path, f, rec.Code, body)
+			}
+		}
+		if strings.Contains(body, "null") {
+			t.Errorf("GET %s: null in %s", path, body)
+		}
+	}
+}

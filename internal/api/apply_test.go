@@ -20,6 +20,29 @@ type fakeContainers struct {
 	running map[string]bool
 	started []model.Agent
 	stops   int
+
+	// slow makes each Start and Stop take that long; overlaps counts the
+	// calls that began while another was still in flight.
+	slow     time.Duration
+	inFlight int
+	overlaps int
+}
+
+// enter marks a Start/Stop as in flight for f.slow; the returned func ends it.
+func (f *fakeContainers) enter() func() {
+	f.mu.Lock()
+	if f.inFlight > 0 {
+		f.overlaps++
+	}
+	f.inFlight++
+	slow := f.slow
+	f.mu.Unlock()
+	time.Sleep(slow)
+	return func() {
+		f.mu.Lock()
+		f.inFlight--
+		f.mu.Unlock()
+	}
 }
 
 func (f *fakeContainers) EnsureNetwork() error { return nil }
@@ -28,6 +51,7 @@ func (f *fakeContainers) Start(a *model.Agent) (string, error) {
 }
 
 func (f *fakeContainers) StartWithAccounts(a *model.Agent, _ map[string]string) (string, error) {
+	defer f.enter()()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.running[a.ID] = true
@@ -35,6 +59,7 @@ func (f *fakeContainers) StartWithAccounts(a *model.Agent, _ map[string]string) 
 	return "c0ffee00c0ffee00", nil
 }
 func (f *fakeContainers) Stop(id string) error {
+	defer f.enter()()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.running[id] = false
@@ -209,5 +234,39 @@ func TestStopClearsPendingRestart(t *testing.T) {
 	do(f.h, "POST", "/api/agents/"+f.id+"/stop", "", "")
 	if f.st.GetAgent(f.id).RestartPending {
 		t.Fatal("stop left the restart pending")
+	}
+}
+
+// Restarts, starts and stops from the portal and from applying settings run
+// one at a time: two at once raced on the container name in production
+// (docker: "the container name ... is already in use").
+func TestContainerOperationsDoNotOverlap(t *testing.T) {
+	f := newApplyFixture(t, false)
+	f.rt.mu.Lock()
+	f.rt.slow = 20 * time.Millisecond
+	f.rt.mu.Unlock()
+	var wg sync.WaitGroup
+	codes := make(chan int, 4)
+	for _, path := range []string{"/restart", "/restart", "/restart", "/stop"} {
+		wg.Add(1)
+		go func(path string) {
+			defer wg.Done()
+			codes <- do(f.h, "POST", "/api/agents/"+f.id+path, "", "").Code
+		}(path)
+	}
+	wg.Add(1)
+	go func() { defer wg.Done(); f.save(`"o/other"`) }()
+	wg.Wait()
+	f.srv.restarts.Wait()
+	close(codes)
+	for c := range codes {
+		if c != http.StatusOK {
+			t.Errorf("got HTTP %d", c)
+		}
+	}
+	f.rt.mu.Lock()
+	defer f.rt.mu.Unlock()
+	if f.rt.overlaps != 0 {
+		t.Fatalf("%d container operations overlapped", f.rt.overlaps)
 	}
 }

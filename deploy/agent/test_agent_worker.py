@@ -1207,6 +1207,22 @@ class PrepareTaskTest(Patched):
         w.prepare_task(agent(), {"id": "t2", "kind": "assigned", "source": "github:o/r#issues:7"})
         self.assertEqual(w.git(repo_dir, "rev-parse", "main"), w.git(repo_dir, "rev-parse", "origin/main"))
 
+    def test_diverged_local_default_branch_is_left_alone(self):
+        self.use({r"/repos/o/r/issues/7": {"title": "Add CI"}, r"/repos/o/r/pulls\?.*": []})
+        w.prepare_task(agent(), {"id": "t1", "kind": "assigned", "source": "github:o/r#issues:7"})
+        repo_dir = os.path.join(WS_DIR, "repos", "r")
+        branch = w.git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD")
+        # A local-only commit on main, then origin moves on: the two diverge.
+        w.git(repo_dir, "checkout", "-q", "main")
+        w.git(repo_dir, "commit", "-q", "--allow-empty", "-m", "local only")
+        local = w.git(repo_dir, "rev-parse", "main")
+        sh("git", "push", "-q", self.origin, "HEAD:main", cwd=os.path.join(self.tmp, "seed"))
+        w.git(repo_dir, "fetch", "-q", "origin")
+        for on in ("main", branch):  # checked out (merge --ff-only) and not (update-ref)
+            w.git(repo_dir, "checkout", "-q", on)
+            w.fast_forward_default(repo_dir, "main")
+            self.assertEqual(w.git(repo_dir, "rev-parse", "main"), local, f"HEAD on {on}")
+
     def test_same_name_other_owner_gets_its_own_clone(self):
         other = os.path.join(WS_DIR, "repos", "r")
         sh("git", "init", "-q", other)
@@ -1235,6 +1251,7 @@ class PrepareTaskTest(Patched):
         self.assertIn("leftovers before task t2", w.git(repo_dir, "stash", "list"))
         self.assertIn("Your job: review this pull request", text)
         self.assertIn("Do not commit, push", text)
+        self.assertIn("scratch files (helper scripts, notes) under /tmp", text)
 
 
 if __name__ == "__main__":

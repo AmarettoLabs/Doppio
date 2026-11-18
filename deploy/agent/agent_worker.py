@@ -1112,8 +1112,9 @@ MAX_LISTED_DOCS = 150
 def git(repo_dir, *args, check=True):
     """git in a checkout, always as the engine user: after a task the
     checkout and its .git belong to it, so the hooks, filters and config in
-    there are things the model can plant, and they must not run as root
-    (the token-needing fetches are the only exception, see root_git)."""
+    there are things the model can plant. They only ever run as the engine
+    user (the worker's own git stays in the root-owned mirrors, see
+    root_git)."""
     r = subprocess.run(engine_argv(["git", "-C", repo_dir, *args]),
                        capture_output=True, text=True, timeout=SHELL_TIMEOUT,
                        env=git_env())
@@ -1122,24 +1123,90 @@ def git(repo_dir, *args, check=True):
     return r.stdout.strip()
 
 
-# The one git the worker runs as root in a checkout: a fetch, which needs
-# the root-only credential store. Hooks, fsmonitor and everything else the
-# engine user could have planted in .git must stay off for it, and the
-# remote is given as the explicit clone URL, never the `origin` name: both
-# remote.origin.url and core.sshCommand would come from config the engine
-# user can write.
-GIT_SAFE = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false")
+# The worker's root git runs nowhere else than in a repo's bare mirror
+# (update_mirror below): the token-needing fetches are the point, and a
+# mirror is root-owned, so no hooks, config or anything else the engine
+# could plant is ever read by it. A checkout's .git belongs to the engine
+# user after its task (git below runs there, as the engine user), and its
+# config must never meet root: `url.*.insteadOf`, `credential.helper = !…`,
+# `include.path`, a `gitdir:` file, ... all of them make git run commands.
+MIRRORS = os.environ.get("AGENT_MIRRORS", "/agent/mirrors")
 
 
-def root_git(repo_dir, *args, check=True):
-    """Fetch git as root, sanitized (see GIT_SAFE): run only on checkouts
-    prepare_task has taken back from the engine user (chown_back_to_root),
-    so nothing can change under it while it runs."""
-    argv = ["git", *GIT_SAFE, "-C", repo_dir, *args]
+def mirror_path(repo):
+    """Path of the repo's bare mirror: root-owned, read-only for the engine
+    user, which fetches it for its checkouts instead of the tokened
+    upstream."""
+    return os.path.join(MIRRORS, "repos", f"{repo}.git")
+
+
+def engine_gitconfig():
+    """The global config the engine user's git reads (git_env points
+    GIT_CONFIG_GLOBAL at it): worker-written, so the engine user cannot
+    change what its git honors."""
+    return os.path.join(MIRRORS, "gitconfig")
+
+
+def trust_mirror(m):
+    """Let the engine user's git read the mirror: root-owned as it is, git
+    would refuse it as a clone/fetch source ("dubious ownership"). The
+    safe.directory exception is honored only from a global config, hence
+    the worker writes it into engine_gitconfig."""
+    if engine_uid_gid() is None:
+        return  # no drop: the mirror is the same user's, nothing to allow
+    p = engine_gitconfig()
+    have = subprocess.run(["git", "config", "--file", p, "--get-all", "safe.directory"],
+                          capture_output=True, text=True)
+    if m not in have.stdout.splitlines():
+        subprocess.run(["git", "config", "--file", p, "--add", "safe.directory", m],
+                       capture_output=True, text=True, check=True)
+        os.chmod(p, 0o644)
+
+
+def root_git(mirror, *args, check=True):
+    """The worker's root git: it alone holds the git token (the credential
+    store setup_git writes). Runs in a mirror only, never in a checkout."""
+    argv = ["git", "-C", mirror, *args]
     r = subprocess.run(argv, capture_output=True, text=True, timeout=SHELL_TIMEOUT)
     if check and r.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)}: {(r.stderr or r.stdout).strip()[:500]}")
     return r.stdout.strip()
+
+
+def update_mirror(provider, repo, url, num=0):
+    """Make the repo's bare mirror hold upstream (heads, and refs/prs/<num>
+    for this item's head when set), and return the mirror with upstream's
+    default branch. Root git, in the mirror only (see root_git): the
+    checkouts are updated from the mirror by the engine user instead, so
+    they never need the git token."""
+    m = mirror_path(repo)
+    have = os.path.isdir(m)
+    if have and root_git(m, "config", "--get", "remote.doppio.url",
+                         check=False).strip().lower() != url.lower():
+        have = False  # a mirror of a former base URL: redo it
+    if not have:
+        # Only the worker (root) writes here, so a mirror built now is
+        # trusted however many tasks ran before.
+        if os.path.lexists(m) and not os.path.isdir(m):
+            os.unlink(m)
+        shutil.rmtree(m, ignore_errors=True)
+        os.makedirs(os.path.dirname(m), exist_ok=True)
+        subprocess.run(["git", "init", "-q", "--bare", m],
+                       capture_output=True, text=True, timeout=SHELL_TIMEOUT, check=True)
+        root_git(m, "config", "remote.doppio.url", url)
+    root_git(m, "fetch", "-q", "--prune", url, "+refs/heads/*:refs/heads/*")
+    if num:
+        pr = f"refs/merge-requests/{num}/head" if provider == "gitlab" else f"refs/pull/{num}/head"
+        root_git(m, "fetch", "-q", url, f"+{pr}:refs/prs/{num}")
+    base = "main"
+    m_ = re.search(r"ref:\s*refs/heads/(\S+)",
+                   root_git(m, "ls-remote", "--symref", url, "HEAD", check=False))
+    if m_:
+        base = m_.group(1)
+    # So a fresh clone from the mirror checks out the default branch.
+    root_git(m, "symbolic-ref", "HEAD", f"refs/heads/{base}")
+    trust_mirror(m)
+    return m, base
 
 
 def clone_url(agent, repo):
@@ -1346,37 +1413,38 @@ def repo_path(agent, repo):
 def prepare_task(agent, t):
     """Clone/fetch the task's repository, check out what the trigger needs
     and return the playbook + workspace + guidance text that goes before
-    the task input. The token-needing fetches run as root, sanitized (see
-    root_git); everything else in the checkout runs as the engine user, so
-    no hook or config the engine planted in .git ever runs as root."""
+    the task input. The worker's git runs as root in the repo's bare mirror
+    only (update_mirror); everything that touches a checkout runs as the
+    engine user, so no hook or config the engine planted in .git ever runs
+    as root."""
     trigger = task_trigger(t)
     provider, repo, kind, num = parse_source(t["source"])
     repo_dir = repo_path(agent, repo)
     url = clone_url(agent, repo)
-    if not os.path.isdir(os.path.join(repo_dir, ".git")):
-        os.makedirs(os.path.dirname(repo_dir), exist_ok=True)
-        r = subprocess.run(["git", *GIT_SAFE, "clone", "-q", url, repo_dir],
-                           capture_output=True, text=True, timeout=SHELL_TIMEOUT)
-        if r.returncode != 0:
-            raise RuntimeError(f"git clone {repo}: {r.stderr.strip()[:500]}")
-    else:
-        # The engine user owns .git here since the last task worked it: its
-        # hooks and config run with whoever runs git. Take the checkout back
-        # and drop the hooks before root fetches from it.
-        chown_back_to_root(repo_dir)
-        shutil.rmtree(os.path.join(repo_dir, ".git", "hooks"), ignore_errors=True)
-    root_git(repo_dir, "fetch", "-q", "--prune", url, "+refs/heads/*:refs/remotes/origin/*")
-    pr_ref = f"merge-requests/{num}/head" if provider == "gitlab" else f"pull/{num}/head"
-    if trigger in ("review_requests", "assigned_prs") or (trigger == "mentions" and kind != "issues"):
-        root_git(repo_dir, "fetch", "-q", url, pr_ref)  # FETCH_HEAD for this item's head
-    base = "main"
-    m = re.search(r"ref:\s*refs/heads/(\S+)",
-                  root_git(repo_dir, "ls-remote", "--symref", url, "HEAD", check=False))
-    if m:
-        base = m.group(1)
+    need_head = trigger in ("review_requests", "assigned_prs") or (trigger == "mentions" and kind != "issues")
+    mirror, base = update_mirror(provider, repo, url, num if need_head else 0)
     # From here on the checkout is the engine user's: git in it (hooks,
     # filters, config included) runs as the engine user too.
     chown_to_engine(repo_dir)
+    if os.path.isdir(os.path.join(repo_dir, ".git")):
+        git(repo_dir, "fetch", "-q", "--prune", mirror, "+refs/heads/*:refs/remotes/origin/*")
+    else:
+        # A brand-new checkout: whatever sits at the path is engine junk
+        # (the engine user owns the workspace root), so make it empty and
+        # let the engine user clone the mirror - no token to be had there.
+        os.makedirs(os.path.dirname(repo_dir), exist_ok=True)
+        if os.path.lexists(repo_dir) and not os.path.isdir(repo_dir):
+            os.unlink(repo_dir)
+        else:
+            shutil.rmtree(repo_dir, ignore_errors=True)
+        os.makedirs(repo_dir)
+        chown_to_engine(repo_dir, recursive=False)
+        git(repo_dir, "clone", "-q", mirror, ".")
+        # Clone set origin to the mirror; pushes go to upstream with the
+        # task's token, so point the remote at it again.
+        git(repo_dir, "remote", "set-url", "origin", url)
+    if need_head:
+        git(repo_dir, "fetch", "-q", mirror, f"refs/prs/{num}")  # FETCH_HEAD for this item's head
     git(repo_dir, "symbolic-ref", "refs/remotes/origin/HEAD", f"refs/remotes/origin/{base}", check=False)
     if git(repo_dir, "status", "--porcelain"):
         # Leftovers from an earlier task: keep them in a stash, start clean.
@@ -1561,10 +1629,6 @@ def setup_git(agent):
     # Without a token there is nothing to configure for fetches, and
     # credential.helper = store would only gain an empty file on first use.
     pairs = [
-        # The engine user owns the checkouts after a task; without
-        # this the worker (root) refuses to work on them ("detected
-        # dubious ownership"). The engine user owns its own.
-        ("safe.directory", "*"),
         ("init.defaultBranch", "main"), ("push.default", "current"),
     ]
     if agent.get("gitToken"):
@@ -1759,26 +1823,16 @@ def chown_to_engine(path, recursive=True):
         os.chown(path, ids[0], ids[1])
 
 
-def chown_back_to_root(path):
-    """Take a checkout back from the engine user (see chown_to_engine), so
-    the root git below it (root_git) cannot have its .git rewritten or
-    swapped under it while it runs. No-op unless the worker drops
-    privileges."""
-    if engine_uid_gid() is None:
-        return
-    subprocess.run(["chown", "-R", "-h", "0:0", path],
-                   capture_output=True, timeout=SHELL_TIMEOUT)
-
-
 def git_env():
     """The environment for engine-user git. With the drop, the worker's own
-    HOME is unreadable to it and git would die on /root/.gitconfig; there is
-    no global config then (identity is passed with -c where a commit is
-    made). Without the drop (tests, a dev checkout) the worker's own
-    environment is kept."""
+    HOME is unreadable to it and git would die on /root/.gitconfig; this is
+    its global config instead, with the safe.directory exceptions for the
+    root-owned mirrors (see trust_mirror). Without the drop (tests, a dev
+    checkout) the worker's own environment is kept."""
     if engine_uid_gid() is None:
         return None
-    return {"PATH": os.environ.get("PATH", ""), "HOME": "/nonexistent"}
+    return {"PATH": os.environ.get("PATH", ""), "HOME": "/nonexistent",
+            "GIT_CONFIG_GLOBAL": engine_gitconfig()}
 
 
 def can_push(t):

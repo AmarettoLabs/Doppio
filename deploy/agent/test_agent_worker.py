@@ -17,6 +17,7 @@ for k, v in (("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"),
              ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")):
     os.environ.setdefault(k, v)
 os.environ["AGENT_WORKSPACE"] = WS_DIR
+os.environ["AGENT_MIRRORS"] = os.path.join(WS_DIR, "mirrors")
 sys.path.insert(0, os.path.dirname(__file__))
 import agent_worker as w  # noqa: E402
 
@@ -1221,7 +1222,6 @@ class SetupGitTest(unittest.TestCase):
             cfg = self.config(home)
             self.assertIn("user.name=bot", cfg)
             self.assertIn("credential.helper=store --file=", cfg)
-            self.assertIn("safe.directory=*", cfg)
             cred = os.path.join(home, ".git-credentials")
             self.assertIn("x-access-token:t@github.com", open(cred).read())
 
@@ -1233,7 +1233,7 @@ class SetupGitTest(unittest.TestCase):
             self.assertNotIn("credential.helper", cfg)
             self.assertNotIn("user.name=", cfg)
             self.assertFalse(os.path.exists(os.path.join(home, ".git-credentials")))
-            self.assertIn("safe.directory=*", cfg)  # the one unconditional setting
+            self.assertIn("init.defaultbranch=main", cfg)  # the one unconditional setting
 
 
 
@@ -1480,9 +1480,8 @@ class PrepareTaskTest(Patched):
         orig = w.clone_url
         w.clone_url = lambda agent, repo: self.origin
         self.addCleanup(setattr, w, "clone_url", orig)
-        repo_dir = os.path.join(WS_DIR, "repos", "r")
-        if os.path.isdir(repo_dir):
-            sh("rm", "-rf", repo_dir)
+        # Each test names its own checkouts: start from none.
+        shutil.rmtree(os.path.join(WS_DIR, "repos"), ignore_errors=True)
 
     def test_assigned_issue_gets_branch_playbook_and_guidance(self):
         self.use({r"/repos/o/r/issues/7": {"title": "Add CI"}, r"/repos/o/r/pulls\?.*": []})
@@ -1552,27 +1551,64 @@ class PrepareTaskTest(Patched):
         self.assertEqual(w.repo_path(agent(), "o/r"), os.path.join(WS_DIR, "repos", "o-r-2"))
         self.assertEqual(w.repo_path(agent(), "x/o-r"), taken)
 
-    def test_git_in_checkouts_runs_as_the_engine_user_and_hooks_are_sanitized(self):
+    def test_prepare_keeps_root_git_out_of_the_engine_s_checkout(self):
+        """A checkout's .git was written by the engine user during its task;
+        its config can make git run commands (url.*.insteadOf with ext::,
+        credential.helper = !…). The worker's git, the only git that knows
+        the token, must never run in the checkout: the checkout is updated
+        from the root-owned mirror, as the engine user."""
         self.use({r"/repos/o/r/issues/7": {"title": "Add CI"}, r"/repos/o/r/pulls\?.*": []})
         w.prepare_task(agent(), {"id": "t1", "kind": "assigned", "source": "github:o/r#issues:7"})
         repo_dir = os.path.join(WS_DIR, "repos", "r")
-        # What a steered engine can plant in a checkout it owns: a hook
-        # (it would run as root with the old root git there).
-        hooks = os.path.join(repo_dir, ".git", "hooks")
-        hook = os.path.join(hooks, "post-checkout")
-        with open(hook, "w") as f:
-            f.write("#!/bin/sh\n")
-        os.chmod(hook, 0o755)
-        seen = []
-        orig = w.engine_argv
-        w.engine_argv = lambda argv: seen.append(argv) or argv
-        self.addCleanup(setattr, w, "engine_argv", orig)
+        mirror = w.mirror_path("o/r")
+        # Plant what a steered engine can: config that runs a command for
+        # any git trusting this .git while talking to upstream.
+        pwned = os.path.join(self.tmp, "PWNED")
+        sh("git", "-C", repo_dir, "config", "protocol.ext.allow", "always")
+        sh("git", "-C", repo_dir, "config",
+           f"url.ext::sh -c touch% {pwned}% >&2% ;% false.insteadOf", self.origin)
+        sh("git", "-C", repo_dir, "config", "credential.helper", f"!touch {pwned}2")
+        # Upstream moves on, so the next prepare has to fetch.
+        sh("git", "push", "-q", self.origin, "HEAD:main", cwd=os.path.join(self.tmp, "seed"))
+        # Everything the next prepare runs, split in two: through the engine
+        # drop (engine_argv) and straight from the worker (root with a drop).
+        all_argv, via_engine = [], []
+        orig_run, orig_engine = w.subprocess.run, w.engine_argv
+        def run_spy(argv, **kw):
+            all_argv.append(tuple(argv))
+            return orig_run(argv, **kw)
+        def engine_spy(argv):
+            out = orig_engine(argv)
+            via_engine.append(tuple(out))
+            return out
+        w.subprocess.run, w.engine_argv = run_spy, engine_spy
+        try:
+            w.prepare_task(agent(), {"id": "t2", "kind": "assigned", "source": "github:o/r#issues:7"})
+        finally:
+            w.subprocess.run, w.engine_argv = orig_run, orig_engine
+        # Neither payload ran: no root git met the poisoned config.
+        self.assertFalse(os.path.exists(pwned))
+        self.assertFalse(os.path.exists(pwned + "2"))
+        # The worker's own git ran, and only in the mirror.
+        root_argv = set(all_argv) - set(via_engine)
+        self.assertTrue(root_argv)  # the mirror fetches happened
+        for argv in root_argv:
+            self.assertNotIn(repo_dir, argv)
+            self.assertIn(mirror, argv)
+        # The checkout did move: its engine fetched the mirror.
+        self.assertEqual(w.git(repo_dir, "rev-parse", "origin/main"),
+                         w.root_git(mirror, "rev-parse", "main"))
+
+    def test_mirror_is_redone_when_the_clone_url_changes(self):
+        self.use({r"/repos/o/r/issues/7": {"title": "Add CI"}, r"/repos/o/r/pulls\?.*": []})
+        w.prepare_task(agent(), {"id": "t1", "kind": "assigned", "source": "github:o/r#issues:7"})
+        mirror = w.mirror_path("o/r")
+        # The same repo later answers at another base URL (a moved GitLab).
+        moved = os.path.join(self.tmp, "moved.git")
+        sh("git", "clone", "-q", "--bare", self.origin, moved)
+        w.clone_url = lambda agent, repo: moved
         w.prepare_task(agent(), {"id": "t2", "kind": "assigned", "source": "github:o/r#issues:7"})
-        # The hooks are gone before root fetches from the checkout again.
-        self.assertFalse(os.path.exists(hook))
-        # The checkout-local git (fetches excepted) runs as the engine user.
-        self.assertTrue(all(a[0] == "git" for a in seen))
-        self.assertTrue(any(a[1] == "-C" for a in seen))
+        self.assertEqual(w.root_git(mirror, "config", "--get", "remote.doppio.url"), moved)
 
     def test_git_in_a_checkout_runs_through_the_engine_drop(self):
         seen = []

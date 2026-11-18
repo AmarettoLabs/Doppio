@@ -38,8 +38,8 @@ type Runtime struct {
 	// CA certificates agents should trust on top of the system ones, e.g. the
 	// CA of a self-signed local inference server.
 	CABundle string
-	// CapAdd are capabilities handed back to agent containers on top of the
-	// ALL they drop. Empty by default: add one only when proven necessary.
+	// CapAdd are capabilities handed back to agent containers on top of
+	// WorkerCaps. Empty by default: add one only when proven necessary.
 	CapAdd []string
 	// Memory, CPUs and PIDsLimit are the docker run resource limits for
 	// agent containers (docker's --memory/--cpus/--pids-limit syntax). A
@@ -129,11 +129,25 @@ func parseCapAdd(s string) []string {
 	return out
 }
 
-// hardeningArgs are the docker run options every agent container gets: no
-// capabilities, no way to gain any (setuid/sudo included), and resource
-// limits, each configurable per install (see NewFromEnv).
+// WorkerCaps are the capabilities agent containers keep: the ones the
+// worker (root) needs to run its engines as the unprivileged engine user.
+// SETUID/SETGID for the drop itself (setpriv), CHOWN to hand checkouts and
+// homes to that user, DAC_OVERRIDE/FOWNER to manage what it then owns
+// (stashes, leftovers, Vibe's home), KILL to stop its processes at the task
+// limit. Without them the worker cannot start at all. The engines get none
+// of them: they run as a non-root user and no-new-privileges keeps them
+// from gaining any.
+var WorkerCaps = []string{"CHOWN", "DAC_OVERRIDE", "FOWNER", "KILL", "SETGID", "SETUID"}
+
+// hardeningArgs are the docker run options every agent container gets: every
+// capability dropped but WorkerCaps, no way to gain any (setuid/sudo
+// included), and resource limits, each configurable per install (see
+// NewFromEnv).
 func (r *Runtime) hardeningArgs() []string {
 	args := []string{"--cap-drop", "ALL", "--security-opt", "no-new-privileges"}
+	for _, c := range WorkerCaps {
+		args = append(args, "--cap-add", c)
+	}
 	for _, c := range r.CapAdd {
 		args = append(args, "--cap-add", c)
 	}

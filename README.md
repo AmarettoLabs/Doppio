@@ -174,10 +174,13 @@ Each task has a time limit (30 minutes by default, set per agent). A task
 still running then is stopped and retried at a later git check, like other
 infrastructure failures.
 
-The agent's container is the sandbox, hardened: it runs with no capabilities,
-without the ability to gain any, and under memory, CPU and process limits
-(`AGENT_MEMORY`/`AGENT_CPUS`/`AGENT_PIDS_LIMIT`, see Configuration; a
-capability can be handed back with `AGENT_CAP_ADD`). Inside it, only the
+The agent's container is the sandbox, hardened: it drops every capability
+except the six the worker needs to run engines as another user (`CHOWN`,
+`DAC_OVERRIDE`, `FOWNER`, `KILL`, `SETGID`, `SETUID`), cannot gain any, and
+runs under memory, CPU and process limits
+(`AGENT_MEMORY`/`AGENT_CPUS`/`AGENT_PIDS_LIMIT`, see Configuration; another
+capability can be handed back with `AGENT_CAP_ADD`). The engines hold none of
+them: they run as a non-root user. Inside it, only the
 worker runs privileged; every engine — the Doppio loop's shell tool, the CLIs —
 runs as an unprivileged user that cannot read the agent's own tokens in
 `/agent/state` and gets a per-task HOME with only what the task needs:
@@ -209,7 +212,7 @@ Manager environment variables:
 | `AGENT_MEMORY` | `4g` | Memory limit per agent container (docker `--memory` syntax; empty = no limit) |
 | `AGENT_CPUS` | `2` | CPU limit per agent container (docker `--cpus` syntax; empty = no limit) |
 | `AGENT_PIDS_LIMIT` | `512` | Process limit per agent container (docker `--pids-limit`; empty = no limit) |
-| `AGENT_CAP_ADD` | _(empty)_ | Capabilities given back to agent containers, which drop all others |
+| `AGENT_CAP_ADD` | _(empty)_ | Capabilities given back to agent containers on top of the worker's six; all others are dropped |
 
 ### Local / self-hosted model servers
 

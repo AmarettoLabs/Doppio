@@ -53,9 +53,11 @@ too. One secret is necessarily inside the engine's reach: a CLI engine's
 model key (Mistral Vibe's `MISTRAL_API_KEY`, a Claude Code or Codex login)
 is passed into that engine's environment, so a steered CLI engine can read
 and spend it — only the Doppio loop keeps the model key away from the
-engine. Agent containers also drop every capability, cannot gain new
-privileges (`no-new-privileges`) and run under memory, CPU and process
-limits.
+engine. Agent containers also drop every capability but the six the worker
+needs to run the engines as an unprivileged user (`CHOWN`, `DAC_OVERRIDE`,
+`FOWNER`, `KILL`, `SETGID`, `SETUID`; the engines hold none of them), cannot
+gain new privileges (`no-new-privileges`) and run under memory, CPU and
+process limits.
 
 Mitigations you should apply:
 
@@ -72,8 +74,8 @@ Each container receives only its own internal token (an HMAC of the manager's
 master token and the agent ID). With it, an agent can only post events,
 create/claim tasks and finish tasks for itself; it cannot act for other
 agents, and it cannot reach the portal API when `PORTAL_PASSWORD` is set.
-Agent containers do share one Docker network. They are hardened (no
-capabilities, no-new-privileges, resource limits), and inside them only the
+Agent containers do share one Docker network. They are hardened (only the
+worker's capabilities, no-new-privileges, resource limits), and inside them only the
 worker runs privileged; the engines, which execute what the model asks, run
 as an unprivileged user that cannot read the agent's or any account's root
 state — a CLI engine's own key excepted, which its process needs (see

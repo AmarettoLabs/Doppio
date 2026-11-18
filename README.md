@@ -53,6 +53,9 @@ from the portal).
 
 ## What agents respond to
 
+For the GitHub settings and how agents pick up work, step by step, see
+[docs/github.md](docs/github.md).
+
 Each agent has an **owner** (a git login) and a set of **triggers**. It only
 acts when the owner asks: the owner must have assigned it, requested its
 review, or written the mention. Requests from anyone else, peers included, are

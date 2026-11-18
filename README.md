@@ -186,8 +186,8 @@ runs as an unprivileged user that cannot read the agent's own tokens in
 `/agent/state` and gets a per-task HOME with only what the task needs:
 reviews, mentions and portal messages no git token at all, assigned issues
 and PRs the git token to push with. The worker reads the config itself,
-updates the repository (through a root-owned mirror of it) and posts the
-answers. One key is necessarily in the engine's reach: a CLI engine's model
+updates the repository (through a root-owned, engine-readable mirror of it,
+which is the only repo the worker's own git runs in) and posts the answers. One key is necessarily in the engine's reach: a CLI engine's model
 key or login (`MISTRAL_API_KEY` for Mistral Vibe) is passed into its
 environment, so a steered CLI engine can read and spend it. Only the
 Doppio loop keeps the model key away from the engine, with the worker.

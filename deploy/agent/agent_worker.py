@@ -1140,27 +1140,21 @@ def mirror_path(repo):
     return os.path.join(MIRRORS, "repos", f"{repo}.git")
 
 
-def engine_gitconfig():
-    """The global config the engine user's git reads (git_env points
-    GIT_CONFIG_GLOBAL at it): worker-written, so the engine user cannot
-    change what its git honors."""
-    return os.path.join(MIRRORS, "gitconfig")
-
-
-def trust_mirror(m):
-    """Let the engine user's git read the mirror: root-owned as it is, git
-    would refuse it as a clone/fetch source ("dubious ownership"). The
-    safe.directory exception is honored only from a global config, hence
-    the worker writes it into engine_gitconfig."""
-    if engine_uid_gid() is None:
-        return  # no drop: the mirror is the same user's, nothing to allow
-    p = engine_gitconfig()
-    have = subprocess.run(["git", "config", "--file", p, "--get-all", "safe.directory"],
-                          capture_output=True, text=True)
-    if m not in have.stdout.splitlines():
-        subprocess.run(["git", "config", "--file", p, "--add", "safe.directory", m],
-                       capture_output=True, text=True, check=True)
-        os.chmod(p, 0o644)
+def lock_down(path=None):
+    """Hand a mirror (or the whole mirror tree) to root alone, read-only for
+    everyone else: root git runs in there and reads its config and refs, so
+    nothing the engine user can write may live in it. Without the drop (the
+    tests, a dev checkout) the worker is not root: nothing to protect."""
+    if os.geteuid() != 0:
+        return
+    for d, dirs, files in os.walk(path or MIRRORS):
+        for name in files:
+            os.chown(os.path.join(d, name), 0, 0)
+            os.chmod(os.path.join(d, name), 0o444)  # git adds no exec bit either (umask 022)
+        for name in dirs:
+            p = os.path.join(d, name)
+            os.chown(p, 0, 0, follow_symlinks=False)
+            os.chmod(p, 0o555)
 
 
 def root_git(mirror, *args, check=True):
@@ -1173,6 +1167,17 @@ def root_git(mirror, *args, check=True):
     return r.stdout.strip()
 
 
+def mirror_git(m, *args, check=True):
+    """git that writes to the mirror, on top of root_git: a mirror is kept
+    root-owned and read-only (lock_down), so root git never reads a config
+    or a ref the engine user could have written."""
+    lock_down(m)
+    try:
+        return root_git(m, *args, check=check)
+    finally:
+        lock_down(m)
+
+
 def update_mirror(provider, repo, url, num=0):
     """Make the repo's bare mirror hold upstream (heads, and refs/prs/<num>
     for this item's head when set), and return the mirror with upstream's
@@ -1181,8 +1186,8 @@ def update_mirror(provider, repo, url, num=0):
     they never need the git token."""
     m = mirror_path(repo)
     have = os.path.isdir(m)
-    if have and root_git(m, "config", "--get", "remote.doppio.url",
-                         check=False).strip().lower() != url.lower():
+    if have and mirror_git(m, "config", "--get", "remote.doppio.url",
+                           check=False).strip().lower() != url.lower():
         have = False  # a mirror of a former base URL: redo it
     if not have:
         # Only the worker (root) writes here, so a mirror built now is
@@ -1193,19 +1198,18 @@ def update_mirror(provider, repo, url, num=0):
         os.makedirs(os.path.dirname(m), exist_ok=True)
         subprocess.run(["git", "init", "-q", "--bare", m],
                        capture_output=True, text=True, timeout=SHELL_TIMEOUT, check=True)
-        root_git(m, "config", "remote.doppio.url", url)
-    root_git(m, "fetch", "-q", "--prune", url, "+refs/heads/*:refs/heads/*")
+        mirror_git(m, "config", "remote.doppio.url", url)
+    mirror_git(m, "fetch", "-q", "--prune", url, "+refs/heads/*:refs/heads/*")
     if num:
         pr = f"refs/merge-requests/{num}/head" if provider == "gitlab" else f"refs/pull/{num}/head"
-        root_git(m, "fetch", "-q", url, f"+{pr}:refs/prs/{num}")
+        mirror_git(m, "fetch", "-q", url, f"+{pr}:refs/prs/{num}")
     base = "main"
     m_ = re.search(r"ref:\s*refs/heads/(\S+)",
                    root_git(m, "ls-remote", "--symref", url, "HEAD", check=False))
     if m_:
         base = m_.group(1)
     # So a fresh clone from the mirror checks out the default branch.
-    root_git(m, "symbolic-ref", "HEAD", f"refs/heads/{base}")
-    trust_mirror(m)
+    mirror_git(m, "symbolic-ref", "HEAD", f"refs/heads/{base}")
     return m, base
 
 
@@ -1423,8 +1427,8 @@ def prepare_task(agent, t):
     url = clone_url(agent, repo)
     need_head = trigger in ("review_requests", "assigned_prs") or (trigger == "mentions" and kind != "issues")
     mirror, base = update_mirror(provider, repo, url, num if need_head else 0)
-    # From here on the checkout is the engine user's: git in it (hooks,
-    # filters, config included) runs as the engine user too.
+    # From here on the checkout is the engine user's (and git in there,
+    # hooks, filters and config included, runs as the engine user too).
     chown_to_engine(repo_dir)
     if os.path.isdir(os.path.join(repo_dir, ".git")):
         git(repo_dir, "fetch", "-q", "--prune", mirror, "+refs/heads/*:refs/remotes/origin/*")
@@ -1446,6 +1450,8 @@ def prepare_task(agent, t):
         # Clone set origin to the mirror; pushes go to upstream with the
         # task's token, so point the remote at it again.
         git(repo_dir, "remote", "set-url", "origin", url)
+        # The clone runs as the engine user (git_env): what it wrote is
+        # already the engine user's.
     if need_head:
         git(repo_dir, "fetch", "-q", mirror, f"refs/prs/{num}")  # FETCH_HEAD for this item's head
     git(repo_dir, "symbolic-ref", "refs/remotes/origin/HEAD", f"refs/remotes/origin/{base}", check=False)
@@ -1827,15 +1833,22 @@ def chown_to_engine(path, recursive=True):
 
 
 def git_env():
-    """The environment for engine-user git. With the drop, the worker's own
-    HOME is unreadable to it and git would die on /root/.gitconfig; this is
-    its global config instead, with the safe.directory exceptions for the
-    root-owned mirrors (see trust_mirror). Without the drop (tests, a dev
-    checkout) the worker's own environment is kept."""
+    """The environment for the engine user's git when it runs outside a task
+    (the worker's prepare): with the drop, the worker's own HOME is
+    unreadable to it and git would die on /root/.gitconfig. It gets the
+    same global config a task's engine home holds (see build_engine_home),
+    safe.directory included. Without the drop (tests, a dev checkout) the
+    worker's own environment is kept."""
     if engine_uid_gid() is None:
         return None
+    p = os.path.join(ENGINE_HOME_ROOT, "gitconfig")
+    os.makedirs(ENGINE_HOME_ROOT, exist_ok=True)
+    if not os.path.exists(p):
+        with open(p, "w") as f:
+            f.write("[safe]\n\tdirectory = *\n")
+        os.chmod(p, 0o644)
     return {"PATH": os.environ.get("PATH", ""), "HOME": "/nonexistent",
-            "GIT_CONFIG_GLOBAL": engine_gitconfig()}
+            "GIT_CONFIG_GLOBAL": p}
 
 
 def can_push(t):
@@ -1869,8 +1882,15 @@ def build_engine_home(run):
             f.write(entry + "\n")
         os.chmod(p, 0o600)
         cred = f"\n[credential]\n\thelper = store --file={p}\n"
+    # safe.directory=* first: the worker prepares root-owned directories the
+    # engine's git then runs in (the mirror it clones and fetches from, and
+    # a fresh checkout, whose directory stays root's), and git would refuse
+    # them as "dubious ownership". The engine user can only steer its own
+    # checks (the checkouts were handed to it; the mirror is read-only), so
+    # this grants root nothing.
     with open(os.path.join(home, ".gitconfig"), "w") as f:
-        f.write(f"[user]\n\tname = {login}\n\temail = {email}\n"
+        f.write("[safe]\n\tdirectory = *\n"
+                f"[user]\n\tname = {login}\n\temail = {email}\n"
                 "[init]\n\tdefaultBranch = main\n[push]\n\tdefault = current" + cred + "\n")
     # codex reads its config from $HOME; the image's copy only covers /root.
     os.makedirs(os.path.join(home, ".codex"), exist_ok=True)

@@ -44,8 +44,10 @@ What they can no longer reach: the engine (the Doppio loop's shell tool, the
 CLI engines) runs as an unprivileged user, which cannot read `/agent/state`
 — the agent's config with its model API token, git token and internal token —
 nor the worker's own files (its git token included: the worker fetches
-through root-owned, engine-readable mirrors of the watched repos, so the
-engine's git in a checkout never sees it). Its HOME is rebuilt per task and
+through root-owned mirrors of the watched repos, read-only for the engine,
+so the engine's git in a checkout never sees it, and the worker's root git
+never runs in a checkout the engine may have written a hook or config
+into). Its HOME is rebuilt per task and
 removed at the end, so no credential outlives a task. Review and mention
 tasks give the engine no git token at all (the worker posts the answer
 itself, and the Doppio loop refuses its write tools there); portal messages

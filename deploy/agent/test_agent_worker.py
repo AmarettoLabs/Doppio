@@ -3,6 +3,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -23,6 +24,10 @@ import agent_worker as w  # noqa: E402
 
 # Engine HOMEs stay in the throwaway workspace, like everything else.
 w.ENGINE_HOME_ROOT = os.path.join(WS_DIR, "engine-home")
+# ... and as no engine user: the drop needs root plus the image's user, and a
+# worker without it (a dev checkout, these tests) alone touches the workspace
+# and the mirror. In the container this runs as root with the "agent" user.
+w.engine_uid_gid = lambda: None
 
 API = "https://api.github.com"
 REPO = "o/r"
@@ -1637,6 +1642,27 @@ class PrepareTaskTest(Patched):
         w.clone_url = lambda agent, repo: moved
         w.prepare_task(agent(), {"id": "t2", "kind": "assigned", "source": "github:o/r#issues:7"})
         self.assertEqual(w.root_git(mirror, "config", "--get", "remote.doppio.url"), moved)
+
+    def test_lock_down_strips_group_and_world_write(self):
+        """Root git reads the mirror's config and refs: whatever mode a
+        umask leaves them in, the engine user must not be able to write
+        there (the other assertions on uid need root: see the e2e note)."""
+        if os.geteuid() != 0:
+            self.skipTest("needs root, like the worker in the image")
+        tree = tempfile.mkdtemp(prefix="doppio-lock-")
+        self.addCleanup(shutil.rmtree, tree, True)
+        os.makedirs(os.path.join(tree, "repos", "o", "r.git", "refs", "heads"))
+        for name in ("gitconfig", os.path.join("repos", "o", "r.git", "config"),
+                     os.path.join("repos", "o", "r.git", "HEAD")):
+            with open(os.path.join(tree, name), "w") as f:
+                f.write("[core]\n")
+        w.lock_down(tree)
+        for d, dirs, files in os.walk(tree):
+            for name in dirs + files:
+                st = os.stat(os.path.join(d, name))
+                self.assertEqual(st.st_uid, 0, name)
+                self.assertFalse(st.st_mode & (stat.S_IWGRP | stat.S_IWOTH), name)
+        self.assertTrue(os.access(os.path.join(tree, "gitconfig"), os.R_OK))
 
     def test_git_in_a_checkout_runs_through_the_engine_drop(self):
         seen = []

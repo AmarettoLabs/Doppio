@@ -136,11 +136,7 @@ func parseCapAdd(s string) []string {
 // (stashes, leftovers, Vibe's home), KILL to stop its processes at the task
 // limit. Without them the worker cannot start at all. The engines get none
 // of them: they run as a non-root user and no-new-privileges keeps them
-// from gaining any. Docker's per-container bounding set keeps them, though,
-// so a process that drops to the engine user without giving up its
-// capabilities (setpriv's --bounding-set and --inh-caps) still holds them in
-// its effective set: the worker's setpriv call relies on no-new-privileges,
-// which stops any binary it starts from gaining a capability back.
+// from gaining any.
 var WorkerCaps = []string{"CHOWN", "DAC_OVERRIDE", "FOWNER", "KILL", "SETGID", "SETUID"}
 
 // hardeningArgs are the docker run options every agent container gets: every

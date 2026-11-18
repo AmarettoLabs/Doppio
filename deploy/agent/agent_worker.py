@@ -1439,7 +1439,10 @@ def prepare_task(agent, t):
             shutil.rmtree(repo_dir, ignore_errors=True)
         os.makedirs(repo_dir)
         chown_to_engine(repo_dir, recursive=False)
-        git(repo_dir, "clone", "-q", mirror, ".")
+        # --no-hardlinks: a hardlinked object is the mirror's own inode, and
+        # the next task's chown of the checkout would hand it to the engine
+        # user (where hardlinks to root's files are allowed at all).
+        git(repo_dir, "clone", "-q", "--no-hardlinks", mirror, ".")
         # Clone set origin to the mirror; pushes go to upstream with the
         # task's token, so point the remote at it again.
         git(repo_dir, "remote", "set-url", "origin", url)
@@ -2225,6 +2228,10 @@ def vibe_env(run):
                 with open(env_file, "w") as f:
                     f.write(f"MISTRAL_API_KEY={key}\n")
                 os.chmod(env_file, 0o600)
+                # Vibe runs as the engine user and reads this file at
+                # start: a root-owned 0600 file makes it die on a
+                # PermissionError. The key is in its env anyway.
+                chown_to_engine(env_file, recursive=False)
             except OSError as e:
                 run.emit("log", f"could not write {env_file}: {e}")
     if can_push(run.task) and run.agent.get("gitToken"):

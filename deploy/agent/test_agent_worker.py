@@ -901,9 +901,18 @@ class VibeEngineTest(unittest.TestCase):
         t = {"id": "t-p", "kind": "assigned", "title": "x", "input": "i",
              "source": "github:o/r#issues:7@assigned"}
         run = w.TaskRun(self.mgr, a, "sys", t, t["input"], WS_DIR)
-        env = w.vibe_env(run)
+        handed = []
+        orig_chown = w.chown_to_engine
+        w.chown_to_engine = lambda path, recursive=True: handed.append((path, recursive))
+        try:
+            env = w.vibe_env(run)
+        finally:
+            w.chown_to_engine = orig_chown
         self.assertEqual(env["MISTRAL_API_KEY"], key)
         self.assertEqual(open(os.path.join(w.VIBE_HOME, ".env")).read(), f"MISTRAL_API_KEY={key}\n")
+        # Vibe runs as the engine user and reads the file at start: a
+        # root-owned 0600 file makes it die (seen in a live container).
+        self.assertIn((os.path.join(w.VIBE_HOME, ".env"), False), handed)
         w.cleanup_engine_home(run)
         self.assertFalse(os.path.exists(os.path.join(w.VIBE_STATE, ".env")))
         # Reviews and mentions: the env var still logs the engine in, but no
@@ -1598,6 +1607,25 @@ class PrepareTaskTest(Patched):
         # The checkout did move: its engine fetched the mirror.
         self.assertEqual(w.git(repo_dir, "rev-parse", "origin/main"),
                          w.root_git(mirror, "rev-parse", "main"))
+
+    def test_checkout_is_cloned_from_the_mirror_without_hardlinks(self):
+        """A hardlinked object would be the mirror's own inode: the next
+        task's chown of the checkout would hand it to the engine user."""
+        self.use({r"/repos/o/r/issues/7": {"title": "Add CI"}, r"/repos/o/r/pulls\?.*": []})
+        cmds = []
+        orig_run = w.subprocess.run
+        def run_spy(argv, **kw):
+            cmds.append(list(argv))
+            return orig_run(argv, **kw)
+        w.subprocess.run = run_spy
+        try:
+            w.prepare_task(agent(), {"id": "t1", "kind": "assigned", "source": "github:o/r#issues:7"})
+        finally:
+            w.subprocess.run = orig_run
+        clones = [c for c in cmds if "clone" in c]
+        self.assertEqual(len(clones), 1)
+        self.assertIn("--no-hardlinks", clones[0])
+        self.assertIn(w.mirror_path("o/r"), clones[0])
 
     def test_mirror_is_redone_when_the_clone_url_changes(self):
         self.use({r"/repos/o/r/issues/7": {"title": "Add CI"}, r"/repos/o/r/pulls\?.*": []})

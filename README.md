@@ -179,18 +179,18 @@ except the six the worker needs to run engines as another user (`CHOWN`,
 `DAC_OVERRIDE`, `FOWNER`, `KILL`, `SETGID`, `SETUID`), cannot gain any, and
 runs under memory, CPU and process limits
 (`AGENT_MEMORY`/`AGENT_CPUS`/`AGENT_PIDS_LIMIT`, see Configuration; another
-capability can be handed back with `AGENT_CAP_ADD`). The engines hold none of
-them: they run as a non-root user. Inside it, only the
-worker runs privileged; every engine — the Doppio loop's shell tool, the CLIs —
-runs as an unprivileged user that cannot read the agent's own tokens in
+capability can be handed back with `AGENT_CAP_ADD`). Inside it only the
+worker runs privileged; every engine — the Doppio loop's shell tool, the CLIs
+— runs as an unprivileged user that cannot read the agent's own tokens in
 `/agent/state` and gets a per-task HOME with only what the task needs:
 reviews, mentions and portal messages no git token at all, assigned issues
 and PRs the git token to push with. The worker reads the config itself,
 updates the repository (through a root-owned, engine-readable mirror of it,
-which is the only repo the worker's own git runs in) and posts the answers. One key is necessarily in the engine's reach: a CLI engine's model
-key or login (`MISTRAL_API_KEY` for Mistral Vibe) is passed into its
-environment, so a steered CLI engine can read and spend it. Only the
-Doppio loop keeps the model key away from the engine, with the worker.
+which is the only repo the worker's own git runs in) and posts the answers.
+One key is necessarily in the engine's reach: a CLI engine's model key or
+login (`MISTRAL_API_KEY` for Mistral Vibe) is passed into its environment,
+so a steered CLI engine can read and spend it. Only the Doppio loop keeps
+the model key away from the engine, with the worker.
 
 ## Configuration
 

@@ -13,6 +13,10 @@ mention/assigned tasks this worker creates itself), run them through the
 configured LLM provider, post the reply back to the git host when the task
 came from a mention, and stream every step as an event to the manager so the
 portal can show live logs and discussions.
+
+The worker runs as root (it must read AGENT_CONFIG, mode 0600); everything the
+model steers (the shell tool, the CLI engines) runs as an unprivileged user
+that cannot read /agent/state — see the "engine user" section.
 """
 import datetime
 import json
@@ -1106,10 +1110,103 @@ MAX_LISTED_DOCS = 150
 
 
 def git(repo_dir, *args, check=True):
-    r = subprocess.run(["git", "-C", repo_dir, *args], capture_output=True, text=True, timeout=SHELL_TIMEOUT)
+    """git in a checkout, always as the engine user: after a task the
+    checkout and its .git belong to it, so the hooks, filters and config in
+    there are things the model can plant. They only ever run as the engine
+    user (the worker's own git stays in the root-owned mirrors, see
+    root_git)."""
+    r = subprocess.run(engine_argv(["git", "-C", repo_dir, *args]),
+                       capture_output=True, text=True, timeout=SHELL_TIMEOUT,
+                       env=git_env())
     if check and r.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)}: {(r.stderr or r.stdout).strip()[:500]}")
     return r.stdout.strip()
+
+
+# The worker's root git runs nowhere else than in a repo's bare mirror
+# (update_mirror below): the token-needing fetches are the point, and a
+# mirror is root-owned, so no hooks, config or anything else the engine
+# could plant is ever read by it. A checkout's .git belongs to the engine
+# user after its task (git below runs there, as the engine user), and its
+# config must never meet root: `url.*.insteadOf`, `credential.helper = !…`,
+# `include.path`, a `gitdir:` file, ... all of them make git run commands.
+MIRRORS = os.environ.get("AGENT_MIRRORS", "/agent/mirrors")
+
+
+def mirror_path(repo):
+    """Path of the repo's bare mirror: root-owned, read-only for the engine
+    user, which fetches it for its checkouts instead of the tokened
+    upstream."""
+    return os.path.join(MIRRORS, "repos", f"{repo}.git")
+
+
+def engine_gitconfig():
+    """The global config the engine user's git reads (git_env points
+    GIT_CONFIG_GLOBAL at it): worker-written, so the engine user cannot
+    change what its git honors."""
+    return os.path.join(MIRRORS, "gitconfig")
+
+
+def trust_mirror(m):
+    """Let the engine user's git read the mirror: root-owned as it is, git
+    would refuse it as a clone/fetch source ("dubious ownership"). The
+    safe.directory exception is honored only from a global config, hence
+    the worker writes it into engine_gitconfig."""
+    if engine_uid_gid() is None:
+        return  # no drop: the mirror is the same user's, nothing to allow
+    p = engine_gitconfig()
+    have = subprocess.run(["git", "config", "--file", p, "--get-all", "safe.directory"],
+                          capture_output=True, text=True)
+    if m not in have.stdout.splitlines():
+        subprocess.run(["git", "config", "--file", p, "--add", "safe.directory", m],
+                       capture_output=True, text=True, check=True)
+        os.chmod(p, 0o644)
+
+
+def root_git(mirror, *args, check=True):
+    """The worker's root git: it alone holds the git token (the credential
+    store setup_git writes). Runs in a mirror only, never in a checkout."""
+    argv = ["git", "-C", mirror, *args]
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=SHELL_TIMEOUT)
+    if check and r.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)}: {(r.stderr or r.stdout).strip()[:500]}")
+    return r.stdout.strip()
+
+
+def update_mirror(provider, repo, url, num=0):
+    """Make the repo's bare mirror hold upstream (heads, and refs/prs/<num>
+    for this item's head when set), and return the mirror with upstream's
+    default branch. Root git, in the mirror only (see root_git): the
+    checkouts are updated from the mirror by the engine user instead, so
+    they never need the git token."""
+    m = mirror_path(repo)
+    have = os.path.isdir(m)
+    if have and root_git(m, "config", "--get", "remote.doppio.url",
+                         check=False).strip().lower() != url.lower():
+        have = False  # a mirror of a former base URL: redo it
+    if not have:
+        # Only the worker (root) writes here, so a mirror built now is
+        # trusted however many tasks ran before.
+        if os.path.lexists(m) and not os.path.isdir(m):
+            os.unlink(m)
+        shutil.rmtree(m, ignore_errors=True)
+        os.makedirs(os.path.dirname(m), exist_ok=True)
+        subprocess.run(["git", "init", "-q", "--bare", m],
+                       capture_output=True, text=True, timeout=SHELL_TIMEOUT, check=True)
+        root_git(m, "config", "remote.doppio.url", url)
+    root_git(m, "fetch", "-q", "--prune", url, "+refs/heads/*:refs/heads/*")
+    if num:
+        pr = f"refs/merge-requests/{num}/head" if provider == "gitlab" else f"refs/pull/{num}/head"
+        root_git(m, "fetch", "-q", url, f"+{pr}:refs/prs/{num}")
+    base = "main"
+    m_ = re.search(r"ref:\s*refs/heads/(\S+)",
+                   root_git(m, "ls-remote", "--symref", url, "HEAD", check=False))
+    if m_:
+        base = m_.group(1)
+    # So a fresh clone from the mirror checks out the default branch.
+    root_git(m, "symbolic-ref", "HEAD", f"refs/heads/{base}")
+    trust_mirror(m)
+    return m, base
 
 
 def clone_url(agent, repo):
@@ -1153,12 +1250,13 @@ def open_pr_for_branch(agent, repo, branch):
 
 def checkout_branch(repo_dir, branch, default):
     """Check out branch: the local one if any, else the remote one, else a
-    new one from origin/default."""
+    new one from origin/default. Runs as the engine user (see git); the
+    remote-tracking refs come from the fetch prepare_task just did."""
     if git(repo_dir, "branch", "--list", branch):
         git(repo_dir, "checkout", branch)
-        if git(repo_dir, "ls-remote", "--heads", "origin", branch):
+        if git(repo_dir, "rev-parse", "--quiet", "--verify", f"refs/remotes/origin/{branch}", check=False):
             git(repo_dir, "merge", "--ff-only", f"origin/{branch}", check=False)
-    elif git(repo_dir, "ls-remote", "--heads", "origin", branch):
+    elif git(repo_dir, "rev-parse", "--quiet", "--verify", f"refs/remotes/origin/{branch}", check=False):
         git(repo_dir, "checkout", "-b", branch, "--track", f"origin/{branch}")
     else:
         git(repo_dir, "checkout", "-b", branch, f"origin/{default}")
@@ -1172,8 +1270,8 @@ def fast_forward_default(repo_dir, base):
         return
     if git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD", check=False) == base:
         git(repo_dir, "merge", "--ff-only", "-q", f"origin/{base}", check=False)
-    elif subprocess.run(["git", "-C", repo_dir, "merge-base", "--is-ancestor", base, f"origin/{base}"],
-                        capture_output=True, timeout=SHELL_TIMEOUT).returncode == 0:
+    elif subprocess.run(engine_argv(["git", "-C", repo_dir, "merge-base", "--is-ancestor", base, f"origin/{base}"]),
+                        capture_output=True, timeout=SHELL_TIMEOUT, env=git_env()).returncode == 0:
         git(repo_dir, "update-ref", f"refs/heads/{base}", f"origin/{base}", check=False)
 
 
@@ -1315,24 +1413,50 @@ def repo_path(agent, repo):
 def prepare_task(agent, t):
     """Clone/fetch the task's repository, check out what the trigger needs
     and return the playbook + workspace + guidance text that goes before
-    the task input."""
+    the task input. The worker's git runs as root in the repo's bare mirror
+    only (update_mirror); everything that touches a checkout runs as the
+    engine user, so no hook or config the engine planted in .git ever runs
+    as root."""
     trigger = task_trigger(t)
     provider, repo, kind, num = parse_source(t["source"])
     repo_dir = repo_path(agent, repo)
-    if not os.path.isdir(os.path.join(repo_dir, ".git")):
+    url = clone_url(agent, repo)
+    need_head = trigger in ("review_requests", "assigned_prs") or (trigger == "mentions" and kind != "issues")
+    mirror, base = update_mirror(provider, repo, url, num if need_head else 0)
+    # From here on the checkout is the engine user's: git in it (hooks,
+    # filters, config included) runs as the engine user too.
+    chown_to_engine(repo_dir)
+    if os.path.isdir(os.path.join(repo_dir, ".git")):
+        git(repo_dir, "fetch", "-q", "--prune", mirror, "+refs/heads/*:refs/remotes/origin/*")
+    else:
+        # A brand-new checkout: whatever sits at the path is engine junk
+        # (the engine user owns the workspace root), so make it empty and
+        # let the engine user clone the mirror - no token to be had there.
         os.makedirs(os.path.dirname(repo_dir), exist_ok=True)
-        r = subprocess.run(["git", "clone", "-q", clone_url(agent, repo), repo_dir],
-                           capture_output=True, text=True, timeout=SHELL_TIMEOUT)
-        if r.returncode != 0:
-            raise RuntimeError(f"git clone {repo}: {r.stderr.strip()[:500]}")
-    git(repo_dir, "fetch", "-q", "--prune", "origin")
-    git(repo_dir, "remote", "set-head", "origin", "--auto", check=False)
-    base = git(repo_dir, "symbolic-ref", "--short", "refs/remotes/origin/HEAD", check=False).removeprefix("origin/") or "main"
+        if os.path.lexists(repo_dir) and not os.path.isdir(repo_dir):
+            os.unlink(repo_dir)
+        else:
+            shutil.rmtree(repo_dir, ignore_errors=True)
+        os.makedirs(repo_dir)
+        chown_to_engine(repo_dir, recursive=False)
+        # --no-hardlinks: a hardlinked object is the mirror's own inode, and
+        # the next task's chown of the checkout would hand it to the engine
+        # user (where hardlinks to root's files are allowed at all).
+        git(repo_dir, "clone", "-q", "--no-hardlinks", mirror, ".")
+        # Clone set origin to the mirror; pushes go to upstream with the
+        # task's token, so point the remote at it again.
+        git(repo_dir, "remote", "set-url", "origin", url)
+    if need_head:
+        git(repo_dir, "fetch", "-q", mirror, f"refs/prs/{num}")  # FETCH_HEAD for this item's head
+    git(repo_dir, "symbolic-ref", "refs/remotes/origin/HEAD", f"refs/remotes/origin/{base}", check=False)
     if git(repo_dir, "status", "--porcelain"):
         # Leftovers from an earlier task: keep them in a stash, start clean.
-        git(repo_dir, "stash", "push", "-u", "-m", f"doppio: leftovers before task {t['id']}")
+        # The engine user's git has no global config: pass the identity along.
+        login = normalize_login(agent.get("gitLogin")) or "agent"
+        email = (agent.get("emails") or [f"{login}@users.noreply.github.com"])[0]
+        git(repo_dir, "-c", f"user.name={login}", "-c", f"user.email={email}",
+            "stash", "push", "-u", "-m", f"doppio: leftovers before task {t['id']}")
     fast_forward_default(repo_dir, base)
-    pr_ref = f"merge-requests/{num}/head" if provider == "gitlab" else f"pull/{num}/head"
     # A CLI engine has no create_pr tool: its playbook opens the PR with gh/glab.
     cli = (agent.get("engine") or "doppio") != "doppio"
     pr_line = CLI_PR_LINE if cli else ("open one with create_pr (repo {repo}, head `{branch}`, base "
@@ -1342,7 +1466,6 @@ def prepare_task(agent, t):
     if trigger == "review_requests" or (trigger == "mentions" and kind != "issues"):
         item = fetch_item(agent, repo, kind, num)
         vars_["base"] = (item.get("base") or {}).get("ref") or item.get("target_branch") or base
-        git(repo_dir, "fetch", "-q", "origin", pr_ref)
         git(repo_dir, "checkout", "-q", "--detach", "FETCH_HEAD")
     elif trigger == "assigned_issues":
         item = fetch_item(agent, repo, kind, num)
@@ -1361,7 +1484,6 @@ def prepare_task(agent, t):
             head_repo = "a fork"
         vars_["base"] = (item.get("base") or {}).get("ref") or item.get("target_branch") or base
         if head_repo.lower() != repo.lower():
-            git(repo_dir, "fetch", "-q", "origin", pr_ref)
             git(repo_dir, "checkout", "-q", "-B", branch or f"pr-{num}", "FETCH_HEAD")
             vars_["fork"] = (f" It comes from {head_repo}, so you cannot push to it: "
                              "describe the changes needed in your answer instead.")
@@ -1393,9 +1515,9 @@ SHELL_TIMEOUT = 300
 TOOL_DEFS = {
     "shell": {
         "name": "shell",
-        "description": "Run a shell command in /agent/workspace (git is preconfigured with "
-                       "your credentials; for git tasks the repository is already cloned and "
-                       "checked out under repos/<name>, see the task — do NOT clone again).",
+        "description": "Run a shell command in /agent/workspace (the task says what git "
+                       "credentials it comes with; for git tasks the repository is already "
+                       "cloned and checked out under repos/<name>, see the task — do NOT clone again).",
         "parameters": {
             "type": "object",
             "properties": {
@@ -1450,7 +1572,7 @@ TOOL_DEFS = {
 TOOL_SPEC = """You can act with tools. Each turn, reply with EITHER:
 - a final plain-text answer (no JSON block), or
 - exactly one tool call in a ```json fenced block:
-  {"tool":"shell","command":"..."}                     run a shell command in /agent/workspace (git is preconfigured with your credentials; for git tasks the repository is already cloned and checked out under repos/<name>, see the task — do NOT clone again)
+  {"tool":"shell","command":"..."}                     run a shell command in /agent/workspace (the task says what git credentials it comes with; for git tasks the repository is already cloned and checked out under repos/<name>, see the task — do NOT clone again)
   {"tool":"read_file","path":"...","start_line":1,"end_line":400}   read a file under /agent/workspace (lines optional; long files are shown in parts)
   {"tool":"write_file","path":"...","content":"..."}   write a file under /agent/workspace
   {"tool":"create_pr","repo":"owner/repo","head":"your-branch","base":"main","title":"...","body":"..."}
@@ -1498,27 +1620,40 @@ def parse_tool_call(text):
 
 
 def setup_git(agent):
-    """Configure git identity + credential store inside the workspace."""
-    if not agent.get("gitToken"):
-        return
+    """Configure git identity + credential store for the WORKER (root), whose
+    own fetches need the token (it alone uses root_git; anything in a
+    checkout runs as the engine user). The store lives in the worker's home,
+    not the workspace: the engine user could read it there. Engines get
+    per-task credentials instead (see engine_env)."""
+    os.makedirs(WS, exist_ok=True)
     login = normalize_login(agent.get("gitLogin")) or "agent"
     email = (agent.get("emails") or [f"{login}@users.noreply.github.com"])[0]
-    os.makedirs(WS, exist_ok=True)
-    cred = os.path.join(WS, ".git-credentials")
-    tok = agent["gitToken"]
-    entries = []
-    if agent.get("gitProvider") == "github":
-        entries.append(f"https://x-access-token:{tok}@github.com")
-    elif agent.get("gitProvider") == "gitlab":
-        host = urllib.parse.urlparse(agent.get("gitBaseURL") or "https://gitlab.com").netloc
-        entries.append(f"https://oauth2:{tok}@{host}")
-    if entries:
-        with open(cred, "w") as f:
-            f.write("\n".join(entries) + "\n")
-        os.chmod(cred, 0o600)
-    for k, v in (("user.name", login), ("user.email", email),
-                 ("credential.helper", f"store --file={cred}"),
-                 ("init.defaultBranch", "main"), ("push.default", "current")):
+    cred = os.path.expanduser("~/.git-credentials")
+    # Without a token there is nothing to configure for fetches, and
+    # credential.helper = store would only gain an empty file on first use.
+    pairs = [
+        ("init.defaultBranch", "main"), ("push.default", "current"),
+    ]
+    if agent.get("gitToken"):
+        # A store left in the workspace by an older worker: remove it now that
+        # the engine could otherwise end up reading it.
+        legacy = os.path.join(WS, ".git-credentials")
+        if os.path.exists(legacy):
+            os.remove(legacy)
+        tok = agent["gitToken"]
+        entries = []
+        if agent.get("gitProvider") == "github":
+            entries.append(f"https://x-access-token:{tok}@github.com")
+        elif agent.get("gitProvider") == "gitlab":
+            host = urllib.parse.urlparse(agent.get("gitBaseURL") or "https://gitlab.com").netloc
+            entries.append(f"https://oauth2:{tok}@{host}")
+        if entries:
+            with open(cred, "w") as f:
+                f.write("\n".join(entries) + "\n")
+            os.chmod(cred, 0o600)
+        pairs = [("user.name", login), ("user.email", email),
+                 ("credential.helper", f"store --file={cred}"), *pairs]
+    for k, v in pairs:
         subprocess.run(["git", "config", "--global", k, v], check=False)
 
 
@@ -1565,16 +1700,18 @@ def read_file_part(path, start=None, end=None):
     return text
 
 
-def execute_tool(agent, name, args):
+def execute_tool(run, name, args):
+    agent = run.agent
     name = TOOL_ALIASES.get(name, name)
+    if run.readonly and name in ("write_file", "create_pr"):
+        return (f"{name} is not available for this task: reviews and mentions answer only, "
+                "they never change code or open pull requests")
     if name == "shell":
         cmd = args.get("command", "")
         if not cmd.strip():
             return "empty command"
-        env = dict(os.environ)
-        env["GIT_TOKEN"] = agent.get("gitToken") or ""
         try:
-            r = subprocess.run(cmd, shell=True, cwd=WS, env=env,
+            r = subprocess.run(engine_argv(["sh", "-c", cmd]), cwd=WS, env=engine_env(run),
                                capture_output=True, text=True, timeout=SHELL_TIMEOUT)
             out = (r.stdout + r.stderr).strip()
             return f"exit={r.returncode}\n{out[:4000]}"
@@ -1584,9 +1721,16 @@ def execute_tool(agent, name, args):
         return read_file_part(ws_path(args.get("path", "")), args.get("start_line"), args.get("end_line"))
     if name == "write_file":
         p = ws_path(args.get("path", ""))
-        os.makedirs(os.path.dirname(p), exist_ok=True)
+        d = os.path.dirname(p)
+        os.makedirs(d, exist_ok=True)
         with open(p, "w") as f:
             f.write(args.get("content", ""))
+        # The engine's shell edits these too: hand the file over wherever it
+        # landed, and its new directory too - unless that is the workspace
+        # itself, which is never recursively chowned (see chown_to_engine).
+        chown_to_engine(p, recursive=False)
+        if d != WS:
+            chown_to_engine(d)
         return f"wrote {len(args.get('content', ''))} bytes to {args.get('path')}"
     if name == "create_pr":
         repo = normalize_repo(args.get("repo", ""))
@@ -1622,6 +1766,167 @@ class TaskTimeout(Exception):
     pass
 
 
+# ---------- the engine user ----------
+#
+# The worker runs as root: it has to read /agent/state, where the manager
+# mounts the agent's config and credentials (mode 0600). Everything the model
+# can steer - the Doppio loop's shell tool, the CLI engines - runs as the
+# unprivileged user the image ships, which cannot read that directory or any
+# other root-owned file. Each engine process gets a fresh per-task HOME
+# (built by build_engine_home) holding only what the task needs.
+
+# The user deploy/Dockerfile.agent creates; its uid/gid (1000/1000) is what
+# setpriv and chown pass on.
+ENGINE_USER = "agent"
+# Where the per-task engine HOMEs live: scratch the engine may put anything
+# in, removed when the task ends.
+ENGINE_HOME_ROOT = "/tmp/doppio-engine"
+
+
+def engine_uid_gid():
+    """(uid, gid) of the engine user, when the worker can drop to it: it runs
+    as root, the user exists and setpriv is there for the drop. None leaves
+    engine processes at the worker's own user (the tests, a dev checkout, an
+    image from before the user was added)."""
+    if os.geteuid() != 0 or not shutil.which("setpriv"):
+        return None
+    try:
+        import pwd
+        pw = pwd.getpwnam(ENGINE_USER)
+    except (ImportError, KeyError):
+        return None
+    return pw.pw_uid, pw.pw_gid
+
+
+def engine_argv(argv):
+    """argv to run a command as the engine user (plain argv when the worker
+    cannot drop)."""
+    ids = engine_uid_gid()
+    if ids is None:
+        return argv
+    return ["setpriv", f"--reuid={ids[0]}", f"--regid={ids[1]}", "--init-groups",
+            "--", *argv]
+
+
+def chown_to_engine(path, recursive=True):
+    """Give the engine user ownership of path (and below, unless recursive is
+    False), so what the worker prepared as root works for it. Never recursive
+    over the workspace itself: root-owned files there (the worker's own
+    credential store) must stay unreadable to the engine. No-op unless the
+    worker drops privileges."""
+    ids = engine_uid_gid()
+    if ids is None:
+        return
+    if recursive:
+        # -h: a checkout may hold symlinks the engine user planted; following
+        # them would hand root files (its .git-credentials...) to the engine.
+        subprocess.run(["chown", "-R", "-h", f"{ids[0]}:{ids[1]}", path],
+                       capture_output=True, timeout=SHELL_TIMEOUT)
+    else:
+        os.chown(path, ids[0], ids[1])
+
+
+def git_env():
+    """The environment for engine-user git. With the drop, the worker's own
+    HOME is unreadable to it and git would die on /root/.gitconfig; this is
+    its global config instead, with the safe.directory exceptions for the
+    root-owned mirrors (see trust_mirror). Without the drop (tests, a dev
+    checkout) the worker's own environment is kept."""
+    if engine_uid_gid() is None:
+        return None
+    return {"PATH": os.environ.get("PATH", ""), "HOME": "/nonexistent",
+            "GIT_CONFIG_GLOBAL": engine_gitconfig()}
+
+
+def can_push(t):
+    """Whether the task's engine gets the git token: implementation work the
+    owner assigned (issues and PRs) only. The worker posts reviews and
+    mention answers itself, so their engine holds no token at all."""
+    return t.get("kind") == "assigned" and bool(t.get("source"))
+
+
+def build_engine_home(run):
+    """The per-task HOME the engine runs with: the git identity and build
+    caches config, codex's update check off, vibe's persistent home, and -
+    only when the task may push - the git credentials. Removed when the task
+    ends (cleanup_engine_home), so no credential outlives its task."""
+    agent = run.agent
+    login = normalize_login(agent.get("gitLogin")) or "agent"
+    email = (agent.get("emails") or [f"{login}@users.noreply.github.com"])[0]
+    home = os.path.join(ENGINE_HOME_ROOT,
+                        re.sub(r"[^A-Za-z0-9._-]", "-", str(run.task.get("id") or "run")))
+    os.makedirs(home, exist_ok=True)
+    cred = ""
+    if can_push(run.task) and agent.get("gitToken"):
+        tok = agent["gitToken"]
+        if agent.get("gitProvider") == "gitlab":
+            host = urllib.parse.urlparse(agent.get("gitBaseURL") or "https://gitlab.com").netloc
+            entry = f"https://oauth2:{tok}@{host}"
+        else:
+            entry = f"https://x-access-token:{tok}@github.com"
+        p = os.path.join(home, ".git-credentials")
+        with open(p, "w") as f:
+            f.write(entry + "\n")
+        os.chmod(p, 0o600)
+        cred = f"\n[credential]\n\thelper = store --file={p}\n"
+    with open(os.path.join(home, ".gitconfig"), "w") as f:
+        f.write(f"[user]\n\tname = {login}\n\temail = {email}\n"
+                "[init]\n\tdefaultBranch = main\n[push]\n\tdefault = current" + cred + "\n")
+    # codex reads its config from $HOME; the image's copy only covers /root.
+    os.makedirs(os.path.join(home, ".codex"), exist_ok=True)
+    with open(os.path.join(home, ".codex", "config.toml"), "w") as f:
+        f.write("check_for_update_on_startup = false\n")
+    # Vibe keeps its home in the workspace; link it into this task's HOME.
+    link = os.path.join(home, ".vibe")
+    if not os.path.lexists(link):
+        os.symlink(VIBE_STATE, link)
+    chown_to_engine(home)
+    return home
+
+
+def cleanup_engine_home(run):
+    """Remove the task's engine home, credentials included: a later task (a
+    review, say) must not find an earlier task's token there."""
+    home = getattr(run, "_home", None)
+    if home:
+        shutil.rmtree(home, ignore_errors=True)
+        run._home = None
+    # The key file vibe_env writes into Vibe's shared home goes with the
+    # task too: it is handed back through the env var on the next one.
+    try:
+        os.remove(os.path.join(VIBE_STATE, ".env"))
+    except OSError:
+        pass
+
+
+# What the engine inherits from the worker's environment: a whitelist, so a
+# secret that happens to sit there (now or by some later change) never
+# reaches a steered shell - the token a task needs is added back explicitly
+# by engine_env (git) and vibe_env (gh, glab, the account key). The CA
+# variables are set by setup_extra_ca; engines need them for git, the API
+# host and the Node-based CLIs.
+ENGINE_ENV_ALLOW = ("PATH", "HOME", "LANG", "TERM", "TZ", "TMPDIR",
+                    "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+                    "GIT_SSL_CAINFO", "NODE_EXTRA_CA_CERTS",
+                    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+                    "http_proxy", "https_proxy", "no_proxy")
+
+
+def engine_env(run):
+    """The environment for the engine's processes: HOME is the per-task dir,
+    nothing outside ENGINE_ENV_ALLOW comes through from the worker's own
+    environment, and the git token is added only where the task may push."""
+    env = {k: v for k, v in os.environ.items() if k in ENGINE_ENV_ALLOW or k.startswith("LC_")}
+    env["HOME"] = run.engine_home()
+    cache = os.path.join(WS, ".cache")
+    env.setdefault("GOCACHE", os.path.join(cache, "go-build"))
+    env.setdefault("GOPATH", os.path.join(cache, "go"))
+    env.setdefault("NPM_CONFIG_CACHE", os.path.join(cache, "npm"))
+    if can_push(run.task) and run.agent.get("gitToken"):
+        env["GIT_TOKEN"] = run.agent["gitToken"]
+    return env
+
+
 class EngineResult:
     def __init__(self, outcome, answer="", error=""):
         self.outcome = outcome
@@ -1646,6 +1951,17 @@ class TaskRun:
         self.deadline = time.monotonic() + self.minutes * 60
         max_turns = agent.get("maxTurns") or DEFAULT_MAX_TURNS
         self.max_turns = None if max_turns < 0 else max_turns  # None: until the context limit
+        # Reviews and mentions answer only: their engine has no git token and
+        # the Doppio loop refuses its write tools (see execute_tool).
+        self.readonly = task.get("kind") in ("review", "mention")
+        self._home = None  # the per-task engine HOME, built on demand
+
+    def engine_home(self):
+        """The per-task HOME for the engine (identity, credentials only when
+        the task may push); see build_engine_home."""
+        if self._home is None:
+            self._home = build_engine_home(self)
+        return self._home
 
     def emit(self, type_, content):
         self.mgr.emit(type_, content, task_id=self.task["id"])
@@ -1659,13 +1975,14 @@ class TaskRun:
 
 
 def run_process(run, argv, stdin_text="", env=None, on_line=None, cwd=None):
-    """Run an engine's process in the task's directory, feeding stdin_text and
-    handing each stdout line to on_line. The process (and its children) is
-    killed at the task's time limit, raising TaskTimeout. Returns
-    (exit code, last lines of stderr)."""
+    """Run an engine's process in the task's directory, as the engine user,
+    feeding stdin_text and handing each stdout line to on_line. The process
+    (and its children) is killed at the task's time limit, raising
+    TaskTimeout. Returns (exit code, last lines of stderr)."""
     import signal
     import threading
-    proc = subprocess.Popen(argv, cwd=cwd or run.workdir, env=env, text=True, start_new_session=True,
+    proc = subprocess.Popen(engine_argv(argv), cwd=cwd or run.workdir, env=env, text=True,
+                            start_new_session=True,
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     err_tail = []
 
@@ -1753,7 +2070,7 @@ def doppio_engine(run):
                 name, args = call
                 run.emit("action", f"$ {name} {json.dumps(args)[:300]}")
                 try:
-                    result = execute_tool(run.agent, name, args)
+                    result = execute_tool(run, name, args)
                 except Exception as e:
                     result = f"tool error: {type(e).__name__}: {e}"
                 run.emit("log", f"→ {result[:1500]}")
@@ -1785,7 +2102,7 @@ def doppio_engine(run):
             for cid, name, args in reply.calls:
                 run.emit("action", f"$ {name} {json.dumps(args)[:300]}")
                 try:
-                    out = execute_tool(run.agent, name, args)
+                    out = execute_tool(run, name, args)
                 except Exception as e:
                     out = f"tool error: {type(e).__name__}: {e}"
                 run.emit("log", f"→ {out[:1500]}")
@@ -1824,7 +2141,7 @@ def doppio_engine(run):
         bad = 0
         run.emit("action", f"$ {name} {json.dumps(args)[:300]}")
         try:
-            result = execute_tool(run.agent, name, args)
+            result = execute_tool(run, name, args)
         except Exception as e:
             result = f"tool error: {type(e).__name__}: {e}"
         run.emit("log", f"→ {result[:1500]}")
@@ -1853,6 +2170,14 @@ def persist_vibe_home():
     """Make ~/.vibe a link to VIBE_STATE. The image's fresh ~/.vibe is merged
     in first: its config.toml (update checks off) replaces the stored one,
     other files only fill gaps."""
+    # A key file a crashed task left behind must not reach the engine: this
+    # runs even when the link is already in place (then only the chown
+    # below would run and hand it over), and the key comes back per task
+    # through the env var anyway (see vibe_env).
+    try:
+        os.remove(os.path.join(VIBE_STATE, ".env"))
+    except OSError:
+        pass
     if os.path.islink(VIBE_HOME) and os.path.realpath(VIBE_HOME) == os.path.realpath(VIBE_STATE):
         return
     os.makedirs(VIBE_STATE, exist_ok=True)
@@ -1868,6 +2193,8 @@ def persist_vibe_home():
     elif os.path.lexists(VIBE_HOME):
         os.remove(VIBE_HOME)
     os.symlink(VIBE_STATE, VIBE_HOME)
+    # The engine user writes session journals and caches there.
+    chown_to_engine(VIBE_STATE)
 
 
 def vibe_model_alias(agent):
@@ -1879,25 +2206,35 @@ def vibe_model_alias(agent):
 
 
 def vibe_env(run):
-    """The environment for the vibe process: the account's key where Vibe
-    looks for it, and the git credentials for gh/glab. Vibe keeps its own
-    home (~/.vibe), outside the repository."""
-    env = dict(os.environ)
+    """The environment for the vibe process, on top of engine_env (per-task
+    HOME, no agent secrets, git token only when the task may push): the
+    account's key where Vibe looks for it in turn, and the git credentials
+    for gh/glab on tasks that may push. Vibe keeps its own home (~/.vibe),
+    outside the repository."""
+    env = engine_env(run)
     key = run.agent.get("accountToken") or run.agent.get("apiToken") or ""
     if key:
-        # Vibe reads MISTRAL_API_KEY from the environment first and from
-        # ~/.vibe/.env otherwise; write it there too, the way `vibe --setup`
-        # saves a login, so a key Vibe itself asks for is the same one.
-        os.makedirs(VIBE_HOME, exist_ok=True)
-        env_file = os.path.join(VIBE_HOME, ".env")
-        try:
-            with open(env_file, "w") as f:
-                f.write(f"MISTRAL_API_KEY={key}\n")
-            os.chmod(env_file, 0o600)
-        except OSError as e:
-            run.emit("log", f"could not write {env_file}: {e}")
+        # The engine gets the key through env["MISTRAL_API_KEY"] (Vibe reads
+        # it from the environment first); ~/.vibe/.env is the way
+        # `vibe --setup` saves a login. Written only on tasks that may push
+        # and removed when the task ends (cleanup_engine_home): the file
+        # lives in Vibe's shared home, which the engine user owns, so a
+        # steered review shell must never find a key there.
         env["MISTRAL_API_KEY"] = key
-    if run.agent.get("gitToken"):
+        if can_push(run.task):
+            os.makedirs(VIBE_HOME, exist_ok=True)
+            env_file = os.path.join(VIBE_HOME, ".env")
+            try:
+                with open(env_file, "w") as f:
+                    f.write(f"MISTRAL_API_KEY={key}\n")
+                os.chmod(env_file, 0o600)
+                # Vibe runs as the engine user and reads this file at
+                # start: a root-owned 0600 file makes it die on a
+                # PermissionError. The key is in its env anyway.
+                chown_to_engine(env_file, recursive=False)
+            except OSError as e:
+                run.emit("log", f"could not write {env_file}: {e}")
+    if can_push(run.task) and run.agent.get("gitToken"):
         env["GH_TOKEN"] = run.agent["gitToken"]
         env["GITLAB_TOKEN"] = run.agent["gitToken"]
     return env
@@ -2065,6 +2402,9 @@ def vibe_engine(run):
         # The persona and standing task go in the prompt, not in
         # --system-prompt-file: that flag replaces Vibe's own instructions.
         f.write((run.system or "").strip() + "\n\n" + run.prompt)
+    # The engine reads the prompt but does not get the run dir itself: only
+    # the export dirs are handed over (non-recursively, see the attempts).
+    os.chmod(prompt_file, 0o644)
     try:
         persist_vibe_home()
     except OSError as e:
@@ -2109,6 +2449,7 @@ def vibe_warmup(run, run_dir):
     let any tool call act on the repository), with a short time limit."""
     out_dir = os.path.join(run_dir, "out-warmup")
     os.makedirs(out_dir, exist_ok=True)
+    chown_to_engine(out_dir, recursive=False)  # the engine user writes the export there
     prompt_file = os.path.join(run_dir, "warmup.md")
     with open(prompt_file, "w") as f:
         f.write(WARMUP_PROMPT + "\n")
@@ -2129,6 +2470,7 @@ def vibe_attempt(run, prompt_file, out_dir, model):
     """One vibe process: streams its output to the portal and returns (exit
     code, stderr tail, final answer, export)."""
     os.makedirs(out_dir, exist_ok=True)
+    chown_to_engine(out_dir, recursive=False)  # the engine user writes the export there
     argv = vibe_argv(run, prompt_file, out_dir, model)
     run.emit("log", "running: " + " ".join(argv))
     answer = ""
@@ -2220,6 +2562,8 @@ def run_task(mgr, agent, system, t):
         res = EngineResult("error", error=str(e))
     except Exception as e:
         res = EngineResult("error", error=f"{type(e).__name__}: {e}")
+    finally:
+        cleanup_engine_home(run)  # credentials included: no token outlives its task
     if res.outcome != "done":
         mgr.emit("error", res.error or f"task {res.outcome}", task_id=tid)
         mgr.finish(tid, "failed", error=res.error or res.outcome)
@@ -2297,6 +2641,19 @@ def main():
     agent = apply_account(cfg["agent"], load_account())
     mgr = Manager(cfg)
     os.makedirs(WS, exist_ok=True)
+    # The engine user works here: it may create scratch and caches, but must
+    # not read the root-owned files (strictly not recursive, see
+    # chown_to_engine). Older workspaces already have its caches.
+    chown_to_engine(WS, recursive=False)
+    # The engine's build caches live under the workspace. vibe-runs stays
+    # root's (its prompts too): only each run's export dir is handed over.
+    cache = os.path.join(WS, ".cache")
+    if os.path.isdir(cache):
+        chown_to_engine(cache)
+    # A worker killed mid-task leaves per-task engine homes - credentials
+    # included - behind: start from none.
+    shutil.rmtree(ENGINE_HOME_ROOT, ignore_errors=True)
+    os.makedirs(ENGINE_HOME_ROOT, exist_ok=True)
     state_path = os.path.join(WS, "worker-state.json")
     state = {}
     if os.path.exists(state_path):

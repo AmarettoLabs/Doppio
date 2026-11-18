@@ -174,6 +174,24 @@ Each task has a time limit (30 minutes by default, set per agent). A task
 still running then is stopped and retried at a later git check, like other
 infrastructure failures.
 
+The agent's container is the sandbox, hardened: it drops every capability
+except the six the worker needs to run engines as another user (`CHOWN`,
+`DAC_OVERRIDE`, `FOWNER`, `KILL`, `SETGID`, `SETUID`), cannot gain any, and
+runs under memory, CPU and process limits
+(`AGENT_MEMORY`/`AGENT_CPUS`/`AGENT_PIDS_LIMIT`, see Configuration; another
+capability can be handed back with `AGENT_CAP_ADD`). The engines hold none of
+them: they run as a non-root user. Inside it, only the
+worker runs privileged; every engine — the Doppio loop's shell tool, the CLIs —
+runs as an unprivileged user that cannot read the agent's own tokens in
+`/agent/state` and gets a per-task HOME with only what the task needs:
+reviews, mentions and portal messages no git token at all, assigned issues
+and PRs the git token to push with. The worker reads the config itself,
+updates the repository (through a root-owned mirror of it) and posts the
+answers. One key is necessarily in the engine's reach: a CLI engine's model
+key or login (`MISTRAL_API_KEY` for Mistral Vibe) is passed into its
+environment, so a steered CLI engine can read and spend it. Only the
+Doppio loop keeps the model key away from the engine, with the worker.
+
 ## Configuration
 
 Manager environment variables:
@@ -191,6 +209,10 @@ Manager environment variables:
 | `DOCKER_BIN` | `docker` | Docker CLI binary |
 | `AGENT_EXTRA_HOSTS` | _(empty)_ | Comma-separated `name:ip` entries added to every agent's `/etc/hosts` |
 | `AGENT_CA_BUNDLE` | _(empty)_ | PEM file of extra CA certificates agents trust, on top of the system ones |
+| `AGENT_MEMORY` | `4g` | Memory limit per agent container (docker `--memory` syntax; empty = no limit) |
+| `AGENT_CPUS` | `2` | CPU limit per agent container (docker `--cpus` syntax; empty = no limit) |
+| `AGENT_PIDS_LIMIT` | `512` | Process limit per agent container (docker `--pids-limit`; empty = no limit) |
+| `AGENT_CAP_ADD` | _(empty)_ | Capabilities given back to agent containers on top of the worker's six; all others are dropped |
 
 ### Local / self-hosted model servers
 

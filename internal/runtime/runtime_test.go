@@ -100,6 +100,42 @@ func TestWriteCABundle(t *testing.T) {
 	}
 }
 
+// TestHardeningArgs pins the docker run options every agent container gets:
+// all capabilities dropped but the worker's own (WorkerCaps, which the
+// privilege drop to the engine user needs) plus CapAdd, no way to gain
+// privileges, and configurable resource limits.
+func TestHardeningArgs(t *testing.T) {
+	base := []string{"--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+		"--cap-add", "CHOWN", "--cap-add", "DAC_OVERRIDE", "--cap-add", "FOWNER",
+		"--cap-add", "KILL", "--cap-add", "SETGID", "--cap-add", "SETUID"}
+	r := &Runtime{}
+	if got := r.hardeningArgs(); !reflect.DeepEqual(got, base) {
+		t.Fatalf("a bare runtime must drop all caps but the worker's and allow no new privileges:\n got %v\nwant %v", got, base)
+	}
+	r = &Runtime{CapAdd: []string{"SYS_PTRACE"}, Memory: "2g", CPUs: "4", PIDsLimit: "256"}
+	want := append(append([]string{}, base...), "--cap-add", "SYS_PTRACE",
+		"--memory", "2g", "--cpus", "4", "--pids-limit", "256")
+	if got := r.hardeningArgs(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("with caps and limits:\n got %v\nwant %v", got, want)
+	}
+	// An empty limit is skipped, not passed empty to docker.
+	r = &Runtime{Memory: "2g"}
+	if got := r.hardeningArgs(); strings.Join(got, " ") != strings.Join(base, " ")+" --memory 2g" {
+		t.Fatalf("empty limits must be skipped: %v", got)
+	}
+}
+
+func TestParseCapAdd(t *testing.T) {
+	if got, want := parseCapAdd(" SYS_PTRACE,\nNET_RAW\t,"), []string{"SYS_PTRACE", "NET_RAW"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for _, bad := range []string{"", "   ", ","} {
+		if got := parseCapAdd(bad); got != nil {
+			t.Errorf("%q: expected nil, got %v", bad, got)
+		}
+	}
+}
+
 func TestWriteAccount(t *testing.T) {
 	dir := t.TempDir()
 	r := &Runtime{DataDir: dir}

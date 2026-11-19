@@ -2626,6 +2626,11 @@ def qwen_outcome(code, result, err_tail):
     caller checks the answer is usable), turn limit -> "failed", usage
     limit -> "limit", everything else that broke around the task (crash,
     network, auth) -> "error" (both retried at a later git check)."""
+    # Success is decided first: a result frame with is_error false and exit 0
+    # is done whatever stderr says - a 429 qwen retried along the way is not
+    # a usage limit, and "limit" would drop the answer and re-run the task.
+    if result is not None and not result.get("is_error") and code == 0:
+        return "done", ""
     msg = ((result or {}).get("error") or {}).get("message") or ""
     if not msg and err_tail.strip():
         msg = err_tail.strip().splitlines()[-1][:300]

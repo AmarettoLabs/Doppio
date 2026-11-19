@@ -1146,6 +1146,15 @@ class QwenEngineTest(unittest.TestCase):
                 if want != "done":
                     self.assertTrue(res.error, (frames, code))
 
+    def test_a_finished_run_is_done_whatever_stderr_says(self):
+        # qwen retried a 429 on the way but finished fine: "limit" would
+        # drop the answer and re-run the whole task.
+        ok = {"type": "result", "subtype": "success", "is_error": False,
+              "result": "Done.", "num_turns": 2}
+        self.assertEqual(w.qwen_outcome(0, ok, "[API Error: 429 Too Many Requests] retrying in 2s"),
+                         ("done", ""))
+        self.assertEqual(w.qwen_outcome(0, ok, "quota exceeded for this account"), ("done", ""))
+
     def test_error_message_from_result_then_stderr(self):
         self.fake(qwen_frames(qwen_result(error="connection refused")), 2)
         res, _, _ = qwen_run(self.mgr, self.tmp)

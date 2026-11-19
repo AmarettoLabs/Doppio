@@ -2501,7 +2501,217 @@ def vibe_attempt(run, prompt_file, out_dir, model):
     return code, err_tail, answer, vibe_read_export(out_dir)
 
 
-ENGINES = {"doppio": doppio_engine, "vibe": vibe_engine}
+# ---------- Qwen Code engine ----------
+#
+# Qwen Code runs headless in the task's repository, logged in with the
+# OpenAI-compatible endpoint account (its baseURL/apiToken land on the
+# agent as apiBase/apiToken, see apply_account). The worker feeds it the
+# prompt on stdin, streams its stream-json output to the portal and maps
+# its exit code / result frame to a task outcome.
+
+# qwen's own fatal exit codes: 53 = session turn limit reached, 55 = the
+# account's budget/usage limit. 41 is auth; anything else non-zero is a
+# crash or an API/network failure - all of those are "error" (retried).
+QWEN_EXIT_TURN_LIMIT = 53
+QWEN_EXIT_USAGE_LIMIT = 55
+
+# An error text meaning the account's usage limit was reached (mapped to
+# "limit", retried at a later git check), whatever the exit code says.
+QWEN_LIMIT_RE = re.compile(r"budget|quota|usage limit|rate limit|RESOURCE_EXHAUSTED|\b429\b", re.IGNORECASE)
+
+
+def qwen_env(run):
+    """The environment for the qwen process, on top of engine_env (per-task
+    HOME, the CA bundle for this Node CLI via NODE_EXTRA_CA_CERTS - Node
+    ignores SSL_CERT_FILE -, no agent secrets, the git token only when the
+    task may push): the git hosts' tokens, for the gh/glab the playbooks
+    open pull/merge requests with on tasks that may push."""
+    env = engine_env(run)
+    if can_push(run.task) and run.agent.get("gitToken"):
+        env["GH_TOKEN"] = run.agent["gitToken"]
+        env["GITLAB_TOKEN"] = run.agent["gitToken"]
+    return env
+
+
+def qwen_argv(run, base, token):
+    """The headless qwen invocation for one task: --yolo (its sandbox and
+    approval prompts stay off: the agent's container is the sandbox, and
+    --sandbox is never passed - it would run commands through Docker or
+    Podman on the host), stream-json output, the turn limit, and the
+    endpoint's URL and key. The prompt goes on stdin (run_process); the
+    workdir is the task's repository (run_process's cwd)."""
+    argv = ["qwen", "--yolo", "-o", "stream-json"]
+    if run.max_turns is not None:
+        argv += ["--max-session-turns", str(run.max_turns)]
+    argv += ["--auth-type", "openai", "--openai-base-url", base, "--openai-api-key", token]
+    model = (run.agent.get("model") or "").strip()
+    if model:
+        argv += ["-m", model]
+    return argv
+
+
+def qwen_tool_result_text(block):
+    """The text of a tool_result content block (a string; older shapes may
+    carry parts)."""
+    c = block.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        parts = []
+        for p in c:
+            if isinstance(p, str):
+                parts.append(p)
+            elif isinstance(p, dict) and isinstance(p.get("text"), str):
+                parts.append(p["text"])
+        return "\n".join(parts)
+    if c is None:
+        return ""
+    return json.dumps(c)[:1500]
+
+
+def qwen_stream_event(run, entry, answer):
+    """Turn one streamed qwen frame into portal events. Returns the latest
+    assistant text, which the caller keeps as a fallback for the answer (the
+    result frame carries the final one)."""
+    kind = entry.get("type")
+    if kind == "assistant":
+        blocks = (entry.get("message") or {}).get("content")
+        if not isinstance(blocks, list):
+            return answer
+        for b in blocks:
+            if not isinstance(b, dict):
+                continue
+            btype = b.get("type")
+            if btype == "text":
+                text = b.get("text") or ""
+                if text.strip():
+                    run.emit("assistant", text)
+                    answer = text
+            elif btype == "thinking":
+                thought = b.get("thinking") or ""
+                if thought.strip():
+                    run.emit("log", "thinking: " + thought.strip()[:1500])
+            elif btype == "tool_use":
+                name = b.get("name") or "tool"
+                run.emit("action", f"$ {name} {json.dumps(b.get('input') or {})[:300]}")
+        return answer
+    if kind == "user":
+        # Tool results come back as user frames; the prompt echo is skipped
+        # (run_task already emitted it).
+        blocks = (entry.get("message") or {}).get("content")
+        if not isinstance(blocks, list):
+            return answer
+        for b in blocks:
+            if isinstance(b, dict) and b.get("type") == "tool_result":
+                out = qwen_tool_result_text(b)
+                if b.get("is_error") and not out.strip():
+                    out = "failed"
+                if out.strip():
+                    run.emit("log", "→ " + out.strip()[:1500])
+        return answer
+    if kind == "system":
+        line = entry.get("subtype") or "system"
+        data = entry.get("data")
+        if isinstance(data, dict):
+            line += ": " + json.dumps(data)[:300]
+        elif data:
+            line += ": " + str(data)[:300]
+        run.emit("log", f"qwen: {line}")
+        return answer
+    return answer
+
+
+def qwen_outcome(code, result, err_tail):
+    """Map a finished qwen run to (outcome, error): success -> "done" (the
+    caller checks the answer is usable), turn limit -> "failed", usage
+    limit -> "limit", everything else that broke around the task (crash,
+    network, auth) -> "error" (both retried at a later git check)."""
+    msg = ((result or {}).get("error") or {}).get("message") or ""
+    if not msg and err_tail.strip():
+        msg = err_tail.strip().splitlines()[-1][:300]
+    if not msg:
+        msg = f"qwen exited {code}"
+    low = msg.lower()
+    if code == QWEN_EXIT_TURN_LIMIT or "max session turns" in low or "max_session_turns" in low:
+        return "failed", msg
+    if code == QWEN_EXIT_USAGE_LIMIT or QWEN_LIMIT_RE.search(msg):
+        return "limit", msg
+    if result is not None:
+        if result.get("is_error"):
+            return "error", msg
+        return "done", ""
+    if code == 0:
+        return "failed", msg  # no result frame: no usable answer
+    return "error", msg
+
+
+def qwen_usage_note(result):
+    """One log line with the run's token usage and turn count, when it has any."""
+    usage = (result or {}).get("usage") or {}
+    if not usage:
+        return ""
+    total = usage.get("total_tokens") or 0
+    note = f"qwen usage: {total} tokens"
+    if usage.get("input_tokens") or usage.get("output_tokens"):
+        note += f" ({usage.get('input_tokens', 0)} in / {usage.get('output_tokens', 0)} out)"
+    turns = (result or {}).get("num_turns")
+    if turns:
+        note += f", {turns} turns"
+    return note
+
+
+def qwen_engine(run):
+    """Run one task with Qwen Code, headless, in the task's repository.
+
+    Qwen does its own tool loop there (--yolo: the agent's container is the
+    sandbox); the worker only builds the prompt, streams qwen's output to
+    the portal and maps its result to a task outcome."""
+    base = (run.agent.get("apiBase") or "").strip().rstrip("/")
+    if not base:
+        msg = ("engine 'qwen-code' needs an OpenAI-compatible endpoint: pick an endpoint "
+               "account in the agent's settings (Accounts page) or set the agent's API base URL")
+        run.emit("error", msg)
+        return EngineResult("failed", error=msg)
+    token = run.agent.get("apiToken") or run.agent.get("accountToken") or ""
+    argv = qwen_argv(run, base, token)
+    # The key is on the command line: never log it.
+    run.emit("log", "running: " + " ".join(a if a != token else "***" for a in argv))
+    # The persona and standing task go in the prompt, not in --system-prompt:
+    # that flag replaces Qwen's own instructions.
+    prompt = (run.system or "").strip() + "\n\n" + run.prompt
+    answer, result = "", None
+
+    def on_line(line):
+        nonlocal answer, result
+        line = line.strip()
+        if not line.startswith("{"):
+            return
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(entry, dict):
+            return
+        if entry.get("type") == "result":
+            result = entry
+            text = entry.get("result")
+            if isinstance(text, str) and text.strip():
+                answer = text
+            return
+        answer = qwen_stream_event(run, entry, answer) or answer
+
+    code, err_tail = run_process(run, argv, stdin_text=prompt, env=qwen_env(run), on_line=on_line)
+    outcome, error = qwen_outcome(code, result, err_tail)
+    note = qwen_usage_note(result)
+    if note:
+        run.emit("log", note)
+    if outcome == "done" and not answer.strip():
+        # qwen reported success but streamed no final message: no usable answer.
+        return EngineResult("failed", error="qwen finished without a final message")
+    return EngineResult(outcome, answer=answer, error=error)
+
+
+ENGINES = {"doppio": doppio_engine, "vibe": vibe_engine, "qwen-code": qwen_engine}
 
 
 def task_workdir(t, agent=None):
@@ -2548,7 +2758,7 @@ def run_task(mgr, agent, system, t):
     # A CLI engine logs in with the shared account, not with the agent's own
     # API token: without one it cannot authenticate at all. Engines that are
     # not built in (the tests register their own) are exempt.
-    builtin = ENGINES.get(engine_name) in (doppio_engine, vibe_engine)
+    builtin = ENGINES.get(engine_name) in (doppio_engine, vibe_engine, qwen_engine)
     if engine_name != "doppio" and builtin \
             and not (agent.get("accountToken") or agent.get("apiToken")):
         msg = (f"engine {engine_name!r} needs a login: pick an account in the agent's settings "

@@ -54,10 +54,10 @@ model key (Mistral Vibe's `MISTRAL_API_KEY`, a Claude Code or Codex login)
 is passed into that engine's environment, so a steered CLI engine can read
 and spend it — only the Doppio loop keeps the model key away from the
 engine. For Codex that is the ChatGPT login's `auth.json`, refresh token
-included: a steered engine could take the login elsewhere. It cannot swap
-the shared login for another ChatGPT account, or roll it back, by
-reporting a "refresh": the manager only adopts a refreshed login from an
-agent when it is a later refresh of the same account. Agent containers also drop every capability but the six the worker
+included: a steered engine could take the login elsewhere. Reported refreshes are untrusted: before replacing the shared login, the
+manager exchanges the reported refresh token with the auth server and
+checks that the returned tokens belong to the stored ChatGPT account.
+Only those returned tokens are adopted. Agent containers also drop every capability but the six the worker
 needs to run the engines as an unprivileged user (`CHOWN`, `DAC_OVERRIDE`,
 `FOWNER`, `KILL`, `SETGID`, `SETUID`; the engines hold none of them), cannot
 gain new privileges (`no-new-privileges`) and run under memory, CPU and

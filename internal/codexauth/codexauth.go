@@ -168,16 +168,27 @@ func (a *Auth) NewerThan(old *Auth) bool {
 
 // VerifyRefresh exchanges only the reported refresh token, discarding all
 // engine-supplied claims. Identity must come from the auth server's reply.
-func (a *Auth) VerifyRefresh(ctx context.Context, client *http.Client, tokenURL string, now time.Time, accountID string) (*Auth, error) {
+// After verification, stored fields are preserved with the returned tokens.
+func (a *Auth) VerifyRefresh(ctx context.Context, client *http.Client, tokenURL string, now time.Time, stored *Auth) (*Auth, error) {
 	candidate := &Auth{raw: map[string]any{"tokens": map[string]any{"refresh_token": a.RefreshToken()}}}
 	fresh, err := candidate.Refresh(ctx, client, tokenURL, now)
 	if err != nil {
 		return nil, err
 	}
-	if accountID == "" || fresh.AccountID() != accountID {
+	if stored.AccountID() == "" || fresh.AccountID() != stored.AccountID() {
 		return nil, errors.New("refreshed login does not match the stored account")
 	}
-	return fresh, nil
+	// Merge only after checking identity, so stored claims cannot mask it.
+	out := stored.clone()
+	for _, key := range []string{"id_token", "access_token", "refresh_token"} {
+		delete(out.tokens(), key)
+	}
+	for key, value := range fresh.tokens() {
+		out.tokens()[key] = value
+	}
+	out.tokens()["account_id"] = fresh.AccountID()
+	out.raw["last_refresh"] = fresh.raw["last_refresh"]
+	return out, nil
 }
 
 // Refresh exchanges the refresh token for new tokens at tokenURL, the way

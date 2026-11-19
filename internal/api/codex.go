@@ -336,8 +336,12 @@ func (s *Server) handleInternalCodexAuth(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusOK, map[string]bool{"adopted": false})
 		return
 	}
-	verified, err := got.VerifyRefresh(r.Context(), cs.client, codexauth.TokenURL(), time.Now(), stored.AccountID())
+	// Finish the single-use exchange even if the reporting worker disconnects.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	verified, err := got.VerifyRefresh(ctx, cs.client, codexauth.TokenURL(), time.Now(), stored)
 	if err != nil {
+		log.Printf("codex account %s: reported refresh verification failed: %v", acc.Name, err)
 		writeJSON(w, http.StatusOK, map[string]bool{"adopted": false})
 		return
 	}

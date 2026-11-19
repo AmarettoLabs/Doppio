@@ -1,9 +1,11 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -366,4 +368,41 @@ func waitFor(t *testing.T, cond func() bool) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("condition not met in time")
+}
+
+func TestCodexReportSurvivesWorkerCancellation(t *testing.T) {
+	now := time.Now()
+	f := newCodexFixture(t, codexAuthJSON("acct-1", "rt-0", now, now.Add(-time.Hour)))
+	ctx, cancel := context.WithCancel(context.Background())
+	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cancel() // The worker disconnects after the exchange has started.
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"id_token":     testJWT(map[string]any{"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct-1"}}),
+			"access_token": "verified-access", "refresh_token": "verified-refresh",
+		})
+	}))
+	defer tokenSrv.Close()
+	defer cancel()
+	t.Setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE", tokenSrv.URL)
+	req := httptest.NewRequest("POST", "/api/internal/agents/"+f.agent+"/codex-auth", strings.NewReader(mustJSON(map[string]any{"authJson": codexAuthJSON("acct-1", "rt-1", now, now)}))).WithContext(ctx)
+	req.Header.Set("X-Manager-Token", runtime.AgentToken(testMaster, f.agent))
+	rec := httptest.NewRecorder()
+	f.h.ServeHTTP(rec, req)
+	if ctx.Err() == nil || rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"adopted":true`) || !strings.Contains(f.storedAuth(), "verified-refresh") {
+		t.Fatalf("exchange lost after cancellation: %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestCodexReportVerificationFailureIsLogged(t *testing.T) {
+	tokenServer(t, http.StatusUnauthorized)
+	now := time.Now()
+	f := newCodexFixture(t, codexAuthJSON("acct-1", "rt-0", now, now.Add(-time.Hour)))
+	var output bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&output)
+	defer log.SetOutput(previous)
+	rec := do(f.h, "POST", "/api/internal/agents/"+f.agent+"/codex-auth", runtime.AgentToken(testMaster, f.agent), mustJSON(map[string]any{"authJson": codexAuthJSON("acct-1", "reported-secret", now, now)}))
+	if rec.Code != http.StatusOK || !strings.Contains(output.String(), "reported refresh verification failed") || !strings.Contains(output.String(), "refresh_token_reused") || strings.Contains(output.String(), "reported-secret") {
+		t.Fatalf("verification failure log: %s (HTTP %d)", output.String(), rec.Code)
+	}
 }

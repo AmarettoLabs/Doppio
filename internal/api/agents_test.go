@@ -82,10 +82,10 @@ func TestAgentEngine(t *testing.T) {
 	}
 
 	for body, want := range map[string]string{
-		`"engine":"gemini"`:    "unknown engine",
-		`"engine":"codex"`:     "not available yet",
-		`"taskMinutes":-1`:     "taskMinutes",
-		`"taskMinutes":100000`: "taskMinutes",
+		`"engine":"gemini"`:      "unknown engine",
+		`"engine":"claude-code"`: "not available yet",
+		`"taskMinutes":-1`:       "taskMinutes",
+		`"taskMinutes":100000`:   "taskMinutes",
 	} {
 		rec := do(h, "PATCH", "/api/agents/"+v.ID, "", agentJSON(`"ownerLogin":"me",`+body))
 		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), want) {

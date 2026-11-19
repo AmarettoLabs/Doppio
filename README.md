@@ -119,7 +119,7 @@ them. One account per provider is shared by every agent that uses its engine.
 | API key (Doppio loop) | a pasted key for OpenAI / Anthropic / Mistral / a custom `provider/model` |
 | OpenAI-compatible endpoint | base URL + token (e.g. a local LLM; uses the extra hosts / CA bundle settings) |
 | Claude Code | the long-lived token from `claude setup-token`, pasted |
-| Codex CLI | ChatGPT login (device-code flow) |
+| Codex CLI | ChatGPT login: **Log in with ChatGPT** on the Accounts page (device code), or the `~/.codex/auth.json` of a `codex login`, pasted |
 | Mistral Vibe | the `MISTRAL_API_KEY` Vibe writes to `~/.vibe/.env`, pasted |
 
 Credentials are stored once under `DATA_DIR/accounts/<id>/` (mode 0600), are
@@ -132,7 +132,7 @@ account is optional.
 
 ## Engines
 
-An agent's **engine** runs its tasks. Three are available: the **Doppio loop**
+An agent's **engine** runs its tasks. Four are available: the **Doppio loop**
 (the default), Doppio's own tool loop over the agent's model API,
 **Mistral Vibe**, which runs the task headless in the prepared repository
 (`vibe --prompt-file … --output streaming --agent auto-approve --max-turns N
@@ -141,10 +141,12 @@ the same way (`qwen --yolo -o stream-json --max-session-turns N --auth-type
 openai -m <model>`, prompt on stdin, the endpoint's URL and key passed in
 `OPENAI_BASE_URL`/`OPENAI_API_KEY`), logged in with the
 OpenAI-compatible endpoint account — meant for a
-local LLM behind such an API. The other coding CLIs (Claude Code, Codex CLI)
-are listed in the agent form and will become selectable as they're added; the
-agent image already ships them, with `gh` and `glab` to open pull/merge
-requests. Whatever the engine, the worker handles the git side: triggers,
+local LLM behind such an API, and **Codex CLI** (`codex exec --json
+--dangerously-bypass-approvals-and-sandbox --skip-git-repo-check --ephemeral
+-C <repo> -m <model> -o <file> -`, prompt on stdin), logged in with a ChatGPT
+account. Claude Code is listed in the agent form and will become selectable
+when it's added; the agent image already ships it, with `gh` and `glab` to
+open pull/merge requests. Whatever the engine, the worker handles the git side: triggers,
 workspace, guidance and posting the answer.
 
 The Doppio loop calls the model's tools with the provider's built-in tool
@@ -190,6 +192,31 @@ hosts and CA bundle apply: as a Node CLI, Qwen reads `NODE_EXTRA_CA_CERTS`
 statistics, self-updates and managed auto-memory are off: the memory pass
 would cost an extra model call after every task, for memories the per-task
 home discards.
+
+Codex CLI logs in with the **Codex account**: the `auth.json` codex writes
+after a ChatGPT login. **Log in with ChatGPT** on the Accounts page runs
+`codex login --device-auth` in a throwaway container from the agent image and
+shows the link to open and the one-time code to enter; when the code is
+entered, the login is stored on the account. (Pasting the `auth.json` of a
+`codex login` done elsewhere works too.) Each task copies the login into its
+own codex home; without one, the agent's own OpenAI API key goes in
+`CODEX_API_KEY`. Codex's sandbox and approval prompts stay off: the agent's
+container is the sandbox. The worker streams its JSONL events to the portal
+(messages, reasoning, commands and their output, file changes), takes its
+final message (`-o`) as the task's answer and maps the turn's end: completed
+-> done, the plan's usage limit or a rate limit -> retried later, any other
+failure (auth, network) -> retried at the next git check. There is no turn
+limit, only the task's time limit. Codex's update check and analytics are off.
+
+ChatGPT refresh tokens are single-use, so several agents sharing one login
+must never refresh it themselves: the first refresh would lock the others
+out. The manager owns the login instead. Every hour it refreshes any login
+whose access token expires within two days (codex itself only refreshes an
+expired token) and writes the new tokens into each deployed agent using the
+account; their next task picks them up, no restart needed. If an agent's
+codex refreshes the login anyway, the worker hands the new tokens back and
+the manager adopts them, but only a later refresh of the same ChatGPT
+account. A refresh that fails shows on the agents' pages; log in again then.
 
 Each task has a time limit (30 minutes by default, set per agent). A task
 still running then is stopped and retried at a later git check, like other

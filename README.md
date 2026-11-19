@@ -132,15 +132,20 @@ account is optional.
 
 ## Engines
 
-An agent's **engine** runs its tasks. Two are available: the **Doppio loop**
-(the default), Doppio's own tool loop over the agent's model API, and
+An agent's **engine** runs its tasks. Three are available: the **Doppio loop**
+(the default), Doppio's own tool loop over the agent's model API,
 **Mistral Vibe**, which runs the task headless in the prepared repository
 (`vibe --prompt-file … --output streaming --agent auto-approve --max-turns N
---workdir <repo> --model <alias>`). Coding CLIs (Claude Code, Codex CLI,
-Qwen Code) are listed in the agent form and will become selectable as they're
-added; the agent image already ships them, with `gh` and `glab` to open
-pull/merge requests. Whatever the engine, the worker handles the git side:
-triggers, workspace, guidance and posting the answer.
+--workdir <repo> --model <alias>`), and **Qwen Code**, which runs it headless
+the same way (`qwen --yolo -o stream-json --max-session-turns N --auth-type
+openai -m <model>`, prompt on stdin, the endpoint's URL and key passed in
+`OPENAI_BASE_URL`/`OPENAI_API_KEY`), logged in with the
+OpenAI-compatible endpoint account — meant for a
+local LLM behind such an API. The other coding CLIs (Claude Code, Codex CLI)
+are listed in the agent form and will become selectable as they're added; the
+agent image already ships them, with `gh` and `glab` to open pull/merge
+requests. Whatever the engine, the worker handles the git side: triggers,
+workspace, guidance and posting the answer.
 
 The Doppio loop calls the model's tools with the provider's built-in tool
 calling (OpenAI-compatible `tools`/`tool_calls`, Anthropic
@@ -172,6 +177,19 @@ agent's model. Only a model that is still unknown after that (not in the
 plan, or a typo) runs on Vibe's default model, with an error on the task. The
 key (`.env`) and the run files (`vibe-runs/`) stay in the workspace, never
 inside a repository checkout.
+
+Qwen Code does its own tool loop with `--yolo` (its sandbox and approval
+prompts stay off; `--sandbox` is never passed, since it would run commands
+through Docker or Podman on the host): the agent's container is the sandbox.
+The worker streams its `stream-json` output to the portal (assistant text,
+tool calls, results), takes its final message as the task's answer and maps
+its outcome: turn limit -> failed, usage limit -> retried later, crash,
+network or auth error -> retried at the next git check. The endpoint's extra
+hosts and CA bundle apply: as a Node CLI, Qwen reads `NODE_EXTRA_CA_CERTS`
+(the worker points it at the bundle), not `SSL_CERT_FILE`. Its usage
+statistics, self-updates and managed auto-memory are off: the memory pass
+would cost an extra model call after every task, for memories the per-task
+home discards.
 
 Each task has a time limit (30 minutes by default, set per agent). A task
 still running then is stopped and retried at a later git check, like other

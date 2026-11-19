@@ -85,7 +85,9 @@ func Engines() []EngineInfo {
 		}},
 		{ID: EngineClaudeCode, Label: "Claude Code"},
 		{ID: EngineCodex, Label: "Codex CLI"},
-		{ID: EngineQwenCode, Label: "Qwen Code"},
+		// Qwen Code runs on any OpenAI-compatible endpoint (e.g. a local
+		// LLM), logged in with the endpoint account.
+		{ID: EngineQwenCode, Label: "Qwen Code", Available: true},
 	}
 }
 

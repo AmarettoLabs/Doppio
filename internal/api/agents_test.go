@@ -84,7 +84,6 @@ func TestAgentEngine(t *testing.T) {
 	for body, want := range map[string]string{
 		`"engine":"gemini"`:    "unknown engine",
 		`"engine":"codex"`:     "not available yet",
-		`"engine":"qwen-code"`: "not available yet",
 		`"taskMinutes":-1`:     "taskMinutes",
 		`"taskMinutes":100000`: "taskMinutes",
 	} {
@@ -106,12 +105,23 @@ func TestAgentEngine(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), `"engines":[{"id":"doppio","label":"Doppio loop","available":true},{"id":"vibe","label":"Mistral Vibe","available":true,"models":["mistral-large-4-0-3",`) {
 		t.Fatalf("providers: %s", rec.Body)
 	}
+	if !strings.Contains(rec.Body.String(), `{"id":"qwen-code","label":"Qwen Code","available":true}`) {
+		t.Fatalf("qwen-code engine not available: %s", rec.Body)
+	}
 
 	// Mistral Vibe is selectable, and sticks across updates.
 	do(h, "PATCH", "/api/agents/"+v.ID, "", agentJSON(`"ownerLogin":"me","engine":"vibe"`))
 	rec = do(h, "PATCH", "/api/agents/"+v.ID, "", agentJSON(`"ownerLogin":"me"`))
 	_ = json.Unmarshal(rec.Body.Bytes(), &v)
 	if v.Engine != "vibe" {
+		t.Fatalf("engine after update: %q", v.Engine)
+	}
+
+	// Qwen Code is selectable too.
+	do(h, "PATCH", "/api/agents/"+v.ID, "", agentJSON(`"ownerLogin":"me","engine":"qwen-code"`))
+	rec = do(h, "PATCH", "/api/agents/"+v.ID, "", agentJSON(`"ownerLogin":"me"`))
+	_ = json.Unmarshal(rec.Body.Bytes(), &v)
+	if v.Engine != "qwen-code" {
 		t.Fatalf("engine after update: %q", v.Engine)
 	}
 }

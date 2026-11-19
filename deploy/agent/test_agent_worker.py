@@ -938,6 +938,270 @@ class VibeEngineTest(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(w.VIBE_HOME, ".env")))
 
 
+class FakeQwen:
+    """A fake `qwen` binary: records its argv, cwd, stdin and env, prints a
+    scripted stream-json stdout and exits with a scripted code. `lines` are
+    printed one per line, `code` is the exit code."""
+
+    def __init__(self, tmp, lines, code):
+        self.dir = os.path.join(tmp, "bin-qwen")
+        os.makedirs(self.dir, exist_ok=True)
+        self.path = os.path.join(self.dir, "qwen")
+        with open(self.path, "w") as f:
+            f.write("#!/bin/sh\n")
+            f.write("python3 \"$FAKE_QWEN_SCRIPT\" \"$@\"\n")
+        os.chmod(self.path, 0o755)
+        self.script = os.path.join(tmp, "fake_qwen.py")
+        with open(self.script, "w") as f:
+            f.write("import json, os, sys\n")
+            f.write("calls = os.environ['FAKE_QWEN_CALLS']\n")
+            f.write("with open(calls, 'a') as fh:\n")
+            f.write("    fh.write(json.dumps({'argv': ['qwen'] + sys.argv[1:], 'cwd': os.getcwd(),\n")
+            f.write("                         'stdin': sys.stdin.read(),\n")
+            f.write("                         'gh_token': os.environ.get('GH_TOKEN'),\n")
+            f.write("                         'node_ca': os.environ.get('NODE_EXTRA_CA_CERTS')}) + '\\n')\n")
+            f.write("for line in %r:\n    print(line, flush=True)\n" % (lines,))
+            f.write("sys.exit(%d)\n" % (code,))
+        os.environ["FAKE_QWEN_SCRIPT"] = self.script
+        os.environ["FAKE_QWEN_CALLS"] = os.path.join(tmp, "qwen-calls.jsonl")
+        self.calls_path = os.environ["FAKE_QWEN_CALLS"]
+
+    def use(self):
+        orig = os.environ["PATH"]
+        os.environ["PATH"] = self.dir + os.pathsep + orig
+        return lambda: os.environ.update(PATH=orig)
+
+    def recorded(self):
+        if not os.path.exists(self.calls_path):
+            return []
+        with open(self.calls_path) as f:
+            return [json.loads(l) for l in f if l.strip()]
+
+
+def qwen_run(mgr, tmp, agent_cfg=None, task=None, system="sys persona"):
+    """Run the qwen engine on one task with a fake binary; returns (result,
+    events, recorded call)."""
+    if os.environ.get("FAKE_QWEN_CALLS") and os.path.exists(os.environ["FAKE_QWEN_CALLS"]):
+        os.unlink(os.environ["FAKE_QWEN_CALLS"])
+    cfg = {"engine": "qwen-code", "apiBase": "http://llm.local/v1", "apiToken": "llm-key"}
+    cfg.update(agent_cfg or {})
+    a = agent(**cfg)
+    t = task or {"id": "t9", "kind": "assigned", "title": "x", "input": "do it",
+                 "source": "github:o/r#issues:7@assigned"}
+    run = w.TaskRun(mgr, a, system, t, t["input"], WS_DIR, minutes=5)
+    res = w.qwen_engine(run)
+    calls = []
+    p = os.environ.get("FAKE_QWEN_CALLS")
+    if p and os.path.exists(p):
+        with open(p) as f:
+            calls = [json.loads(l) for l in f if l.strip()]
+    return res, mgr.events, (calls[-1] if calls else None)
+
+
+def qwen_frames(*frames):
+    """Stream-json frames as JSON lines."""
+    return [json.dumps(f) for f in frames]
+
+
+def qwen_assistant(text=None, thinking=None, tool=None):
+    blocks = []
+    if thinking is not None:
+        blocks.append({"type": "thinking", "thinking": thinking, "signature": "s"})
+    if text is not None:
+        blocks.append({"type": "text", "text": text})
+    if tool is not None:
+        name, args = tool
+        blocks.append({"type": "tool_use", "id": "c1", "name": name, "input": args})
+    return {"type": "assistant", "message": {"role": "assistant", "content": blocks}}
+
+
+def qwen_tool_result(content, is_error=False):
+    return {"type": "user", "message": {"role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "c1", "is_error": is_error,
+                         "content": content}]}}
+
+
+def qwen_result(result=None, error=None, usage=None, turns=2):
+    frame = {"type": "result", "subtype": "error_during_execution" if error else "success",
+             "is_error": bool(error), "num_turns": turns}
+    if result is not None:
+        frame["result"] = result
+    if error is not None:
+        frame["error"] = {"message": error}
+    if usage is not None:
+        frame["usage"] = usage
+    return frame
+
+
+class QwenEngineTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="doppio-qwen-")
+        self.mgr = RunTaskMgr()
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+        # No leftover fake from another test: the real `qwen` must not run here.
+        for k in ("FAKE_QWEN_SCRIPT", "FAKE_QWEN_CALLS"):
+            os.environ.pop(k, None)
+        # The engine environment is a whitelist now; the fake qwen harness
+        # is shell on the other side of it.
+        p = unittest.mock.patch.object(w, "ENGINE_ENV_ALLOW",
+                                       w.ENGINE_ENV_ALLOW + ("FAKE_QWEN_CALLS", "FAKE_QWEN_SCRIPT"))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def fake(self, lines, code):
+        fq = FakeQwen(self.tmp, lines, code)
+        self.addCleanup(fq.use())
+        return fq
+
+    def test_argv_stdin_and_env(self):
+        self.fake(qwen_frames(
+            qwen_assistant(text="all good"),
+            qwen_result(result="FINAL: all good",
+                        usage={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15})),
+            0)
+        res, events, call = qwen_run(self.mgr, self.tmp,
+                                     agent_cfg={"model": "my-model", "maxTurns": 7, "gitToken": "gt"})
+        self.assertEqual(call["argv"],
+                         ["qwen", "--yolo", "-o", "stream-json", "--max-session-turns", "7",
+                          "--auth-type", "openai", "--openai-base-url", "http://llm.local/v1",
+                          "--openai-api-key", "llm-key", "-m", "my-model"])
+        self.assertNotIn("--sandbox", call["argv"])  # never: it needs the host's Docker socket
+        self.assertEqual(call["cwd"], WS_DIR)         # the task's repository
+        # The prompt (persona + standing task + the worker's prompt) goes on stdin.
+        self.assertEqual(call["stdin"], "sys persona\n\ndo it")
+        # The git hosts' tokens reach gh/glab on a task that may push.
+        self.assertEqual(call["gh_token"], "gt")
+        self.assertEqual((res.outcome, res.answer), ("done", "FINAL: all good"))
+        self.assertIn(("assistant", "all good"), events)
+        self.assertTrue(any("qwen usage: 15 tokens (10 in / 5 out), 2 turns" in c
+                            for _, c in events), events)
+
+    def test_running_log_masks_the_key(self):
+        self.fake(qwen_frames(qwen_result(result="ok")), 0)
+        _, events, _ = qwen_run(self.mgr, self.tmp)
+        running = [c for t, c in events if t == "log" and c.startswith("running:")]
+        self.assertEqual(len(running), 1)
+        self.assertNotIn("llm-key", running[0])
+        self.assertIn("--openai-api-key", running[0])
+
+    def test_ca_bundle_reaches_the_node_cli(self):
+        os.environ["NODE_EXTRA_CA_CERTS"] = "/tmp/bundle.pem"
+        self.addCleanup(lambda: os.environ.pop("NODE_EXTRA_CA_CERTS", None))
+        self.fake(qwen_frames(qwen_result(result="ok")), 0)
+        _, _, call = qwen_run(self.mgr, self.tmp)
+        # Node reads NODE_EXTRA_CA_CERTS, not SSL_CERT_FILE.
+        self.assertEqual(call["node_ca"], "/tmp/bundle.pem")
+
+    def test_streamed_tool_calls_and_results(self):
+        self.fake(qwen_frames(
+            qwen_assistant(text="let me look", thinking="hmm",
+                           tool=("shell", {"command": "ls"})),
+            qwen_tool_result("a.txt\nb.txt"),
+            qwen_tool_result("", is_error=True),
+            {"type": "system", "subtype": "model_fallback",
+             "data": {"fromModel": "a", "toModel": "b"}},
+            qwen_assistant(text="done: two files"),
+            qwen_result(result="done: two files")),
+            0)
+        res, events, _ = qwen_run(self.mgr, self.tmp)
+        kinds = [(t, c) for t, c in events if t in ("action", "log", "assistant")]
+        self.assertIn(("assistant", "let me look"), kinds)
+        self.assertIn(("log", "thinking: hmm"), kinds)
+        self.assertIn(("action", '$ shell {"command": "ls"}'), kinds)
+        self.assertIn(("log", "→ a.txt\nb.txt"), kinds)
+        self.assertIn(("log", "→ failed"), kinds)  # an errored call with no output
+        self.assertIn(("log", 'qwen: model_fallback: {"fromModel": "a", "toModel": "b"}'), kinds)
+        self.assertEqual((res.outcome, res.answer), ("done", "done: two files"))
+
+    def test_answer_falls_back_to_the_last_assistant_message(self):
+        self.fake(qwen_frames(qwen_assistant(text="first"),
+                              qwen_assistant(text="the final answer"),
+                              qwen_result()),  # no "result" field
+            0)
+        res, _, _ = qwen_run(self.mgr, self.tmp)
+        self.assertEqual((res.outcome, res.answer), ("done", "the final answer"))
+
+    def test_outcomes(self):
+        cases = [
+            ([qwen_result(result="ok")], 0, "done"),
+            ([qwen_result()], 0, "failed"),                     # success, no final message
+            ([], 53, "failed"),                                 # turn limit exit code
+            ([qwen_result(error="Reached max session turns for this session.")], 1, "failed"),
+            ([], 55, "limit"),                                  # budget/usage exit code
+            ([qwen_result(error="429 Too Many Requests: quota exceeded")], 1, "limit"),
+            ([], 41, "error"),                                  # auth exit code
+            ([qwen_result(error="fetch failed: ECONNREFUSED 127.0.0.1:8000")], 1, "error"),
+            ([qwen_result(error="Unauthorized: invalid API key")], 1, "error"),
+            ([], 2, "error"),                                   # crash, no result frame
+            ([], 0, "failed"),                                  # exit 0 without a result frame
+        ]
+        for frames, code, want in cases:
+            with self.subTest(frames=frames, code=code):
+                self.fake(qwen_frames(*frames), code)
+                res, events, _ = qwen_run(self.mgr, self.tmp,
+                                          task={"id": "t-%d-%d" % (code, len(frames)), "kind": "assigned",
+                                                "title": "x", "input": "do it",
+                                                "source": "github:o/r#issues:7@assigned"})
+                self.assertEqual(res.outcome, want)
+                if want != "done":
+                    self.assertTrue(res.error, (frames, code))
+
+    def test_error_message_from_result_then_stderr(self):
+        self.fake(qwen_frames(qwen_result(error="connection refused")), 2)
+        res, _, _ = qwen_run(self.mgr, self.tmp)
+        self.assertEqual(res.error, "connection refused")
+        # No result frame: fall back to the last stderr line... the fake
+        # prints none, so the exit code is the message.
+        self.fake([], 2)
+        res, _, _ = qwen_run(self.mgr, self.tmp,
+                             task={"id": "t10", "title": "x", "input": "hi"})
+        self.assertIn("qwen exited 2", res.error)
+
+    def test_no_endpoint_is_a_config_error(self):
+        fq = self.fake(qwen_frames(qwen_result(result="ok")), 0)
+        res, events, call = qwen_run(self.mgr, self.tmp, agent_cfg={"apiBase": ""})
+        self.assertEqual(res.outcome, "failed")
+        self.assertIn("endpoint", res.error)
+        self.assertIsNone(call)  # no process was run
+        self.assertTrue(any(t == "error" and "endpoint" in c for t, c in events))
+
+    def test_no_turn_limit_or_model_omits_the_flags(self):
+        self.fake(qwen_frames(qwen_result(result="ok")), 0)
+        _, _, call = qwen_run(self.mgr, self.tmp, agent_cfg={"model": "", "maxTurns": -1})
+        self.assertNotIn("--max-session-turns", call["argv"])
+        self.assertNotIn("-m", call["argv"])
+
+    def test_review_task_gets_no_git_token(self):
+        self.fake(qwen_frames(qwen_result(result="ok")), 0)
+        task = {"id": "t-rev", "kind": "review", "title": "x", "input": "do it",
+                "source": "github:o/r#pull_requests:8@abc"}
+        res, _, call = qwen_run(self.mgr, self.tmp, agent_cfg={"gitToken": "gt"}, task=task)
+        self.assertEqual((res.outcome, res.answer), ("done", "ok"))
+        self.assertIsNone(call["gh_token"])  # the engine may not push on a review
+        # The endpoint login still goes along on the command line.
+        self.assertIn("--openai-base-url", call["argv"])
+        self.assertIn("--openai-api-key", call["argv"])
+
+    def test_nothing_is_written_into_the_repository(self):
+        repo = os.path.join(self.tmp, "repo")
+        os.makedirs(repo)
+        self.fake(qwen_frames(qwen_result(result="ok")), 0)
+        a = agent(engine="qwen-code", apiBase="http://llm.local/v1", apiToken="llm-key")
+        t = {"id": "t11", "title": "x", "input": "do it"}
+        run = w.TaskRun(self.mgr, a, "sys", t, t["input"], repo, minutes=5)
+        self.assertEqual(w.qwen_engine(run).outcome, "done")
+        self.assertEqual(os.listdir(repo), [])
+
+    def test_qwen_engine_needs_a_login(self):
+        out = w.run_task(self.mgr, agent(engine="qwen-code"), "sys",
+                         {"id": "t1", "title": "x", "input": "hi"})
+        self.assertEqual(out, "failed")
+        self.assertIn("needs a login", self.mgr.finished[-1][2])
+
+    def test_qwen_is_a_registered_engine(self):
+        self.assertIs(w.ENGINES["qwen-code"], w.qwen_engine)
+
+
 class EngineTest(unittest.TestCase):
     def setUp(self):
         orig = dict(w.ENGINES)

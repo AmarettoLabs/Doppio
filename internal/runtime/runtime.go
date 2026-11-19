@@ -338,11 +338,46 @@ func (r *Runtime) writeAccount(a *model.Agent, secrets map[string]string) error 
 		}
 		return nil
 	}
-	b, err := json.MarshalIndent(secrets, "", "  ")
+	return writeSecretFile(p, secrets)
+}
+
+// UpdateAccount rewrites the account credentials of an agent that is already
+// deployed, so its next task picks them up without a restart (the manager
+// refreshes a Codex login this way). An agent with no state dir yet is
+// skipped: it gets the credentials when it starts.
+func (r *Runtime) UpdateAccount(agentID string, secrets map[string]string) error {
+	dir := r.agentDir(agentID)
+	if _, err := os.Stat(dir); err != nil {
+		return nil
+	}
+	return writeSecretFile(filepath.Join(dir, accountFile), secrets)
+}
+
+// writeSecretFile writes v as JSON to p with mode 0600, through a temporary
+// file and a rename: a worker reading the file at that moment sees the old
+// or the new one, never half of it.
+func writeSecretFile(p string, v any) error {
+	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(p, b, 0o600)
+	tmp, err := os.CreateTemp(filepath.Dir(p), "."+filepath.Base(p)+".*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(b); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), p)
 }
 
 // Stop stops and removes the agent's container.

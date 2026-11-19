@@ -36,7 +36,9 @@ RUN npm install -g --omit=dev \
  && npm cache clean --force
 
 # --- codex CLI -------------------------------------------------------------
-# A native binary from its GitHub release (no Node involved). The tarball
+# Native binaries from its GitHub release (no Node involved): codex and its
+# code-mode host, which codex looks for next to itself (without it, a
+# ChatGPT login's turns start with "Code Mode is unavailable"). Each tarball
 # holds one file named after the target triple, hence the mv. Both
 # architectures are downloaded (each with its checksum) and the one for
 # TARGETARCH is kept.
@@ -45,11 +47,17 @@ ARG TARGETARCH
 ARG CODEX_VERSION=0.166.0
 ARG CODEX_SHA256_AMD64=a0bf572d2f93f056c6712a6da348e96078dc84f3885fd7be67807ef389cb3978
 ARG CODEX_SHA256_ARM64=94eb707605ec2646b2e05b7edf7c4e7b3ccf02b16237c34ae9beb8cfb7f810a9
+ARG CODEX_HOST_SHA256_AMD64=7588334fd47bc4003d970b70dfd4d1e4578491b1e9baa72976a4c2d7e97590da
+ARG CODEX_HOST_SHA256_ARM64=ac98d1f878e353a16cba711fd47bfef2f6c814109bdd819ee2b6b6d6a19701e7
 ADD --checksum=sha256:${CODEX_SHA256_AMD64} https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/codex-x86_64-unknown-linux-musl.tar.gz /tmp/codex-amd64.tar.gz
 ADD --checksum=sha256:${CODEX_SHA256_ARM64} https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/codex-aarch64-unknown-linux-musl.tar.gz /tmp/codex-arm64.tar.gz
-RUN tar -xzf /tmp/codex-${TARGETARCH}.tar.gz -C /tmp \
- && mv /tmp/codex-*-unknown-linux-musl /usr/local/bin/codex \
- && rm -f /tmp/codex-*.tar.gz
+ADD --checksum=sha256:${CODEX_HOST_SHA256_AMD64} https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/codex-code-mode-host-x86_64-unknown-linux-musl.tar.gz /tmp/host-amd64.tar.gz
+ADD --checksum=sha256:${CODEX_HOST_SHA256_ARM64} https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/codex-code-mode-host-aarch64-unknown-linux-musl.tar.gz /tmp/host-arm64.tar.gz
+RUN mkdir /tmp/x && tar -xzf /tmp/codex-${TARGETARCH}.tar.gz -C /tmp/x \
+ && tar -xzf /tmp/host-${TARGETARCH}.tar.gz -C /tmp/x \
+ && mv /tmp/x/codex-code-mode-host-*-unknown-linux-musl /usr/local/bin/codex-code-mode-host \
+ && mv /tmp/x/codex-*-unknown-linux-musl /usr/local/bin/codex \
+ && rm -rf /tmp/x /tmp/*.tar.gz
 
 # --- gh / glab --------------------------------------------------------------
 # The git hosts' CLIs as debs from their releases: the CLI engines don't have
@@ -125,14 +133,15 @@ ENV PATH=/usr/local/go/bin:$PATH
 # launcher points the Rust CLI at the vibe-app-server script next to itself,
 # which the venv's bin has). Only the entry points are linked: the venv's own
 # python stays off PATH.
-COPY --from=codex-cli /usr/local/bin/codex /usr/local/bin/codex
+COPY --from=codex-cli /usr/local/bin/codex /usr/local/bin/codex-code-mode-host /usr/local/bin/
 COPY --from=vibe-cli /opt/vibe /opt/vibe
 RUN for f in /opt/vibe/bin/vibe*; do ln -s "$f" /usr/local/bin/; done
 # No self-updates. Containers run as root (HOME=/root), so each CLI reads its
 # own home config; qwen's system-wide file lives in /etc and wins over any
 # user settings.
 #   claude: DISABLE_AUTOUPDATER (its own env var).
-#   codex:  check_for_update_on_startup in ~/.codex/config.toml.
+#   codex:  check_for_update_on_startup in ~/.codex/config.toml (its
+#           analytics are off there too).
 #   vibe:   enable_update_checks / enable_auto_update in ~/.vibe/config.toml.
 #   qwen:   general.enableAutoUpdate in /etc/qwen-code/settings.json.
 # qwen's managed auto-memory and auto-dream are off there too: after every
@@ -140,7 +149,7 @@ RUN for f in /opt/vibe/bin/vibe*; do ln -s "$f" /usr/local/bin/; done
 # which the worker throws away with it.
 ENV DISABLE_AUTOUPDATER=1
 RUN mkdir -p /root/.codex /root/.vibe /etc/qwen-code \
- && printf 'check_for_update_on_startup = false\n' > /root/.codex/config.toml \
+ && printf 'check_for_update_on_startup = false\n[analytics]\nenabled = false\n' > /root/.codex/config.toml \
  && printf 'enable_update_checks = false\nenable_auto_update = false\n' > /root/.vibe/config.toml \
  && printf '{ "general": { "enableAutoUpdate": false },\n  "memory": { "enableManagedAutoMemory": false, "enableManagedAutoDream": false } }\n' > /etc/qwen-code/settings.json \
  && chmod 0644 /root/.codex/config.toml /root/.vibe/config.toml /etc/qwen-code/settings.json

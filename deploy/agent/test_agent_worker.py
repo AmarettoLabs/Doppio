@@ -959,6 +959,8 @@ class FakeQwen:
             f.write("    fh.write(json.dumps({'argv': ['qwen'] + sys.argv[1:], 'cwd': os.getcwd(),\n")
             f.write("                         'stdin': sys.stdin.read(),\n")
             f.write("                         'gh_token': os.environ.get('GH_TOKEN'),\n")
+            f.write("                         'openai_base': os.environ.get('OPENAI_BASE_URL'),\n")
+            f.write("                         'openai_key': os.environ.get('OPENAI_API_KEY'),\n")
             f.write("                         'node_ca': os.environ.get('NODE_EXTRA_CA_CERTS')}) + '\\n')\n")
             f.write("for line in %r:\n    print(line, flush=True)\n" % (lines,))
             f.write("sys.exit(%d)\n" % (code,))
@@ -1063,10 +1065,12 @@ class QwenEngineTest(unittest.TestCase):
                                      agent_cfg={"model": "my-model", "maxTurns": 7, "gitToken": "gt"})
         self.assertEqual(call["argv"],
                          ["qwen", "--yolo", "-o", "stream-json", "--max-session-turns", "7",
-                          "--auth-type", "openai", "--openai-base-url", "http://llm.local/v1",
-                          "--openai-api-key", "llm-key", "-m", "my-model"])
+                          "--auth-type", "openai", "-m", "my-model"])
         self.assertNotIn("--sandbox", call["argv"])  # never: it needs the host's Docker socket
         self.assertEqual(call["cwd"], WS_DIR)         # the task's repository
+        # The endpoint's URL and key go in the env, not on the command line.
+        self.assertEqual(call["openai_base"], "http://llm.local/v1")
+        self.assertEqual(call["openai_key"], "llm-key")
         # The prompt (persona + standing task + the worker's prompt) goes on stdin.
         self.assertEqual(call["stdin"], "sys persona\n\ndo it")
         # The git hosts' tokens reach gh/glab on a task that may push.
@@ -1076,13 +1080,15 @@ class QwenEngineTest(unittest.TestCase):
         self.assertTrue(any("qwen usage: 15 tokens (10 in / 5 out), 2 turns" in c
                             for _, c in events), events)
 
-    def test_running_log_masks_the_key(self):
+    def test_key_never_reaches_the_command_line(self):
         self.fake(qwen_frames(qwen_result(result="ok")), 0)
-        _, events, _ = qwen_run(self.mgr, self.tmp)
+        _, events, call = qwen_run(self.mgr, self.tmp)
         running = [c for t, c in events if t == "log" and c.startswith("running:")]
         self.assertEqual(len(running), 1)
+        # The key travels in the env only: not in argv, not in the logged command.
         self.assertNotIn("llm-key", running[0])
-        self.assertIn("--openai-api-key", running[0])
+        self.assertNotIn("llm-key", call["argv"])
+        self.assertEqual(call["openai_key"], "llm-key")
 
     def test_ca_bundle_reaches_the_node_cli(self):
         os.environ["NODE_EXTRA_CA_CERTS"] = "/tmp/bundle.pem"
@@ -1187,9 +1193,9 @@ class QwenEngineTest(unittest.TestCase):
         res, _, call = qwen_run(self.mgr, self.tmp, agent_cfg={"gitToken": "gt"}, task=task)
         self.assertEqual((res.outcome, res.answer), ("done", "ok"))
         self.assertIsNone(call["gh_token"])  # the engine may not push on a review
-        # The endpoint login still goes along on the command line.
-        self.assertIn("--openai-base-url", call["argv"])
-        self.assertIn("--openai-api-key", call["argv"])
+        # The endpoint login still goes along, in the env.
+        self.assertEqual(call["openai_base"], "http://llm.local/v1")
+        self.assertEqual(call["openai_key"], "llm-key")
 
     def test_nothing_is_written_into_the_repository(self):
         repo = os.path.join(self.tmp, "repo")

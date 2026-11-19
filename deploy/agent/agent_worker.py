@@ -2520,30 +2520,36 @@ QWEN_EXIT_USAGE_LIMIT = 55
 QWEN_LIMIT_RE = re.compile(r"budget|quota|usage limit|rate limit|RESOURCE_EXHAUSTED|\b429\b", re.IGNORECASE)
 
 
-def qwen_env(run):
+def qwen_env(run, base, token):
     """The environment for the qwen process, on top of engine_env (per-task
     HOME, the CA bundle for this Node CLI via NODE_EXTRA_CA_CERTS - Node
     ignores SSL_CERT_FILE -, no agent secrets, the git token only when the
     task may push): the git hosts' tokens, for the gh/glab the playbooks
-    open pull/merge requests with on tasks that may push."""
+    open pull/merge requests with on tasks that may push, and qwen's
+    endpoint URL and key where it reads them with --auth-type openai
+    (env, not argv: the key must not sit on the command line)."""
     env = engine_env(run)
     if can_push(run.task) and run.agent.get("gitToken"):
         env["GH_TOKEN"] = run.agent["gitToken"]
         env["GITLAB_TOKEN"] = run.agent["gitToken"]
+    env["OPENAI_BASE_URL"] = base
+    if token:
+        env["OPENAI_API_KEY"] = token
     return env
 
 
-def qwen_argv(run, base, token):
+def qwen_argv(run):
     """The headless qwen invocation for one task: --yolo (its sandbox and
     approval prompts stay off: the agent's container is the sandbox, and
     --sandbox is never passed - it would run commands through Docker or
-    Podman on the host), stream-json output, the turn limit, and the
-    endpoint's URL and key. The prompt goes on stdin (run_process); the
-    workdir is the task's repository (run_process's cwd)."""
+    Podman on the host), stream-json output and the turn limit. The prompt
+    goes on stdin (run_process), the workdir is the task's repository
+    (run_process's cwd); the endpoint's URL and key go in qwen_env (env, not
+    argv: anything in the container can read the command line)."""
     argv = ["qwen", "--yolo", "-o", "stream-json"]
     if run.max_turns is not None:
         argv += ["--max-session-turns", str(run.max_turns)]
-    argv += ["--auth-type", "openai", "--openai-base-url", base, "--openai-api-key", token]
+    argv += ["--auth-type", "openai"]
     model = (run.agent.get("model") or "").strip()
     if model:
         argv += ["-m", model]
@@ -2678,9 +2684,10 @@ def qwen_engine(run):
         run.emit("error", msg)
         return EngineResult("failed", error=msg)
     token = run.agent.get("apiToken") or run.agent.get("accountToken") or ""
-    argv = qwen_argv(run, base, token)
-    # The key is on the command line: never log it.
-    run.emit("log", "running: " + " ".join(a if a != token else "***" for a in argv))
+    argv = qwen_argv(run)
+    # The endpoint's key is in the env, not on the command line, so this is
+    # safe to log (and anything in the container could have read the argv).
+    run.emit("log", "running: " + " ".join(argv))
     # The persona and standing task go in the prompt, not in --system-prompt:
     # that flag replaces Qwen's own instructions.
     prompt = (run.system or "").strip() + "\n\n" + run.prompt
@@ -2705,7 +2712,7 @@ def qwen_engine(run):
             return
         answer = qwen_stream_event(run, entry, answer) or answer
 
-    code, err_tail = run_process(run, argv, stdin_text=prompt, env=qwen_env(run), on_line=on_line)
+    code, err_tail = run_process(run, argv, stdin_text=prompt, env=qwen_env(run, base, token), on_line=on_line)
     outcome, error = qwen_outcome(code, result, err_tail)
     note = qwen_usage_note(result)
     if note:

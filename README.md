@@ -138,8 +138,9 @@ An agent's **engine** runs its tasks. Three are available: the **Doppio loop**
 (`vibe --prompt-file … --output streaming --agent auto-approve --max-turns N
 --workdir <repo> --model <alias>`), and **Qwen Code**, which runs it headless
 the same way (`qwen --yolo -o stream-json --max-session-turns N --auth-type
-openai --openai-base-url <url> --openai-api-key <token> -m <model>`, prompt on
-stdin), logged in with the OpenAI-compatible endpoint account — meant for a
+openai -m <model>`, prompt on stdin, the endpoint's URL and key passed in
+`OPENAI_BASE_URL`/`OPENAI_API_KEY`), logged in with the
+OpenAI-compatible endpoint account — meant for a
 local LLM behind such an API. The other coding CLIs (Claude Code, Codex CLI)
 are listed in the agent form and will become selectable as they're added; the
 agent image already ships them, with `gh` and `glab` to open pull/merge

@@ -297,10 +297,8 @@ type codexAuthReport struct {
 	AuthJSON string `json:"authJson"`
 }
 
-// handleInternalCodexAuth takes the auth.json an agent's codex refreshed on
-// its own. It is adopted only when it is a later refresh of the same ChatGPT
-// account (codexauth.NewerThan): an engine must not be able to swap the
-// shared login for another account, or roll it back.
+// handleInternalCodexAuth verifies a reported refresh with the auth server
+// before adopting its returned tokens for the same ChatGPT account.
 func (s *Server) handleInternalCodexAuth(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !s.checkInternal(w, r, id) {
@@ -338,7 +336,16 @@ func (s *Server) handleInternalCodexAuth(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusOK, map[string]bool{"adopted": false})
 		return
 	}
-	if err := s.storeCodexAuthLocked(acc.ID, got.String(), "refreshed by agent "+a.Name); err != nil {
+	// Finish the single-use exchange even if the reporting worker disconnects.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	verified, err := got.VerifyRefresh(ctx, cs.client, codexauth.TokenURL(), time.Now(), stored)
+	if err != nil {
+		log.Printf("codex account %s: reported refresh verification failed: %v", acc.Name, err)
+		writeJSON(w, http.StatusOK, map[string]bool{"adopted": false})
+		return
+	}
+	if err := s.storeCodexAuthLocked(acc.ID, verified.String(), "refreshed by agent "+a.Name); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}

@@ -2918,6 +2918,7 @@ def codex_engine(run):
     Codex does its own tool loop there (no sandbox or approvals: the agent's
     container is the sandbox); the worker builds the prompt, streams codex's
     events to the portal and maps the turn's end to a task outcome."""
+    run.agent = apply_account(run.agent, load_account())
     if not (run.agent.get("codexAuth") or run.agent.get("apiToken") or run.agent.get("accountToken")):
         msg = ("engine 'codex' needs a login: pick a Codex account (ChatGPT login) in the agent's "
                "settings (Accounts page) or set the agent's own OpenAI API key")
@@ -2982,6 +2983,8 @@ def run_task(mgr, agent, system, t):
     """Run one task with the agent's engine, then post its answer on the
     git item it came from. Returns the outcome: "done", "failed", "error"
     or "limit" (see RETRIED_OUTCOMES)."""
+    if agent.get("engine") == "codex":
+        agent = apply_account(agent, load_account())
     tid = t["id"]
     mgr.emit("status", f"running task: {t['title']}", task_id=tid)
     engine_name = agent.get("engine") or "doppio"

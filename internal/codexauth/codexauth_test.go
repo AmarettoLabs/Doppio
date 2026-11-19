@@ -165,3 +165,47 @@ func TestNewerThanRefusesAnotherAccount(t *testing.T) {
 		t.Error("an older refresh must not win")
 	}
 }
+
+func TestVerifyRefreshPreservesStoredDocumentAfterCheckingServerIdentity(t *testing.T) {
+	now := time.Now()
+	stored := mustParse(t, authJSON(t, "acct-1", "rt-old", now, now.Add(-time.Hour)))
+	stored.tokens()["account_id"] = "acct-1"
+	stored.tokens()["future_token_field"] = "kept"
+	original := stored.String()
+	reported := mustParse(t, authJSON(t, "acct-1", "rt-reported", now, now))
+	reported.raw["untrusted_field"] = true
+	for _, account := range []string{"", "acct-2", "acct-1"} {
+		t.Run("server identity "+account, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				reply := map[string]string{"access_token": "new-access", "refresh_token": "new-refresh"}
+				if account != "" {
+					reply["id_token"] = jwt(map[string]any{"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": account}})
+				}
+				_ = json.NewEncoder(w).Encode(reply)
+			}))
+			defer srv.Close()
+			fresh, err := reported.VerifyRefresh(context.Background(), srv.Client(), srv.URL, now, stored)
+			if account != "acct-1" {
+				if err == nil {
+					t.Fatal("stored identity masked missing or different server identity")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if fresh.token("account_id") != "acct-1" || fresh.token("access_token") != "new-access" || fresh.RefreshToken() != "new-refresh" || fresh.token("future_token_field") != "kept" || fresh.raw["future_field"] == nil {
+				t.Fatalf("stored document was not preserved with verified tokens: %s", fresh)
+			}
+			if value, ok := fresh.raw["OPENAI_API_KEY"]; !ok || value != nil {
+				t.Fatal("OPENAI_API_KEY null was lost")
+			}
+			if _, ok := fresh.raw["untrusted_field"]; ok {
+				t.Fatal("adopted an engine-supplied field")
+			}
+		})
+	}
+	if stored.String() != original {
+		t.Fatal("verification changed stored document")
+	}
+}

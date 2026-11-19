@@ -2199,6 +2199,26 @@ class CodexEngineTest(unittest.TestCase):
         self.assertEqual(res.outcome, "failed")
         self.assertIn("without a final message", res.error)
 
+    def test_codex_engine_picks_up_login_after_start(self):
+        self.account("")
+        cfg = w.apply_account(agent(engine="codex", apiToken=""), w.load_account())
+        self.account(self.AUTH)
+        res, _, call = self.run_codex(CODEX_OK, agent_cfg={**cfg, "codexAuth": ""})
+        self.assertEqual(res.outcome, "done")
+        self.assertEqual(call["auth"], self.AUTH)
+
+    def test_run_task_picks_up_login_after_start(self):
+        self.account("")
+        a = w.apply_account(agent(engine="codex", apiToken=""), w.load_account())
+        self.account(self.AUTH)
+        self.addCleanup(FakeCodex(self.tmp, CODEX_OK, 0).use())
+        mgr = CodexMgr()
+        t = {"id": "t7", "kind": "chat", "title": "hi", "input": "hello", "source": ""}
+        self.assertEqual(w.run_task(mgr, a, "sys", t), "done")
+        with open(os.environ["FAKE_CODEX_CALLS"]) as f:
+            call = json.loads(f.readline())
+        self.assertEqual(call["auth"], self.AUTH)
+
     def test_run_task_accepts_a_codex_login_alone(self):
         self.addCleanup(FakeCodex(self.tmp, CODEX_OK, 0).use())
         mgr = CodexMgr()

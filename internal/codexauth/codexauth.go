@@ -151,8 +151,8 @@ func (a *Auth) NeedsRefresh(now time.Time) bool {
 // NewerThan reports whether a holds a later refresh of the same ChatGPT
 // account than old: what an agent reports back after its codex refreshed
 // the login on its own (the manager then adopts it, since the old refresh
-// token no longer works). A different account is never newer: an engine
-// must not be able to swap the shared login for another one.
+// token no longer works). This is only a candidate check: engine-supplied
+// claims must be verified with VerifyRefresh before adoption.
 func (a *Auth) NewerThan(old *Auth) bool {
 	if !a.IsChatGPT() || !old.IsChatGPT() {
 		return false
@@ -164,6 +164,31 @@ func (a *Auth) NewerThan(old *Auth) bool {
 		return false
 	}
 	return a.LastRefresh().After(old.LastRefresh())
+}
+
+// VerifyRefresh exchanges only the reported refresh token, discarding all
+// engine-supplied claims. Identity must come from the auth server's reply.
+// After verification, stored fields are preserved with the returned tokens.
+func (a *Auth) VerifyRefresh(ctx context.Context, client *http.Client, tokenURL string, now time.Time, stored *Auth) (*Auth, error) {
+	candidate := &Auth{raw: map[string]any{"tokens": map[string]any{"refresh_token": a.RefreshToken()}}}
+	fresh, err := candidate.Refresh(ctx, client, tokenURL, now)
+	if err != nil {
+		return nil, err
+	}
+	if stored.AccountID() == "" || fresh.AccountID() != stored.AccountID() {
+		return nil, errors.New("refreshed login does not match the stored account")
+	}
+	// Merge only after checking identity, so stored claims cannot mask it.
+	out := stored.clone()
+	for _, key := range []string{"id_token", "access_token", "refresh_token"} {
+		delete(out.tokens(), key)
+	}
+	for key, value := range fresh.tokens() {
+		out.tokens()[key] = value
+	}
+	out.tokens()["account_id"] = fresh.AccountID()
+	out.raw["last_refresh"] = fresh.raw["last_refresh"]
+	return out, nil
 }
 
 // Refresh exchanges the refresh token for new tokens at tokenURL, the way

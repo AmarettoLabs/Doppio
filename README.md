@@ -186,7 +186,10 @@ tool calls, results), takes its final message as the task's answer and maps
 its outcome: turn limit -> failed, usage limit -> retried later, crash,
 network or auth error -> retried at the next git check. The endpoint's extra
 hosts and CA bundle apply: as a Node CLI, Qwen reads `NODE_EXTRA_CA_CERTS`
-(the worker points it at the bundle), not `SSL_CERT_FILE`.
+(the worker points it at the bundle), not `SSL_CERT_FILE`. Its usage
+statistics, self-updates and managed auto-memory are off: the memory pass
+would cost an extra model call after every task, for memories the per-task
+home discards.
 
 Each task has a time limit (30 minutes by default, set per agent). A task
 still running then is stopped and retried at a later git check, like other

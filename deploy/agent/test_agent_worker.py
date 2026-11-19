@@ -961,6 +961,7 @@ class FakeQwen:
             f.write("                         'gh_token': os.environ.get('GH_TOKEN'),\n")
             f.write("                         'openai_base': os.environ.get('OPENAI_BASE_URL'),\n")
             f.write("                         'openai_key': os.environ.get('OPENAI_API_KEY'),\n")
+            f.write("                         'usage_stats': os.environ.get('QWEN_USAGE_STATISTICS_ENABLED'),\n")
             f.write("                         'node_ca': os.environ.get('NODE_EXTRA_CA_CERTS')}) + '\\n')\n")
             f.write("for line in %r:\n    print(line, flush=True)\n" % (lines,))
             f.write("sys.exit(%d)\n" % (code,))
@@ -1071,6 +1072,8 @@ class QwenEngineTest(unittest.TestCase):
         # The endpoint's URL and key go in the env, not on the command line.
         self.assertEqual(call["openai_base"], "http://llm.local/v1")
         self.assertEqual(call["openai_key"], "llm-key")
+        # qwen's usage statistics are off: the engine talks to a local LLM.
+        self.assertEqual(call["usage_stats"], "false")
         # The prompt (persona + standing task + the worker's prompt) goes on stdin.
         self.assertEqual(call["stdin"], "sys persona\n\ndo it")
         # The git hosts' tokens reach gh/glab on a task that may push.

@@ -2525,9 +2525,10 @@ def qwen_env(run, base, token):
     HOME, the CA bundle for this Node CLI via NODE_EXTRA_CA_CERTS - Node
     ignores SSL_CERT_FILE -, no agent secrets, the git token only when the
     task may push): the git hosts' tokens, for the gh/glab the playbooks
-    open pull/merge requests with on tasks that may push, and qwen's
-    endpoint URL and key where it reads them with --auth-type openai
-    (env, not argv: the key must not sit on the command line)."""
+    open pull/merge requests with on tasks that may push, qwen's endpoint
+    URL and key where it reads them with --auth-type openai (env, not argv:
+    the key must not sit on the command line), and its usage statistics off
+    (they default to on)."""
     env = engine_env(run)
     if can_push(run.task) and run.agent.get("gitToken"):
         env["GH_TOKEN"] = run.agent["gitToken"]
@@ -2535,6 +2536,7 @@ def qwen_env(run, base, token):
     env["OPENAI_BASE_URL"] = base
     if token:
         env["OPENAI_API_KEY"] = token
+    env["QWEN_USAGE_STATISTICS_ENABLED"] = "false"
     return env
 
 

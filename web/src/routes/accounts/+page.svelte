@@ -1,6 +1,6 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
-	import { api, type AccountKindInfo, type AccountPayload, type AccountView } from '#lib/api';
+	import { onDestroy, onMount } from 'svelte';
+	import { api, type AccountKindInfo, type AccountPayload, type AccountView, type CodexLogin } from '#lib/api';
 
 	let accounts = $state<AccountView[]>([]);
 	let kinds = $state<AccountKindInfo[]>([]);
@@ -25,6 +25,52 @@
 	}
 
 	onMount(load);
+
+	// A ChatGPT login for a Codex account: the manager runs `codex login
+	// --device-auth` and shows its link and one-time code here; the page polls
+	// until the code was entered (or the login failed).
+	let login = $state<{ account: AccountView; status: CodexLogin } | null>(null);
+	let loginTimer: ReturnType<typeof setTimeout> | undefined;
+	onDestroy(() => clearTimeout(loginTimer));
+
+	async function startLogin(a: AccountView) {
+		busy = a.id;
+		try {
+			login = { account: a, status: await api.codexLoginStart(a.id) };
+			error = '';
+			pollLogin();
+		} catch (e) {
+			error = String(e instanceof Error ? e.message : e);
+		} finally {
+			busy = '';
+		}
+	}
+
+	function pollLogin() {
+		clearTimeout(loginTimer);
+		if (!login || login.status.state !== 'waiting') return;
+		loginTimer = setTimeout(async () => {
+			if (!login) return;
+			try {
+				login.status = await api.codexLogin(login.account.id);
+				if (login.status.state === 'done') await load();
+			} catch (e) {
+				error = String(e instanceof Error ? e.message : e);
+			}
+			pollLogin();
+		}, 3000);
+	}
+
+	async function cancelLogin() {
+		if (!login) return;
+		clearTimeout(loginTimer);
+		try {
+			await api.codexLoginCancel(login.account.id);
+		} catch {
+			// gone already: nothing to cancel
+		}
+		login = null;
+	}
 
 	function startCreate() {
 		editing = null;
@@ -117,6 +163,9 @@
 						<td><span class="badge {a.status === 'configured' ? 'done' : 'error'}">{a.status}</span></td>
 						<td class="muted">{a.agents?.length ? a.agents.join(', ') : '—'}</td>
 						<td class="nowrap">
+							{#if a.kind === 'codex'}
+								<button class="ghost" onclick={() => startLogin(a)} disabled={!!busy || login?.status.state === 'waiting'}>Log in with ChatGPT</button>
+							{/if}
 							<button class="ghost" onclick={() => startEdit(a)} disabled={!!busy}>Edit</button>
 							<button class="danger" onclick={() => del(a)} disabled={!!busy || (a.agents?.length ?? 0) > 0} title={a.agents?.length ? `used by ${a.agents.join(', ')}` : 'delete'}>Delete</button>
 						</td>
@@ -127,6 +176,28 @@
 		</div>
 	{/if}
 </div>
+
+{#if login}
+	<h2>ChatGPT login for {login.account.name}</h2>
+	<div class="panel">
+		{#if login.status.state === 'waiting'}
+			{#if login.status.url && login.status.code}
+				<p>1. Open <a href={login.status.url} target="_blank" rel="noopener noreferrer">{login.status.url}</a> and sign in with the ChatGPT account the agents should use.</p>
+				<p>2. Enter this one-time code (it expires in 15 minutes): <code class="otp">{login.status.code}</code></p>
+				<p class="muted"><span class="spinner"></span> Waiting for the code to be entered…</p>
+			{:else}
+				<p class="muted"><span class="spinner"></span> Starting codex…</p>
+			{/if}
+			<button type="button" class="ghost" onclick={cancelLogin}>Cancel</button>
+		{:else if login.status.state === 'done'}
+			<p>Logged in. Agents using this account get the login with their next task, and the manager keeps it refreshed.</p>
+			<button type="button" class="ghost" onclick={() => (login = null)}>Close</button>
+		{:else}
+			<p class="err">The login {login.status.state === 'cancelled' ? 'was cancelled' : 'failed'}{login.status.error ? ': ' + login.status.error : '.'}</p>
+			<button type="button" class="ghost" onclick={() => (login = null)}>Close</button>
+		{/if}
+	</div>
+{/if}
 
 <h2>{editing ? `Edit ${editing.name}` : 'New account'}</h2>
 <div class="panel">

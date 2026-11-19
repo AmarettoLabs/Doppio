@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/AmarettoLabs/Doppio/internal/codexauth"
 	"github.com/AmarettoLabs/Doppio/internal/model"
 )
 
@@ -99,6 +100,18 @@ func (in *accountInput) validate(kindRequired bool) string {
 	return ""
 }
 
+// checkSecretValues validates the values of the fields that have a format:
+// a Codex login's auth.json must be one codex can use. Empty values (clear
+// the field) are fine.
+func checkSecretValues(kind model.AccountKind, secrets map[string]string) string {
+	if kind == model.AcctCodex && strings.TrimSpace(secrets["authJson"]) != "" {
+		if _, err := codexauth.Parse(secrets["authJson"]); err != nil {
+			return err.Error()
+		}
+	}
+	return ""
+}
+
 func (s *Server) handleListAccounts(w http.ResponseWriter, _ *http.Request) {
 	accs := s.store.Accounts().List()
 	views := make([]AccountView, 0, len(accs))
@@ -118,6 +131,10 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if msg := in.validate(true); msg != "" {
+		writeErr(w, http.StatusBadRequest, msg)
+		return
+	}
+	if msg := checkSecretValues(model.AccountKind(in.Kind), in.Secrets); msg != "" {
 		writeErr(w, http.StatusBadRequest, msg)
 		return
 	}
@@ -161,6 +178,10 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 		// The kind decides which secret fields exist, so it can't be swapped
 		// on an existing account; the UI locks it while editing too.
 		writeErr(w, http.StatusBadRequest, "the kind can't be changed; create a new account")
+		return
+	}
+	if msg := checkSecretValues(acc.Kind, in.Secrets); msg != "" {
+		writeErr(w, http.StatusBadRequest, msg)
 		return
 	}
 	acc, err := s.store.Accounts().Update(id, in.Name, in.Notes, in.Secrets)

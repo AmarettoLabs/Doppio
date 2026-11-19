@@ -21,6 +21,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"log"
@@ -28,6 +29,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	"github.com/AmarettoLabs/Doppio/internal/api"
 	"github.com/AmarettoLabs/Doppio/internal/model"
@@ -94,7 +96,12 @@ func main() {
 		log.Printf("warning: %v", err)
 	}
 
+	rt.RemoveStaleCodexLogins()
+
 	srv := api.NewServer(st, rt, password, staticDir, token)
+	// Codex logins are refreshed long before their access token expires
+	// (see internal/codexauth): an hourly check is plenty.
+	srv.StartCodexRefresher(context.Background(), time.Hour)
 	mode := "open"
 	if password != "" {
 		mode = "password protected"

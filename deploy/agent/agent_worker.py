@@ -75,6 +75,8 @@ def apply_account(agent, account):
         out["accountToken"] = account["token"]  # e.g. claude setup-token
     if account.get("apiKey"):
         out["accountToken"] = account["apiKey"]  # e.g. Vibe's MISTRAL_API_KEY
+    if account.get("authJson"):
+        out["codexAuth"] = account["authJson"]  # Codex's auth.json (ChatGPT login)
     return out
 
 
@@ -193,6 +195,18 @@ class Manager:
             f"/api/internal/agents/{self.agent_id}/tasks",
             {"kind": kind, "title": title, "input": inp, "source": source},
         )
+
+    def report_codex_auth(self, auth_json):
+        """Hand the manager an auth.json this agent's codex refreshed on its
+        own: ChatGPT refresh tokens are single-use, so the shared copy is
+        dead until the manager adopts the new one. Returns whether it did."""
+        try:
+            res = self.req("POST", f"/api/internal/agents/{self.agent_id}/codex-auth",
+                           {"authJson": auth_json})
+        except Exception as e:
+            log("codex login report failed:", e)
+            return False
+        return bool((res or {}).get("adopted"))
 
     def finish(self, task_id, status, output="", error=""):
         try:
@@ -1875,7 +1889,7 @@ def build_engine_home(run):
     # codex reads its config from $HOME; the image's copy only covers /root.
     os.makedirs(os.path.join(home, ".codex"), exist_ok=True)
     with open(os.path.join(home, ".codex", "config.toml"), "w") as f:
-        f.write("check_for_update_on_startup = false\n")
+        f.write(CODEX_CONFIG)
     # Vibe keeps its home in the workspace; link it into this task's HOME.
     link = os.path.join(home, ".vibe")
     if not os.path.lexists(link):
@@ -2725,7 +2739,230 @@ def qwen_engine(run):
     return EngineResult(outcome, answer=answer, error=error)
 
 
-ENGINES = {"doppio": doppio_engine, "vibe": vibe_engine, "qwen-code": qwen_engine}
+# ---------- Codex CLI engine ----------
+#
+# Codex runs headless in the task's repository (`codex exec --json`), logged
+# in with the Codex account: the auth.json of a ChatGPT login, which the
+# manager keeps refreshed and rewrites in /agent/state (apply_account puts
+# it on the agent as codexAuth). Without one, the agent's own OpenAI API key
+# goes in CODEX_API_KEY. Each task copies the login into its own codex home;
+# if codex refreshed it during the task (ChatGPT refresh tokens are single-
+# use), the new copy goes back to the manager (codex_report_refresh).
+
+# Every task's ~/.codex/config.toml: no update check, no analytics.
+CODEX_CONFIG = "check_for_update_on_startup = false\n\n[analytics]\nenabled = false\n"
+
+# An error text meaning the plan's usage limit (or the API's rate limit) was
+# hit: "limit", retried at a later git check.
+CODEX_LIMIT_RE = re.compile(r"usage limit|usage_limit_reached|rate limit|quota|\b429\b|Too Many Requests",
+                            re.IGNORECASE)
+
+
+def codex_env(run):
+    """The environment for the codex process, on top of engine_env (per-task
+    HOME, no agent secrets, the git token only when the task may push): the
+    git hosts' tokens for the gh/glab the playbooks open pull/merge requests
+    with (tasks that may push only), and, without a ChatGPT login, the
+    agent's own API key in CODEX_API_KEY (env, never argv). Codex reads the
+    CA bundle from SSL_CERT_FILE, which engine_env passes on."""
+    env = engine_env(run)
+    if can_push(run.task) and run.agent.get("gitToken"):
+        env["GH_TOKEN"] = run.agent["gitToken"]
+        env["GITLAB_TOKEN"] = run.agent["gitToken"]
+    if not run.agent.get("codexAuth"):
+        key = run.agent.get("apiToken") or run.agent.get("accountToken") or ""
+        if key:
+            env["CODEX_API_KEY"] = key
+    return env
+
+
+def codex_write_auth(run):
+    """Put the account's auth.json in the task's codex home (the engine user
+    owns it: codex rewrites it when it refreshes). It is read again from the
+    account file, not taken from the worker's start: the manager rewrites
+    that file when it refreshes the login. Returns its path, or None when
+    the agent has no ChatGPT login."""
+    auth = load_account().get("authJson") or run.agent.get("codexAuth")
+    run.codex_auth = auth  # what the task started with (codex_report_refresh)
+    if not auth:
+        return None
+    p = os.path.join(run.engine_home(), ".codex", "auth.json")
+    with open(p, "w") as f:
+        f.write(auth)
+    os.chmod(p, 0o600)
+    chown_to_engine(p, recursive=False)
+    return p
+
+
+def codex_report_refresh(run, auth_path):
+    """After the run: if codex refreshed the login (the file now differs from
+    what the task started with), hand the new one to the manager."""
+    if not auth_path:
+        return
+    try:
+        with open(auth_path) as f:
+            now = f.read()
+    except OSError:
+        return
+    if now.strip() == (getattr(run, "codex_auth", "") or "").strip():
+        return
+    try:
+        doc = json.loads(now)
+    except ValueError:
+        return
+    if not ((doc.get("tokens") or {}).get("refresh_token")):
+        return
+    if run.mgr.report_codex_auth(now):
+        run.emit("log", "codex refreshed the ChatGPT login; the manager adopted the new tokens")
+    else:
+        run.emit("log", "codex rewrote its login, but the manager kept the stored one")
+
+
+def codex_argv(run, last_file):
+    """The headless codex invocation for one task: JSONL events, its sandbox
+    and approval prompts off (the agent's container is the sandbox), no git
+    repo check (a chat runs in the workspace), no session files kept, the
+    task's directory, the model, and the file it writes its final message
+    to. The prompt goes on stdin ("-"). There is no turn limit: the task's
+    time limit applies."""
+    argv = ["codex", "exec", "--json", "--dangerously-bypass-approvals-and-sandbox",
+            "--skip-git-repo-check", "--ephemeral", "-C", run.workdir]
+    model = (run.agent.get("model") or "").strip()
+    if model:
+        argv += ["-m", model]
+    return argv + ["-o", last_file, "-"]
+
+
+def codex_stream_event(run, ev, state):
+    """Turn one codex JSONL event into portal events, keeping in state the
+    latest agent message, the turn's failure and the usage."""
+    kind = ev.get("type")
+    if kind in ("item.started", "item.completed"):
+        item = ev.get("item") or {}
+        itype = item.get("type")
+        done = kind == "item.completed"
+        if itype == "agent_message" and done:
+            text = item.get("text") or ""
+            if text.strip():
+                run.emit("assistant", text)
+                state["answer"] = text
+        elif itype == "reasoning" and done:
+            text = (item.get("text") or "").strip()
+            if text:
+                run.emit("log", "thinking: " + text[:1500])
+        elif itype == "command_execution":
+            if not done:
+                run.emit("action", "$ " + str(item.get("command") or "")[:300])
+            else:
+                out = (item.get("aggregated_output") or "").strip()
+                code = item.get("exit_code")
+                line = f"→ exit {code}" if code not in (None, 0) else "→"
+                run.emit("log", (line + " " + out[:1500]).strip() if out else line + " (no output)")
+        elif itype == "file_change" and done:
+            changes = ", ".join(f"{c.get('kind', 'edit')} {c.get('path', '')}" for c in item.get("changes") or [])
+            run.emit("action", "edit: " + (changes or "files")[:300])
+        elif itype == "mcp_tool_call" and not done:
+            run.emit("action", f"$ {item.get('server', '')}.{item.get('tool', '')}"[:300])
+        elif itype == "web_search" and not done:
+            run.emit("action", "web search: " + str(item.get("query") or "")[:300])
+        elif itype == "todo_list" and done:
+            todo = "; ".join(("[x] " if t.get("completed") else "[ ] ") + str(t.get("text") or "")
+                             for t in item.get("items") or [])
+            if todo:
+                run.emit("log", "plan: " + todo[:1500])
+        elif itype == "error" and done:
+            run.emit("log", "codex: " + str(item.get("message") or "")[:500])
+    elif kind == "turn.completed":
+        state["completed"] = True
+        state["usage"] = ev.get("usage") or {}
+    elif kind == "turn.failed":
+        state["failed"] = str((ev.get("error") or {}).get("message") or "turn failed")
+    elif kind == "error":
+        # Reconnect notices and the final error, which turn.failed repeats.
+        run.emit("log", "codex: " + str(ev.get("message") or "")[:500])
+
+
+def codex_outcome(code, state, err_tail):
+    """Map codex's exit code and events to (outcome, error): a completed turn
+    and exit 0 -> "done" (whatever came before it: a retried request is not
+    a failure); the plan's usage limit or the API's rate limit -> "limit";
+    anything else (auth, network, a crash) -> "error". Both are retried."""
+    if code == 0 and state.get("completed") and not state.get("failed"):
+        return "done", ""
+    msg = state.get("failed") or ""
+    if not msg and err_tail.strip():
+        msg = err_tail.strip().splitlines()[-1][:300]
+    if not msg:
+        msg = f"codex exited with code {code}"
+    if CODEX_LIMIT_RE.search(msg):
+        return "limit", msg
+    return "error", msg
+
+
+def codex_usage_note(usage):
+    """One log line with the run's token usage, when it has any."""
+    if not usage:
+        return ""
+    note = f"codex usage: {usage.get('input_tokens', 0)} in"
+    if usage.get("cached_input_tokens"):
+        note += f" ({usage['cached_input_tokens']} cached)"
+    note += f" / {usage.get('output_tokens', 0)} out"
+    if usage.get("reasoning_output_tokens"):
+        note += f" ({usage['reasoning_output_tokens']} reasoning)"
+    return note
+
+
+def codex_engine(run):
+    """Run one task with Codex CLI, headless, in the task's repository.
+
+    Codex does its own tool loop there (no sandbox or approvals: the agent's
+    container is the sandbox); the worker builds the prompt, streams codex's
+    events to the portal and maps the turn's end to a task outcome."""
+    if not (run.agent.get("codexAuth") or run.agent.get("apiToken") or run.agent.get("accountToken")):
+        msg = ("engine 'codex' needs a login: pick a Codex account (ChatGPT login) in the agent's "
+               "settings (Accounts page) or set the agent's own OpenAI API key")
+        run.emit("error", msg)
+        return EngineResult("failed", error=msg)
+    auth_path = codex_write_auth(run)
+    last_file = os.path.join(run.engine_home(), "last-message.md")
+    argv = codex_argv(run, last_file)
+    run.emit("log", "running: " + " ".join(argv))
+    # The persona and standing task go in the prompt: codex keeps its own
+    # instructions (there is no flag to add to them without replacing them).
+    prompt = (run.system or "").strip() + "\n\n" + run.prompt
+    state = {"answer": "", "completed": False, "failed": "", "usage": {}}
+
+    def on_line(line):
+        line = line.strip()
+        if not line.startswith("{"):
+            return
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if isinstance(ev, dict):
+            codex_stream_event(run, ev, state)
+
+    try:
+        code, err_tail = run_process(run, argv, stdin_text=prompt, env=codex_env(run), on_line=on_line)
+    finally:
+        codex_report_refresh(run, auth_path)
+    outcome, error = codex_outcome(code, state, err_tail)
+    note = codex_usage_note(state["usage"])
+    if note:
+        run.emit("log", note)
+    answer = state["answer"]
+    try:
+        with open(last_file) as f:
+            answer = f.read() or answer  # -o: codex's final message
+    except OSError:
+        pass
+    if outcome == "done" and not answer.strip():
+        return EngineResult("failed", error="codex finished without a final message")
+    return EngineResult(outcome, answer=answer, error=error)
+
+
+ENGINES = {"doppio": doppio_engine, "vibe": vibe_engine, "qwen-code": qwen_engine, "codex": codex_engine}
 
 
 def task_workdir(t, agent=None):
@@ -2772,9 +3009,9 @@ def run_task(mgr, agent, system, t):
     # A CLI engine logs in with the shared account, not with the agent's own
     # API token: without one it cannot authenticate at all. Engines that are
     # not built in (the tests register their own) are exempt.
-    builtin = ENGINES.get(engine_name) in (doppio_engine, vibe_engine, qwen_engine)
+    builtin = ENGINES.get(engine_name) in (doppio_engine, vibe_engine, qwen_engine, codex_engine)
     if engine_name != "doppio" and builtin \
-            and not (agent.get("accountToken") or agent.get("apiToken")):
+            and not (agent.get("accountToken") or agent.get("apiToken") or agent.get("codexAuth")):
         msg = (f"engine {engine_name!r} needs a login: pick an account in the agent's settings "
                "(Accounts page) or set the agent's own API token")
         mgr.emit("error", msg, task_id=tid)

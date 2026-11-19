@@ -1978,3 +1978,231 @@ class AccountTest(unittest.TestCase):
     def test_apply_account_without_account_keeps_agent(self):
         a = {"apiToken": "own"}
         self.assertEqual(w.apply_account(a, {}), a)
+
+    def test_apply_account_codex_login(self):
+        agent = w.apply_account({"apiToken": "own"}, {"authJson": '{"tokens":{}}'})
+        self.assertEqual(agent["codexAuth"], '{"tokens":{}}')
+
+
+class FakeCodex:
+    """A fake `codex` binary: records its argv, cwd, stdin, env and the codex
+    home it found, prints scripted JSONL events, writes the -o file and exits
+    with a scripted code. `refresh` makes it rewrite auth.json like codex
+    does after refreshing the login."""
+
+    def __init__(self, tmp, lines, code, last=None, refresh=None):
+        self.dir = os.path.join(tmp, "bin-codex")
+        os.makedirs(self.dir, exist_ok=True)
+        with open(os.path.join(self.dir, "codex"), "w") as f:
+            f.write("#!/bin/sh\npython3 \"$FAKE_CODEX_SCRIPT\" \"$@\"\n")
+        os.chmod(os.path.join(self.dir, "codex"), 0o755)
+        script = os.path.join(tmp, "fake_codex.py")
+        with open(script, "w") as f:
+            f.write(f"""import json, os, sys
+home = os.path.join(os.environ['HOME'], '.codex')
+def read(p):
+    try:
+        return open(os.path.join(home, p)).read()
+    except OSError:
+        return None
+argv = sys.argv[1:]
+with open(os.environ['FAKE_CODEX_CALLS'], 'a') as fh:
+    fh.write(json.dumps({{'argv': ['codex'] + argv, 'cwd': os.getcwd(), 'stdin': sys.stdin.read(),
+                         'gh_token': os.environ.get('GH_TOKEN'), 'api_key': os.environ.get('CODEX_API_KEY'),
+                         'auth': read('auth.json'), 'config': read('config.toml')}}) + '\\n')
+if {refresh!r} is not None:
+    open(os.path.join(home, 'auth.json'), 'w').write({refresh!r})
+for line in {lines!r}:
+    print(line, flush=True)
+if {last!r} is not None and '-o' in argv:
+    open(argv[argv.index('-o') + 1], 'w').write({last!r})
+sys.exit({code!r})
+""")
+        os.environ["FAKE_CODEX_SCRIPT"] = script
+        os.environ["FAKE_CODEX_CALLS"] = os.path.join(tmp, "codex-calls.jsonl")
+
+    def use(self):
+        orig = os.environ["PATH"]
+        os.environ["PATH"] = self.dir + os.pathsep + orig
+        return lambda: os.environ.update(PATH=orig)
+
+
+def codex_events(*evs):
+    return [json.dumps(e) for e in evs]
+
+
+CODEX_OK = codex_events(
+    {"type": "thread.started", "thread_id": "th1"},
+    {"type": "turn.started"},
+    {"type": "item.completed", "item": {"id": "i0", "type": "reasoning", "text": "look at the repo"}},
+    {"type": "item.started", "item": {"id": "i1", "type": "command_execution", "command": "/bin/bash -lc 'ls'",
+                                      "aggregated_output": "", "exit_code": None, "status": "in_progress"}},
+    {"type": "item.completed", "item": {"id": "i1", "type": "command_execution", "command": "/bin/bash -lc 'ls'",
+                                        "aggregated_output": "README.md\n", "exit_code": 0, "status": "completed"}},
+    {"type": "item.completed", "item": {"id": "i2", "type": "file_change", "status": "completed",
+                                        "changes": [{"path": "x.py", "kind": "update"}]}},
+    {"type": "item.completed", "item": {"id": "i3", "type": "agent_message", "text": "All done."}},
+    {"type": "turn.completed", "usage": {"input_tokens": 200, "cached_input_tokens": 20, "output_tokens": 40,
+                                         "reasoning_output_tokens": 10}},
+)
+
+
+def codex_failed(message, retries=0):
+    return codex_events(
+        {"type": "thread.started", "thread_id": "th1"}, {"type": "turn.started"},
+        *[{"type": "error", "message": f"Reconnecting... {i + 1}/5 (stream disconnected)"} for i in range(retries)],
+        {"type": "error", "message": message},
+        {"type": "turn.failed", "error": {"message": message}})
+
+
+class CodexMgr(RunTaskMgr):
+    def __init__(self, adopt=True):
+        super().__init__()
+        self.reported = []
+        self.adopt = adopt
+
+    def report_codex_auth(self, auth_json):
+        self.reported.append(auth_json)
+        return self.adopt
+
+
+class CodexEngineTest(unittest.TestCase):
+    AUTH = json.dumps({"tokens": {"access_token": "a0", "refresh_token": "rt-0", "account_id": "acct"},
+                       "last_refresh": "2026-11-18T00:00:00Z"})
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="doppio-codex-")
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+        for k in ("FAKE_CODEX_SCRIPT", "FAKE_CODEX_CALLS"):
+            os.environ.pop(k, None)
+        p = unittest.mock.patch.object(w, "ENGINE_ENV_ALLOW",
+                                       w.ENGINE_ENV_ALLOW + ("FAKE_CODEX_CALLS", "FAKE_CODEX_SCRIPT"))
+        p.start()
+        self.addCleanup(p.stop)
+        # The account file the manager writes (and rewrites on refresh).
+        self.account_path = os.path.join(self.tmp, "account.json")
+        p = unittest.mock.patch.object(w, "ACCOUNT_PATH", self.account_path)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def account(self, auth):
+        with open(self.account_path, "w") as f:
+            json.dump({"authJson": auth}, f)
+
+    def run_codex(self, lines, code=0, last=None, refresh=None, agent_cfg=None, task=None, mgr=None):
+        self.addCleanup(FakeCodex(self.tmp, lines, code, last=last, refresh=refresh).use())
+        mgr = mgr or CodexMgr()
+        cfg = {"engine": "codex", "codexAuth": self.AUTH}
+        cfg.update(agent_cfg or {})
+        t = task or {"id": "t9", "kind": "assigned", "title": "x", "input": "do it",
+                     "source": "github:o/r#issues:7@assigned"}
+        run = w.TaskRun(mgr, agent(**cfg), "sys persona", t, t["input"], WS_DIR, minutes=5)
+        try:
+            res = w.codex_engine(run)
+        finally:
+            w.cleanup_engine_home(run)
+        calls = []
+        if os.path.exists(os.environ["FAKE_CODEX_CALLS"]):
+            with open(os.environ["FAKE_CODEX_CALLS"]) as f:
+                calls = [json.loads(l) for l in f if l.strip()]
+        return res, mgr, (calls[-1] if calls else None)
+
+    def test_argv_prompt_and_login(self):
+        res, mgr, call = self.run_codex(CODEX_OK, last="Final answer.", agent_cfg={"model": "gpt-5-codex",
+                                                                                   "gitToken": "gt"})
+        self.assertEqual(call["argv"], ["codex", "exec", "--json", "--dangerously-bypass-approvals-and-sandbox",
+                                        "--skip-git-repo-check", "--ephemeral", "-C", WS_DIR, "-m", "gpt-5-codex",
+                                        "-o", call["argv"][-2], "-"])
+        self.assertEqual(call["cwd"], WS_DIR)
+        self.assertEqual(call["stdin"], "sys persona\n\ndo it")
+        # The ChatGPT login is in the task's codex home; no API key on top.
+        self.assertEqual(call["auth"], self.AUTH)
+        self.assertIsNone(call["api_key"])
+        self.assertIn("check_for_update_on_startup = false", call["config"])
+        self.assertIn("[analytics]\nenabled = false", call["config"])
+        self.assertEqual(call["gh_token"], "gt")  # gh/glab open the PR on an assigned task
+        # The -o file is the answer.
+        self.assertEqual((res.outcome, res.answer), ("done", "Final answer."))
+        self.assertEqual(mgr.reported, [])  # codex didn't refresh: nothing to report
+        # Streamed to the portal: thinking, the command, its output, the edit, the message, usage.
+        events = [(t, c) for t, c in mgr.events]
+        self.assertIn(("log", "thinking: look at the repo"), events)
+        self.assertIn(("action", "$ /bin/bash -lc 'ls'"), events)
+        self.assertIn(("log", "→ README.md"), events)
+        self.assertIn(("action", "edit: update x.py"), events)
+        self.assertIn(("assistant", "All done."), events)
+        self.assertIn(("log", "codex usage: 200 in (20 cached) / 40 out (10 reasoning)"), events)
+
+    def test_answer_falls_back_to_the_last_message(self):
+        res, _, _ = self.run_codex(CODEX_OK)
+        self.assertEqual((res.outcome, res.answer), ("done", "All done."))
+
+    def test_login_is_read_again_for_each_task(self):
+        # The manager refreshed the login after the worker started: the
+        # account file wins over the copy loaded at start.
+        newer = self.AUTH.replace("rt-0", "rt-1")
+        self.account(newer)
+        _, mgr, call = self.run_codex(CODEX_OK)
+        self.assertEqual(call["auth"], newer)
+        self.assertEqual(mgr.reported, [])
+
+    def test_a_refresh_by_codex_goes_back_to_the_manager(self):
+        refreshed = self.AUTH.replace("rt-0", "rt-1")
+        res, mgr, _ = self.run_codex(CODEX_OK, refresh=refreshed)
+        self.assertEqual(res.outcome, "done")
+        self.assertEqual(mgr.reported, [refreshed])
+        self.assertTrue(any("manager adopted" in c for _, c in mgr.events))
+        # Nothing reported when codex leaves a file without tokens.
+        _, mgr, _ = self.run_codex(CODEX_OK, refresh="{}")
+        self.assertEqual(mgr.reported, [])
+
+    def test_api_key_without_a_login(self):
+        _, _, call = self.run_codex(CODEX_OK, agent_cfg={"codexAuth": "", "apiToken": "sk-own"})
+        self.assertEqual(call["api_key"], "sk-own")
+        self.assertIsNone(call["auth"])
+
+    def test_no_login_at_all_fails_without_running(self):
+        res, _, call = self.run_codex(CODEX_OK, agent_cfg={"codexAuth": "", "apiToken": ""})
+        self.assertEqual(res.outcome, "failed")
+        self.assertIn("needs a login", res.error)
+        self.assertIsNone(call)
+
+    def test_review_gets_no_git_token(self):
+        task = {"id": "t8", "kind": "review", "title": "r", "input": "review",
+                "source": "github:o/r#pull_requests:1@abc"}
+        _, _, call = self.run_codex(CODEX_OK, agent_cfg={"gitToken": "gt"}, task=task)
+        self.assertIsNone(call["gh_token"])
+
+    def test_outcomes(self):
+        cases = [
+            (codex_failed("You’ve hit your usage limit. Upgrade to Pro or try again later."), 1, "limit"),
+            (codex_failed("exceeded retry limit, last status: 429 Too Many Requests", retries=5), 1, "limit"),
+            (codex_failed("unexpected status 401 Unauthorized: Invalid token"), 1, "error"),
+            (codex_failed("stream disconnected before completion: error sending request", retries=5), 1, "error"),
+            ([], 101, "error"),  # crashed before any event
+        ]
+        for lines, code, want in cases:
+            with self.subTest(want=want, lines=lines[-1:] if lines else code):
+                res, _, _ = self.run_codex(lines, code)
+                self.assertEqual(res.outcome, want)
+                self.assertTrue(res.error)
+
+    def test_reconnects_before_a_completed_turn_are_done(self):
+        lines = CODEX_OK[:2] + codex_events({"type": "error", "message": "Reconnecting... 1/5 (429 Too Many Requests)"}) \
+            + CODEX_OK[2:]
+        res, _, _ = self.run_codex(lines)
+        self.assertEqual(res.outcome, "done")
+
+    def test_done_without_a_message_fails(self):
+        lines = codex_events({"type": "turn.started"}, {"type": "turn.completed", "usage": {}})
+        res, _, _ = self.run_codex(lines)
+        self.assertEqual(res.outcome, "failed")
+        self.assertIn("without a final message", res.error)
+
+    def test_run_task_accepts_a_codex_login_alone(self):
+        self.addCleanup(FakeCodex(self.tmp, CODEX_OK, 0).use())
+        mgr = CodexMgr()
+        a = agent(engine="codex", codexAuth=self.AUTH, apiToken="")
+        t = {"id": "t7", "kind": "chat", "title": "hi", "input": "hello", "source": ""}
+        self.assertEqual(w.run_task(mgr, a, "sys", t), "done")
+        self.assertEqual(mgr.finished[-1][:2], ("t7", "done"))

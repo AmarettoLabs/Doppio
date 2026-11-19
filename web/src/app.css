@@ -151,3 +151,11 @@ textarea { min-height: 7rem; resize: vertical; }
 dl.summary { display: grid; grid-template-columns: 160px 1fr; gap: 0.3rem 1rem; margin: 0; }
 dl.summary dt { color: var(--muted); }
 dl.summary dd { margin: 0; word-break: break-word; }
+
+/* A one-time code to type elsewhere (the ChatGPT login). */
+code.otp {
+	font-size: 1.3em;
+	letter-spacing: 0.08em;
+	padding: 0.15em 0.4em;
+	user-select: all;
+}

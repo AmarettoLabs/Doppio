@@ -50,6 +50,10 @@ type Server struct {
 	// restarts running in the background (tests wait on it).
 	restartMu sync.Mutex
 	restarts  sync.WaitGroup
+
+	// Codex logins and refreshes (see codex.go), set up on first use.
+	codexOnce sync.Once
+	codexSt   *codexState
 }
 
 // NewServer builds the API server.
@@ -97,6 +101,9 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/accounts/{id}", s.handleGetAccount)
 	mux.HandleFunc("PATCH /api/accounts/{id}", s.handleUpdateAccount)
 	mux.HandleFunc("DELETE /api/accounts/{id}", s.handleDeleteAccount)
+	mux.HandleFunc("POST /api/accounts/{id}/codex-login", s.handleCodexLoginStart)
+	mux.HandleFunc("GET /api/accounts/{id}/codex-login", s.handleCodexLoginStatus)
+	mux.HandleFunc("DELETE /api/accounts/{id}/codex-login", s.handleCodexLoginCancel)
 
 	// internal API (agent worker containers, authenticated by manager token)
 	mux.HandleFunc("GET /api/internal/agents/{id}/ping", s.handleInternalPing)
@@ -105,6 +112,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/internal/agents/{id}/events", s.handleInternalEvents)
 	mux.HandleFunc("POST /api/internal/agents/{id}/poll", s.handleInternalPoll)
 	mux.HandleFunc("POST /api/internal/tasks/{id}/finish", s.handleInternalFinishTask)
+	mux.HandleFunc("POST /api/internal/agents/{id}/codex-auth", s.handleInternalCodexAuth)
 
 	// static SPA with fallback to index.html
 	mux.HandleFunc("GET /", s.handleStatic)

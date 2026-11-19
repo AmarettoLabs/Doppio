@@ -12,7 +12,9 @@ const (
 	// AcctClaudeCode holds a long-lived token from `claude setup-token`
 	// (needs a Claude subscription).
 	AcctClaudeCode AccountKind = "claude-code"
-	// AcctCodex is a ChatGPT login for the Codex CLI (device-code flow).
+	// AcctCodex is a ChatGPT login for the Codex CLI: the auth.json codex
+	// writes after logging in (device-code flow from the portal, or pasted).
+	// The manager keeps it refreshed (see internal/codexauth).
 	AcctCodex AccountKind = "codex"
 	// AcctVibe holds the key Mistral Vibe writes to ~/.vibe/.env after
 	// logging in with a Mistral account (MISTRAL_API_KEY).
@@ -43,8 +45,8 @@ func AccountKinds() []AccountKindInfo {
 			"Base URL + token, e.g. a local LLM; uses the extra hosts / CA bundle settings"},
 		{AcctClaudeCode, "Claude Code", []string{"token"},
 			"Long-lived token from `claude setup-token` (needs a Claude subscription), pasted"},
-		{AcctCodex, "Codex CLI (ChatGPT login)", []string{},
-			"ChatGPT login through the device-code flow"},
+		{AcctCodex, "Codex CLI (ChatGPT login)", []string{"authJson"},
+			"Log in with ChatGPT from this page (device code), or paste the ~/.codex/auth.json `codex login` wrote; the manager keeps it refreshed"},
 		{AcctVibe, "Mistral Vibe", []string{"apiKey"},
 			"The key Vibe writes to ~/.vibe/.env (MISTRAL_API_KEY) after logging in with a Mistral account, pasted"},
 	}

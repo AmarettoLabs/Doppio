@@ -121,6 +121,17 @@ export interface AccountPayload {
 	secrets?: Record<string, string>;
 }
 
+/** A ChatGPT device-code login for a Codex account. */
+export interface CodexLogin {
+	/** none, waiting, done, failed, cancelled */
+	state: string;
+	/** while waiting: the page to open and the one-time code to enter there */
+	url?: string;
+	code?: string;
+	error?: string;
+	startedAt?: string;
+}
+
 /** Git activity an agent can respond to, in display order. */
 export const TRIGGERS: { id: string; label: string; hint: string }[] = [
 	{ id: 'review_requests', label: 'Review requests', hint: 'review the PR and comment with a verdict' },
@@ -222,6 +233,9 @@ export const api = {
 	account: (id: string) => req<AccountView>(`/api/accounts/${id}`),
 	createAccount: (a: AccountPayload) => req<AccountView>('/api/accounts', json('POST')(a)),
 	updateAccount: (id: string, a: AccountPayload) => req<AccountView>(`/api/accounts/${id}`, json('PATCH')(a)),
+	codexLoginStart: (id: string) => req<CodexLogin>(`/api/accounts/${id}/codex-login`, { method: 'POST' }),
+	codexLogin: (id: string) => req<CodexLogin>(`/api/accounts/${id}/codex-login`),
+	codexLoginCancel: (id: string) => req<CodexLogin>(`/api/accounts/${id}/codex-login`, { method: 'DELETE' }),
 	deleteAccount: (id: string) => req<{ deleted: string } | { error: string; agents: string[] }>(`/api/accounts/${id}`, { method: 'DELETE' })
 };
 

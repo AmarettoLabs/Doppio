@@ -84,7 +84,9 @@ func Engines() []EngineInfo {
 			"mistral-large-4-0-3", "mistral-medium-3.5", "glm-5-3", "zai-glm-5-3-flash",
 		}},
 		{ID: EngineClaudeCode, Label: "Claude Code"},
-		{ID: EngineCodex, Label: "Codex CLI"},
+		// Codex CLI runs on a ChatGPT login (the Codex account) or the
+		// agent's own OpenAI API key.
+		{ID: EngineCodex, Label: "Codex CLI", Available: true},
 		// Qwen Code runs on any OpenAI-compatible endpoint (e.g. a local
 		// LLM), logged in with the endpoint account.
 		{ID: EngineQwenCode, Label: "Qwen Code", Available: true},

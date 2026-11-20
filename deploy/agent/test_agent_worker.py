@@ -1942,6 +1942,150 @@ class PrepareTaskTest(Patched):
         self.assertIn("Do not commit, push", text)
         self.assertIn("scratch files (helper scripts, notes) under /tmp", text)
 
+    def test_review_prompt_carries_ci_results(self):
+        sha = "5bac782215053f034fa4252bef0bdcc041c6bebd"
+        fake = self.use({
+            r"/repos/o/r/pulls/8": {"base": {"ref": "main"}, "head": {"ref": "fix", "sha": sha}},
+            rf"/repos/o/r/commits/{sha}/check-runs\?per_page=100&page=1": {"check_runs": [
+                {"name": "Python", "status": "completed", "conclusion": "success"},
+                {"name": "Go", "status": "completed", "conclusion": "failure",
+                 "output": {"title": "go vet: 2 problems"}},
+                {"name": "Frontend", "status": "in_progress", "conclusion": None},
+            ]},
+            rf"/repos/o/r/commits/{sha}/status\?per_page=100&page=1": {"statuses": [
+                {"context": "ci/legacy", "state": "success", "description": "ok"}]},
+        })
+        text = w.prepare_task(agent(), {"id": "t2", "kind": "review", "source": "github:o/r#pull_requests:8@abc"})
+        self.assertIn("CI on the head commit `5bac782`", text)
+        self.assertIn("4 checks, 1 failed, 1 pending, 2 passed", text)
+        # Failures lead, then pending, then the rest.
+        ci = text[text.index("CI on the head commit"):]
+        self.assertLess(ci.index("- Go: failure (go vet: 2 problems)"), ci.index("- Frontend: in_progress"))
+        self.assertLess(ci.index("- Frontend: in_progress"), ci.index("- Python: success"))
+        self.assertIn("- ci/legacy: success (ok)", ci)
+        self.assertIn("rely on these results", ci)
+        self.assertTrue(any("/check-runs" in url for _, url, _ in fake.calls))
+
+    def test_ci_fetch_failure_does_not_block_the_task(self):
+        sha = "a" * 40
+        def denied(path):
+            raise RuntimeError("HTTP 403 from https://api.github.com/...: Resource not accessible")
+        self.use({r"/repos/o/r/pulls/8": {"base": {"ref": "main"}, "head": {"ref": "fix", "sha": sha}},
+                  r"/repos/o/r/commits/a+/check-runs.*": denied})
+        text = w.prepare_task(agent(), {"id": "t2", "kind": "review", "source": "github:o/r#pull_requests:8@abc"})
+        self.assertIn("Your job: review this pull request", text)
+        self.assertIn("`aaaaaaa`: could not be fetched (HTTP 403", text)
+
+    def test_assigned_issue_gets_no_ci_section(self):
+        fake = self.use({r"/repos/o/r/issues/7": {"title": "Add CI"}, r"/repos/o/r/pulls\?.*": []})
+        text = w.prepare_task(agent(), {"id": "t1", "kind": "assigned", "source": "github:o/r#issues:7"})
+        self.assertNotIn("CI on the head commit", text)
+        self.assertFalse(any("/commits/" in url for _, url, _ in fake.calls))
+
+
+class CIResultsTest(unittest.TestCase):
+    def test_gitlab_pipeline_jobs(self):
+        calls = []
+        def gl(agent, method, path, body=None):
+            calls.append(path)
+            if "/bridges" in path:
+                return []
+            return [{"stage": "test", "name": "pytest", "status": "failed"},
+                    {"stage": "lint", "name": "ruff", "status": "success"}]
+        orig = w.gl_req
+        w.gl_req = gl
+        self.addCleanup(setattr, w, "gl_req", orig)
+        text = w.ci_results(agent(gitProvider="gitlab"), "gitlab", "g/p",
+                            {"sha": "b" * 40, "head_pipeline": {"id": 99, "status": "failed"}})
+        self.assertEqual(calls, ["/api/v4/projects/g%2Fp/pipelines/99/jobs?per_page=100&page=1",
+                                 "/api/v4/projects/g%2Fp/pipelines/99/bridges?per_page=100&page=1"])
+        self.assertIn("3 checks, 2 failed, 1 passed", text)
+        self.assertIn("- pipeline: failed", text)
+        self.assertLess(text.index("test: pytest: failed"), text.index("lint: ruff: success"))
+
+    def _gh(self, routes):
+        fake = FakeGitHub(routes)
+        orig = w.gh_req
+        w.gh_req = fake
+        self.addCleanup(setattr, w, "gh_req", orig)
+        return fake
+
+    def test_failure_on_a_later_page_counts(self):
+        ok = {"status": "completed", "conclusion": "success"}
+        page1 = [dict(ok, name=f"ok{i:03d}") for i in range(100)]
+        page2 = [dict(ok, name="ok100"), {"name": "late", "status": "completed", "conclusion": "failure"}]
+        statuses1 = [{"context": f"s{i:03d}", "state": "success"} for i in range(100)]
+        statuses2 = [{"context": "s-late", "state": "failure"}]
+        fake = self._gh({
+            r"/repos/o/r/commits/d+/check-runs\?per_page=100&page=1": {"total_count": 102, "check_runs": page1},
+            r"/repos/o/r/commits/d+/check-runs\?per_page=100&page=2": {"total_count": 102, "check_runs": page2},
+            r"/repos/o/r/commits/d+/status\?per_page=100&page=1": {"total_count": 101, "statuses": statuses1},
+            r"/repos/o/r/commits/d+/status\?per_page=100&page=2": {"total_count": 101, "statuses": statuses2},
+        })
+        text = w.ci_results(agent(), "github", "o/r", {"head": {"sha": "d" * 40}})
+        self.assertIn("203 checks, 2 failed, 201 passed", text)
+        lines = text.splitlines()
+        self.assertTrue(lines[1].startswith("- late: failure") or lines[1].startswith("- s-late: failure"), lines[1])
+        self.assertIn("- s-late: failure", text)
+        self.assertNotIn("incomplete", text)
+        self.assertEqual(len(fake.calls), 4)  # stops once total_count is reached
+
+    def test_gitlab_jobs_are_paged_until_a_short_page(self):
+        pages = {1: [{"stage": "t", "name": f"j{i}", "status": "success"} for i in range(100)],
+                 2: [{"stage": "t", "name": "late", "status": "failed"}]}
+        calls = []
+        def gl(agent, method, path, body=None):
+            calls.append(path)
+            if "/bridges" in path:
+                return []
+            return pages.get(int(path.rsplit("page=", 1)[1]), [])
+        orig = w.gl_req
+        w.gl_req = gl
+        self.addCleanup(setattr, w, "gl_req", orig)
+        text = w.ci_results(agent(gitProvider="gitlab"), "gitlab", "g/p",
+                            {"sha": "e" * 40, "head_pipeline": {"id": 7, "status": "failed"}})
+        self.assertEqual(sum("/jobs" in c for c in calls), 2)
+        self.assertIn("102 checks, 2 failed, 100 passed", text)
+
+    def test_failed_downstream_trigger_is_not_reported_as_passed(self):
+        def gl(agent, method, path, body=None):
+            if "/bridges" in path:
+                return [{"stage": "deploy", "name": "downstream", "status": "failed"}]
+            return [{"stage": "build", "name": "build", "status": "success"}]
+        orig = w.gl_req
+        w.gl_req = gl
+        self.addCleanup(setattr, w, "gl_req", orig)
+        text = w.ci_results(agent(gitProvider="gitlab"), "gitlab", "g/p",
+                            {"sha": "9" * 40, "head_pipeline": {"id": 5, "status": "failed"}})
+        self.assertIn("3 checks, 2 failed, 1 passed", text)
+        lines = text.splitlines()
+        self.assertIn("- deploy: downstream (trigger): failed", lines[1:3])
+        self.assertIn("- pipeline: failed", lines[1:3])
+
+    def test_too_many_pages_is_flagged_incomplete(self):
+        ok = {"status": "completed", "conclusion": "success"}
+        full = lambda path: {"check_runs": [dict(ok, name="x")] * 100}
+        fake = self._gh({r"/repos/o/r/commits/f+/check-runs.*": full,
+                         r"/repos/o/r/commits/f+/status.*": {"statuses": []}})
+        text = w.ci_results(agent(), "github", "o/r", {"head": {"sha": "f" * 40}})
+        self.assertIn("totals are incomplete and a failure may be missing", text)
+        self.assertEqual(sum("/check-runs" in u for _, u, _ in fake.calls), w.CI_MAX_PAGES)
+
+    def test_no_head_commit_no_section(self):
+        self.assertEqual(w.ci_results(agent(), "github", "o/r", {"head": {"ref": "x"}}), "")
+
+    def test_long_lists_are_capped(self):
+        runs = [{"name": f"job{i:02d}", "status": "completed", "conclusion": "success"} for i in range(40)]
+        fake = FakeGitHub({r"/repos/o/r/commits/c+/check-runs.*": {"check_runs": runs},
+                           r"/repos/o/r/commits/c+/status.*": {"statuses": []}})
+        orig = w.gh_req
+        w.gh_req = fake
+        self.addCleanup(setattr, w, "gh_req", orig)
+        text = w.ci_results(agent(), "github", "o/r", {"head": {"sha": "c" * 40}})
+        self.assertIn("40 checks, 40 passed", text)
+        self.assertIn("- ... and 10 more", text)
+        self.assertNotIn("job35", text)
+
 
 if __name__ == "__main__":
     unittest.main()

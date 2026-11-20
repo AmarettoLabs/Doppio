@@ -240,7 +240,10 @@ runs as an unprivileged user that cannot read the agent's own tokens in
 reviews, mentions and portal messages no git token at all, assigned issues
 and PRs the git token to push with. The worker reads the config itself,
 updates the repository (through a root-owned mirror of it) and posts the
-answers. One key is necessarily in the engine's reach: a CLI engine's model
+answers. On a pull/merge request (reviews, assigned PRs, mentions on
+a PR) the worker also fetches the CI results for the head commit and puts
+them in the prompt, failures first: without a token the engine couldn't read
+them on a private repository. One key is necessarily in the engine's reach: a CLI engine's model
 key or login (`MISTRAL_API_KEY` for Mistral Vibe) is passed into its
 environment, so a steered CLI engine can read and spend it. Only the
 Doppio loop keeps the model key away from the engine, with the worker.
@@ -324,6 +327,8 @@ their own, at pinned versions (build args at the top of the file):
 | `claude`, `codex`, `vibe`, `qwen` | The coding CLIs, for the CLI engines. |
 | `gh`, `glab` | Opening pull/merge requests; CLI engines don't have Doppio's `create_pr` tool. |
 | `go` | Running `go test ./...` on a checkout (the version `go.mod` builds with). |
+| `make`, `gcc` | A repo's `make check`/`make test`; cgo, which `go test -race` needs. |
+| `uv` | A Python checkout's `uv sync` and `uv run ...` (ruff, mypy, pytest at the versions the project pins). Its cache, like Go's and npm's, lives in the agent's workspace. |
 | `node` + `npm` | Running `npm ci` and `npm run check` in `web/` (Node 22, as in CI and `Dockerfile.manager`). |
 
 Every download is verified with a SHA-256 checksum (a build arg next to its

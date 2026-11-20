@@ -82,6 +82,22 @@ RUN dpkg-deb -x /tmp/gh-${TARGETARCH}.deb /tmp/gh \
  && mv /tmp/gh/usr/bin/gh /tmp/glab/usr/bin/glab /usr/local/bin/ \
  && rm -rf /tmp/gh /tmp/glab /tmp/gh-*.deb /tmp/glab-*.deb
 
+# --- uv -----------------------------------------------------------------------
+# Python projects' own toolchain (`uv sync`, `uv run pytest`): many repos'
+# checks run through it, and it installs the ruff/mypy/pytest versions the
+# project pins. Both architectures are downloaded (each with its checksum);
+# only the static binaries for TARGETARCH are copied on.
+FROM python:3.14-slim AS uv
+ARG TARGETARCH
+ARG UV_VERSION=0.13.9
+ARG UV_SHA256_AMD64=a7fbaff2b9a271d85c1bdb540941090fd1ce011797b4abeb48e4dcd39c2471d5
+ARG UV_SHA256_ARM64=0797542018e541a9288855df555c8077eed06f7a47d206362030480e8ecc9f3d
+ADD --checksum=sha256:${UV_SHA256_AMD64} https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz /tmp/uv-amd64.tar.gz
+ADD --checksum=sha256:${UV_SHA256_ARM64} https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-aarch64-unknown-linux-gnu.tar.gz /tmp/uv-arm64.tar.gz
+RUN mkdir /tmp/x && tar -xzf /tmp/uv-${TARGETARCH}.tar.gz -C /tmp/x --strip-components=1 \
+ && mv /tmp/x/uv /tmp/x/uvx /usr/local/bin/ \
+ && rm -rf /tmp/x /tmp/uv-*.tar.gz
+
 # --- Go toolchain -----------------------------------------------------------
 # The Go toolchain agents run `go test ./...` with (the version go.mod builds
 # with). Both architectures are downloaded (each with its checksum), the one
@@ -111,8 +127,11 @@ RUN python3 -m venv /opt/vibe \
 # --- Final image -----------------------------------------------------------
 FROM python:3.14-slim
 # ca-certificates: the worker and the CLIs talk HTTPS to the manager, the git
-# host and the model API. git: the workspace is a git checkout.
+# host and the model API. git: the workspace is a git checkout. make: most
+# repos' checks start with `make check`/`make test`. gcc + libc6-dev: cgo,
+# which `go test -race` needs, and Python packages built from source.
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    make gcc libc6-dev \
  && rm -rf /var/lib/apt/lists/*
 # The unprivileged user the worker runs every engine as (the coding CLIs and
 # the Doppio loop's shell), while it keeps reading /agent/state itself: this
@@ -128,6 +147,8 @@ COPY --from=git-host-clis /usr/local/bin/gh /usr/local/bin/gh
 COPY --from=git-host-clis /usr/local/bin/glab /usr/local/bin/glab
 # The Go toolchain (agents run `go test ./...` on a checkout).
 COPY --from=go-toolchain /usr/local/go /usr/local/go
+# uv (agents run `uv sync` / `uv run ...` on a Python checkout).
+COPY --from=uv /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
 ENV PATH=/usr/local/go/bin:$PATH
 # codex, and vibe's venv with its three entry points linked onto PATH (the
 # launcher points the Rust CLI at the vibe-app-server script next to itself,

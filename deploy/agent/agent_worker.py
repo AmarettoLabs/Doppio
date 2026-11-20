@@ -1249,6 +1249,111 @@ def fetch_item(agent, repo, kind, num):
     return gl_req(agent, "GET", f"/api/v4/projects/{proj}/{kind}/{num}") or {}
 
 
+CI_MAX_LISTED = 30
+CI_PAGE_SIZE = 100
+CI_MAX_PAGES = 10  # 1000 checks; more than that is reported as incomplete
+
+# GitHub check-run conclusions / commit-status states, and GitLab job and
+# pipeline statuses, grouped the way a reviewer reads them.
+_CI_FAILED = {"failure", "timed_out", "action_required", "startup_failure", "error", "failed", "canceled", "cancelled"}
+_CI_PASSED = {"success", "neutral", "skipped", "passed"}
+
+
+def _ci_pages(fetch, key):
+    """Every item of a paged CI listing: fetch(page) returns a page (a list,
+    or a dict holding the list under key). Totals must cover all pages: a
+    failure on page 2 must not read as "all passed". Returns (items,
+    complete); complete is False when CI_MAX_PAGES full pages were read."""
+    items = []
+    for page in range(1, CI_MAX_PAGES + 1):
+        got = fetch(page) or ([] if key is None else {})
+        batch = (got if key is None else got.get(key)) or []
+        items.extend(batch)
+        total = None if key is None else got.get("total_count")
+        if len(batch) < CI_PAGE_SIZE or (total is not None and len(items) >= total):
+            return items, True
+    return items, False
+
+
+def ci_results(agent, provider, repo, item):
+    """The CI results for a pull/merge request's head commit, one line per
+    check, as text for the task's prompt (or "" without a head commit).
+
+    The worker fetches them with the agent's token: the engine has no token
+    on review tasks, so on a private repository it cannot see CI at all, and
+    an engine that can't run the repo's full checks locally (missing
+    toolchains) otherwise has nothing to go on."""
+    if provider == "github":
+        sha = (item.get("head") or {}).get("sha") or ""
+    else:
+        sha = item.get("sha") or ""
+    if not sha:
+        return ""
+    checks = []  # (name, state, detail)
+    complete = True
+    try:
+        if provider == "github":
+            base = f"{gh_base(agent)}/repos/{repo}/commits/{sha}"
+            runs, done_runs = _ci_pages(lambda page: gh_req(
+                agent, "GET", f"{base}/check-runs?per_page={CI_PAGE_SIZE}&page={page}"), "check_runs")
+            for r in runs:
+                state = r.get("conclusion") or r.get("status") or "unknown"
+                title = ((r.get("output") or {}).get("title") or "").strip()
+                checks.append((r.get("name") or "?", state, title))
+            statuses, done_st = _ci_pages(lambda page: gh_req(
+                agent, "GET", f"{base}/status?per_page={CI_PAGE_SIZE}&page={page}"), "statuses")
+            for st in statuses:
+                checks.append((st.get("context") or "?", st.get("state") or "unknown",
+                               (st.get("description") or "").strip()))
+            complete = done_runs and done_st
+        else:
+            pipe = item.get("head_pipeline") or {}
+            if pipe.get("id"):
+                proj = urllib.parse.quote(repo, safe="")
+                # The pipeline's own status always counts: it is the verdict,
+                # and it covers whatever the job lists below miss.
+                checks.append(("pipeline", pipe.get("status") or "unknown", ""))
+                # /jobs leaves out trigger (bridge) jobs, which start
+                # downstream pipelines: those are listed by /bridges.
+                complete = True
+                for kind in ("jobs", "bridges"):
+                    jobs, done = _ci_pages(lambda page, kind=kind: gl_req(
+                        agent, "GET", f"/api/v4/projects/{proj}/pipelines/{pipe['id']}/{kind}"
+                                      f"?per_page={CI_PAGE_SIZE}&page={page}"), None)
+                    complete = complete and done
+                    for j in jobs:
+                        name = f"{j.get('stage') or '?'}: {j.get('name') or '?'}"
+                        if kind == "bridges":
+                            name += " (trigger)"
+                        checks.append((name, j.get("status") or "unknown", ""))
+    except Exception as e:
+        return (f"CI on the head commit `{sha[:7]}`: could not be fetched ({str(e)[:150]}). "
+                "Say so in your answer if CI results matter for it.")
+    if not checks:
+        return f"CI on the head commit `{sha[:7]}`: no checks reported."
+    def group(state):
+        state = state.lower()
+        return "failed" if state in _CI_FAILED else "passed" if state in _CI_PASSED else "pending"
+    counts = {"failed": 0, "pending": 0, "passed": 0}
+    for _, state, _ in checks:
+        counts[group(state)] += 1
+    # Failures first, then pending, then the rest: what needs attention leads.
+    order = {"failed": 0, "pending": 1, "passed": 2}
+    checks.sort(key=lambda c: (order[group(c[1])], c[0].lower()))
+    lines = [f"- {name}: {state}" + (f" ({detail[:200]})" if detail else "")
+             for name, state, detail in checks[:CI_MAX_LISTED]]
+    if len(checks) > CI_MAX_LISTED:
+        lines.append(f"- ... and {len(checks) - CI_MAX_LISTED} more")
+    summary = ", ".join(f"{n} {k}" for k, n in counts.items() if n)
+    if not complete:
+        summary += (f" (only the first {CI_MAX_PAGES * CI_PAGE_SIZE} per list were read: "
+                    "the totals are incomplete and a failure may be missing)")
+    return (f"CI on the head commit `{sha[:7]}` (fetched for you when the task started; you have no "
+            f"token to query it yourself): {len(checks)} checks, {summary}.\n" + "\n".join(lines) +
+            "\nRun what you can locally. Where you can't (a missing tool), rely on these results "
+            "and say which checks you didn't run yourself.")
+
+
 def open_pr_for_branch(agent, repo, branch):
     """URL of the open PR/MR whose head is branch, or ""."""
     if agent.get("gitProvider") == "github":
@@ -1514,6 +1619,10 @@ def prepare_task(agent, t):
              f"`{git(repo_dir, 'rev-parse', '--abbrev-ref', 'HEAD', check=False)}`). "
              "Put scratch files (helper scripts, notes) under /tmp, not in the workspace "
              "or the repository: the workspace is kept between tasks."]
+    if trigger in ("review_requests", "assigned_prs") or (trigger == "mentions" and kind != "issues"):
+        ci = ci_results(agent, provider, repo, item)
+        if ci:
+            parts.append(ci)
     if trigger != "mentions":
         parts.append(repo_guidance(repo_dir))
     return "\n\n".join(parts)
@@ -1936,6 +2045,8 @@ def engine_env(run):
     env.setdefault("GOCACHE", os.path.join(cache, "go-build"))
     env.setdefault("GOPATH", os.path.join(cache, "go"))
     env.setdefault("NPM_CONFIG_CACHE", os.path.join(cache, "npm"))
+    env.setdefault("UV_CACHE_DIR", os.path.join(cache, "uv"))
+    env.setdefault("UV_PYTHON_INSTALL_DIR", os.path.join(cache, "uv-python"))
     if can_push(run.task) and run.agent.get("gitToken"):
         env["GIT_TOKEN"] = run.agent["gitToken"]
     return env

@@ -1250,11 +1250,29 @@ def fetch_item(agent, repo, kind, num):
 
 
 CI_MAX_LISTED = 30
+CI_PAGE_SIZE = 100
+CI_MAX_PAGES = 10  # 1000 checks; more than that is reported as incomplete
 
 # GitHub check-run conclusions / commit-status states, and GitLab job and
 # pipeline statuses, grouped the way a reviewer reads them.
 _CI_FAILED = {"failure", "timed_out", "action_required", "startup_failure", "error", "failed", "canceled", "cancelled"}
 _CI_PASSED = {"success", "neutral", "skipped", "passed"}
+
+
+def _ci_pages(fetch, key):
+    """Every item of a paged CI listing: fetch(page) returns a page (a list,
+    or a dict holding the list under key). Totals must cover all pages: a
+    failure on page 2 must not read as "all passed". Returns (items,
+    complete); complete is False when CI_MAX_PAGES full pages were read."""
+    items = []
+    for page in range(1, CI_MAX_PAGES + 1):
+        got = fetch(page) or ([] if key is None else {})
+        batch = (got if key is None else got.get(key)) or []
+        items.extend(batch)
+        total = None if key is None else got.get("total_count")
+        if len(batch) < CI_PAGE_SIZE or (total is not None and len(items) >= total):
+            return items, True
+    return items, False
 
 
 def ci_results(agent, provider, repo, item):
@@ -1272,22 +1290,29 @@ def ci_results(agent, provider, repo, item):
     if not sha:
         return ""
     checks = []  # (name, state, detail)
+    complete = True
     try:
         if provider == "github":
             base = f"{gh_base(agent)}/repos/{repo}/commits/{sha}"
-            runs = (gh_req(agent, "GET", f"{base}/check-runs?per_page=100") or {}).get("check_runs") or []
+            runs, done_runs = _ci_pages(lambda page: gh_req(
+                agent, "GET", f"{base}/check-runs?per_page={CI_PAGE_SIZE}&page={page}"), "check_runs")
             for r in runs:
                 state = r.get("conclusion") or r.get("status") or "unknown"
                 title = ((r.get("output") or {}).get("title") or "").strip()
                 checks.append((r.get("name") or "?", state, title))
-            for st in (gh_req(agent, "GET", f"{base}/status") or {}).get("statuses") or []:
+            statuses, done_st = _ci_pages(lambda page: gh_req(
+                agent, "GET", f"{base}/status?per_page={CI_PAGE_SIZE}&page={page}"), "statuses")
+            for st in statuses:
                 checks.append((st.get("context") or "?", st.get("state") or "unknown",
                                (st.get("description") or "").strip()))
+            complete = done_runs and done_st
         else:
             pipe = item.get("head_pipeline") or {}
             if pipe.get("id"):
                 proj = urllib.parse.quote(repo, safe="")
-                jobs = gl_req(agent, "GET", f"/api/v4/projects/{proj}/pipelines/{pipe['id']}/jobs?per_page=100") or []
+                jobs, complete = _ci_pages(lambda page: gl_req(
+                    agent, "GET", f"/api/v4/projects/{proj}/pipelines/{pipe['id']}/jobs"
+                                  f"?per_page={CI_PAGE_SIZE}&page={page}"), None)
                 for j in jobs:
                     checks.append((f"{j.get('stage') or '?'}: {j.get('name') or '?'}", j.get("status") or "unknown", ""))
                 if not checks:
@@ -1311,6 +1336,9 @@ def ci_results(agent, provider, repo, item):
     if len(checks) > CI_MAX_LISTED:
         lines.append(f"- ... and {len(checks) - CI_MAX_LISTED} more")
     summary = ", ".join(f"{n} {k}" for k, n in counts.items() if n)
+    if not complete:
+        summary += (f" (only the first {CI_MAX_PAGES * CI_PAGE_SIZE} per list were read: "
+                    "the totals are incomplete and a failure may be missing)")
     return (f"CI on the head commit `{sha[:7]}` (fetched for you when the task started; you have no "
             f"token to query it yourself): {len(checks)} checks, {summary}.\n" + "\n".join(lines) +
             "\nRun what you can locally. Where you can't (a missing tool), rely on these results "

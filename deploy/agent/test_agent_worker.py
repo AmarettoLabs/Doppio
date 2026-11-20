@@ -1946,13 +1946,13 @@ class PrepareTaskTest(Patched):
         sha = "5bac782215053f034fa4252bef0bdcc041c6bebd"
         fake = self.use({
             r"/repos/o/r/pulls/8": {"base": {"ref": "main"}, "head": {"ref": "fix", "sha": sha}},
-            rf"/repos/o/r/commits/{sha}/check-runs\?per_page=100": {"check_runs": [
+            rf"/repos/o/r/commits/{sha}/check-runs\?per_page=100&page=1": {"check_runs": [
                 {"name": "Python", "status": "completed", "conclusion": "success"},
                 {"name": "Go", "status": "completed", "conclusion": "failure",
                  "output": {"title": "go vet: 2 problems"}},
                 {"name": "Frontend", "status": "in_progress", "conclusion": None},
             ]},
-            rf"/repos/o/r/commits/{sha}/status": {"statuses": [
+            rf"/repos/o/r/commits/{sha}/status\?per_page=100&page=1": {"statuses": [
                 {"context": "ci/legacy", "state": "success", "description": "ok"}]},
         })
         text = w.prepare_task(agent(), {"id": "t2", "kind": "review", "source": "github:o/r#pull_requests:8@abc"})
@@ -1995,9 +1995,60 @@ class CIResultsTest(unittest.TestCase):
         self.addCleanup(setattr, w, "gl_req", orig)
         text = w.ci_results(agent(gitProvider="gitlab"), "gitlab", "g/p",
                             {"sha": "b" * 40, "head_pipeline": {"id": 99, "status": "failed"}})
-        self.assertEqual(calls, ["/api/v4/projects/g%2Fp/pipelines/99/jobs?per_page=100"])
+        self.assertEqual(calls, ["/api/v4/projects/g%2Fp/pipelines/99/jobs?per_page=100&page=1"])
         self.assertIn("2 checks, 1 failed, 1 passed", text)
         self.assertLess(text.index("test: pytest: failed"), text.index("lint: ruff: success"))
+
+    def _gh(self, routes):
+        fake = FakeGitHub(routes)
+        orig = w.gh_req
+        w.gh_req = fake
+        self.addCleanup(setattr, w, "gh_req", orig)
+        return fake
+
+    def test_failure_on_a_later_page_counts(self):
+        ok = {"status": "completed", "conclusion": "success"}
+        page1 = [dict(ok, name=f"ok{i:03d}") for i in range(100)]
+        page2 = [dict(ok, name="ok100"), {"name": "late", "status": "completed", "conclusion": "failure"}]
+        statuses1 = [{"context": f"s{i:03d}", "state": "success"} for i in range(100)]
+        statuses2 = [{"context": "s-late", "state": "failure"}]
+        fake = self._gh({
+            r"/repos/o/r/commits/d+/check-runs\?per_page=100&page=1": {"total_count": 102, "check_runs": page1},
+            r"/repos/o/r/commits/d+/check-runs\?per_page=100&page=2": {"total_count": 102, "check_runs": page2},
+            r"/repos/o/r/commits/d+/status\?per_page=100&page=1": {"total_count": 101, "statuses": statuses1},
+            r"/repos/o/r/commits/d+/status\?per_page=100&page=2": {"total_count": 101, "statuses": statuses2},
+        })
+        text = w.ci_results(agent(), "github", "o/r", {"head": {"sha": "d" * 40}})
+        self.assertIn("203 checks, 2 failed, 201 passed", text)
+        lines = text.splitlines()
+        self.assertTrue(lines[1].startswith("- late: failure") or lines[1].startswith("- s-late: failure"), lines[1])
+        self.assertIn("- s-late: failure", text)
+        self.assertNotIn("incomplete", text)
+        self.assertEqual(len(fake.calls), 4)  # stops once total_count is reached
+
+    def test_gitlab_jobs_are_paged_until_a_short_page(self):
+        pages = {1: [{"stage": "t", "name": f"j{i}", "status": "success"} for i in range(100)],
+                 2: [{"stage": "t", "name": "late", "status": "failed"}]}
+        calls = []
+        def gl(agent, method, path, body=None):
+            calls.append(path)
+            return pages.get(int(path.rsplit("page=", 1)[1]), [])
+        orig = w.gl_req
+        w.gl_req = gl
+        self.addCleanup(setattr, w, "gl_req", orig)
+        text = w.ci_results(agent(gitProvider="gitlab"), "gitlab", "g/p",
+                            {"sha": "e" * 40, "head_pipeline": {"id": 7}})
+        self.assertEqual(len(calls), 2)
+        self.assertIn("101 checks, 1 failed, 100 passed", text)
+
+    def test_too_many_pages_is_flagged_incomplete(self):
+        ok = {"status": "completed", "conclusion": "success"}
+        full = lambda path: {"check_runs": [dict(ok, name="x")] * 100}
+        fake = self._gh({r"/repos/o/r/commits/f+/check-runs.*": full,
+                         r"/repos/o/r/commits/f+/status.*": {"statuses": []}})
+        text = w.ci_results(agent(), "github", "o/r", {"head": {"sha": "f" * 40}})
+        self.assertIn("totals are incomplete and a failure may be missing", text)
+        self.assertEqual(sum("/check-runs" in u for _, u, _ in fake.calls), w.CI_MAX_PAGES)
 
     def test_no_head_commit_no_section(self):
         self.assertEqual(w.ci_results(agent(), "github", "o/r", {"head": {"ref": "x"}}), "")
@@ -2005,7 +2056,7 @@ class CIResultsTest(unittest.TestCase):
     def test_long_lists_are_capped(self):
         runs = [{"name": f"job{i:02d}", "status": "completed", "conclusion": "success"} for i in range(40)]
         fake = FakeGitHub({r"/repos/o/r/commits/c+/check-runs.*": {"check_runs": runs},
-                           r"/repos/o/r/commits/c+/status": {"statuses": []}})
+                           r"/repos/o/r/commits/c+/status.*": {"statuses": []}})
         orig = w.gh_req
         w.gh_req = fake
         self.addCleanup(setattr, w, "gh_req", orig)

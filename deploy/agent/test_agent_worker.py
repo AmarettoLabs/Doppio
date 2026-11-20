@@ -1942,6 +1942,78 @@ class PrepareTaskTest(Patched):
         self.assertIn("Do not commit, push", text)
         self.assertIn("scratch files (helper scripts, notes) under /tmp", text)
 
+    def test_review_prompt_carries_ci_results(self):
+        sha = "5bac782215053f034fa4252bef0bdcc041c6bebd"
+        fake = self.use({
+            r"/repos/o/r/pulls/8": {"base": {"ref": "main"}, "head": {"ref": "fix", "sha": sha}},
+            rf"/repos/o/r/commits/{sha}/check-runs\?per_page=100": {"check_runs": [
+                {"name": "Python", "status": "completed", "conclusion": "success"},
+                {"name": "Go", "status": "completed", "conclusion": "failure",
+                 "output": {"title": "go vet: 2 problems"}},
+                {"name": "Frontend", "status": "in_progress", "conclusion": None},
+            ]},
+            rf"/repos/o/r/commits/{sha}/status": {"statuses": [
+                {"context": "ci/legacy", "state": "success", "description": "ok"}]},
+        })
+        text = w.prepare_task(agent(), {"id": "t2", "kind": "review", "source": "github:o/r#pull_requests:8@abc"})
+        self.assertIn("CI on the head commit `5bac782`", text)
+        self.assertIn("4 checks, 1 failed, 1 pending, 2 passed", text)
+        # Failures lead, then pending, then the rest.
+        ci = text[text.index("CI on the head commit"):]
+        self.assertLess(ci.index("- Go: failure (go vet: 2 problems)"), ci.index("- Frontend: in_progress"))
+        self.assertLess(ci.index("- Frontend: in_progress"), ci.index("- Python: success"))
+        self.assertIn("- ci/legacy: success (ok)", ci)
+        self.assertIn("rely on these results", ci)
+        self.assertTrue(any("/check-runs" in url for _, url, _ in fake.calls))
+
+    def test_ci_fetch_failure_does_not_block_the_task(self):
+        sha = "a" * 40
+        def denied(path):
+            raise RuntimeError("HTTP 403 from https://api.github.com/...: Resource not accessible")
+        self.use({r"/repos/o/r/pulls/8": {"base": {"ref": "main"}, "head": {"ref": "fix", "sha": sha}},
+                  r"/repos/o/r/commits/a+/check-runs.*": denied})
+        text = w.prepare_task(agent(), {"id": "t2", "kind": "review", "source": "github:o/r#pull_requests:8@abc"})
+        self.assertIn("Your job: review this pull request", text)
+        self.assertIn("`aaaaaaa`: could not be fetched (HTTP 403", text)
+
+    def test_assigned_issue_gets_no_ci_section(self):
+        fake = self.use({r"/repos/o/r/issues/7": {"title": "Add CI"}, r"/repos/o/r/pulls\?.*": []})
+        text = w.prepare_task(agent(), {"id": "t1", "kind": "assigned", "source": "github:o/r#issues:7"})
+        self.assertNotIn("CI on the head commit", text)
+        self.assertFalse(any("/commits/" in url for _, url, _ in fake.calls))
+
+
+class CIResultsTest(unittest.TestCase):
+    def test_gitlab_pipeline_jobs(self):
+        calls = []
+        def gl(agent, method, path, body=None):
+            calls.append(path)
+            return [{"stage": "test", "name": "pytest", "status": "failed"},
+                    {"stage": "lint", "name": "ruff", "status": "success"}]
+        orig = w.gl_req
+        w.gl_req = gl
+        self.addCleanup(setattr, w, "gl_req", orig)
+        text = w.ci_results(agent(gitProvider="gitlab"), "gitlab", "g/p",
+                            {"sha": "b" * 40, "head_pipeline": {"id": 99, "status": "failed"}})
+        self.assertEqual(calls, ["/api/v4/projects/g%2Fp/pipelines/99/jobs?per_page=100"])
+        self.assertIn("2 checks, 1 failed, 1 passed", text)
+        self.assertLess(text.index("test: pytest: failed"), text.index("lint: ruff: success"))
+
+    def test_no_head_commit_no_section(self):
+        self.assertEqual(w.ci_results(agent(), "github", "o/r", {"head": {"ref": "x"}}), "")
+
+    def test_long_lists_are_capped(self):
+        runs = [{"name": f"job{i:02d}", "status": "completed", "conclusion": "success"} for i in range(40)]
+        fake = FakeGitHub({r"/repos/o/r/commits/c+/check-runs.*": {"check_runs": runs},
+                           r"/repos/o/r/commits/c+/status": {"statuses": []}})
+        orig = w.gh_req
+        w.gh_req = fake
+        self.addCleanup(setattr, w, "gh_req", orig)
+        text = w.ci_results(agent(), "github", "o/r", {"head": {"sha": "c" * 40}})
+        self.assertIn("40 checks, 40 passed", text)
+        self.assertIn("- ... and 10 more", text)
+        self.assertNotIn("job35", text)
+
 
 if __name__ == "__main__":
     unittest.main()

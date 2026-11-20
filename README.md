@@ -172,7 +172,8 @@ the portal lists them when the engine is Mistral Vibe) and refuses the API
 names such as `mistral-large-4` before calling the API. It learns the plan's
 list during a run and caches it in its home, `~/.vibe`, which the worker keeps
 in the agent's workspace (`.vibe-home/`) so the cache survives container
-restarts; the image's `config.toml` (update checks off) replaces the stored
+restarts; the image's `config.toml` (update checks and the commit signature
+off) replaces the stored
 one at each start. If Vibe still refuses the agent's model, the worker does a
 one-line warm-up run so Vibe fetches the list, then runs the task on the
 agent's model. Only a model that is still unknown after that (not in the
@@ -191,7 +192,11 @@ hosts and CA bundle apply: as a Node CLI, Qwen reads `NODE_EXTRA_CA_CERTS`
 (the worker points it at the bundle), not `SSL_CERT_FILE`. Its usage
 statistics, self-updates and managed auto-memory are off: the memory pass
 would cost an extra model call after every task, for memories the per-task
-home discards.
+home discards. So is its commit and PR attribution (`gitCoAuthor`).
+
+No engine signs its work: Vibe's and Qwen's `Co-authored-by` trailers (and
+Qwen's AI-attribution git notes and PR line) are off in the image, so an
+agent's commits carry only its own name.
 
 Codex CLI logs in with the **Codex account**: the `auth.json` codex writes
 after a ChatGPT login. **Log in with ChatGPT** on the Accounts page runs

@@ -147,11 +147,14 @@ RUN for f in /opt/vibe/bin/vibe*; do ln -s "$f" /usr/local/bin/; done
 # qwen's managed auto-memory and auto-dream are off there too: after every
 # run they make extra model calls to write memories into the per-task HOME,
 # which the worker throws away with it.
+# No engine attribution in commits or PRs: an agent commits as itself. vibe's
+# include_commit_signature and qwen's general.gitCoAuthor (a Co-authored-by
+# trailer, an AI-attribution git note and a PR line) are on by default.
 ENV DISABLE_AUTOUPDATER=1
 RUN mkdir -p /root/.codex /root/.vibe /etc/qwen-code \
  && printf 'check_for_update_on_startup = false\n[analytics]\nenabled = false\n' > /root/.codex/config.toml \
- && printf 'enable_update_checks = false\nenable_auto_update = false\n' > /root/.vibe/config.toml \
- && printf '{ "general": { "enableAutoUpdate": false },\n  "memory": { "enableManagedAutoMemory": false, "enableManagedAutoDream": false } }\n' > /etc/qwen-code/settings.json \
+ && printf 'enable_update_checks = false\nenable_auto_update = false\ninclude_commit_signature = false\n' > /root/.vibe/config.toml \
+ && printf '{ "general": { "enableAutoUpdate": false, "gitCoAuthor": { "commit": false, "pr": false } },\n  "memory": { "enableManagedAutoMemory": false, "enableManagedAutoDream": false } }\n' > /etc/qwen-code/settings.json \
  && chmod 0644 /root/.codex/config.toml /root/.vibe/config.toml /etc/qwen-code/settings.json
 WORKDIR /agent
 COPY deploy/agent/agent_worker.py /agent/agent_worker.py

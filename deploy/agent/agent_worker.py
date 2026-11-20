@@ -1310,13 +1310,22 @@ def ci_results(agent, provider, repo, item):
             pipe = item.get("head_pipeline") or {}
             if pipe.get("id"):
                 proj = urllib.parse.quote(repo, safe="")
-                jobs, complete = _ci_pages(lambda page: gl_req(
-                    agent, "GET", f"/api/v4/projects/{proj}/pipelines/{pipe['id']}/jobs"
-                                  f"?per_page={CI_PAGE_SIZE}&page={page}"), None)
-                for j in jobs:
-                    checks.append((f"{j.get('stage') or '?'}: {j.get('name') or '?'}", j.get("status") or "unknown", ""))
-                if not checks:
-                    checks.append(("pipeline", pipe.get("status") or "unknown", ""))
+                # The pipeline's own status always counts: it is the verdict,
+                # and it covers whatever the job lists below miss.
+                checks.append(("pipeline", pipe.get("status") or "unknown", ""))
+                # /jobs leaves out trigger (bridge) jobs, which start
+                # downstream pipelines: those are listed by /bridges.
+                complete = True
+                for kind in ("jobs", "bridges"):
+                    jobs, done = _ci_pages(lambda page, kind=kind: gl_req(
+                        agent, "GET", f"/api/v4/projects/{proj}/pipelines/{pipe['id']}/{kind}"
+                                      f"?per_page={CI_PAGE_SIZE}&page={page}"), None)
+                    complete = complete and done
+                    for j in jobs:
+                        name = f"{j.get('stage') or '?'}: {j.get('name') or '?'}"
+                        if kind == "bridges":
+                            name += " (trigger)"
+                        checks.append((name, j.get("status") or "unknown", ""))
     except Exception as e:
         return (f"CI on the head commit `{sha[:7]}`: could not be fetched ({str(e)[:150]}). "
                 "Say so in your answer if CI results matter for it.")

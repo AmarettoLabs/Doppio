@@ -1988,6 +1988,8 @@ class CIResultsTest(unittest.TestCase):
         calls = []
         def gl(agent, method, path, body=None):
             calls.append(path)
+            if "/bridges" in path:
+                return []
             return [{"stage": "test", "name": "pytest", "status": "failed"},
                     {"stage": "lint", "name": "ruff", "status": "success"}]
         orig = w.gl_req
@@ -1995,8 +1997,10 @@ class CIResultsTest(unittest.TestCase):
         self.addCleanup(setattr, w, "gl_req", orig)
         text = w.ci_results(agent(gitProvider="gitlab"), "gitlab", "g/p",
                             {"sha": "b" * 40, "head_pipeline": {"id": 99, "status": "failed"}})
-        self.assertEqual(calls, ["/api/v4/projects/g%2Fp/pipelines/99/jobs?per_page=100&page=1"])
-        self.assertIn("2 checks, 1 failed, 1 passed", text)
+        self.assertEqual(calls, ["/api/v4/projects/g%2Fp/pipelines/99/jobs?per_page=100&page=1",
+                                 "/api/v4/projects/g%2Fp/pipelines/99/bridges?per_page=100&page=1"])
+        self.assertIn("3 checks, 2 failed, 1 passed", text)
+        self.assertIn("- pipeline: failed", text)
         self.assertLess(text.index("test: pytest: failed"), text.index("lint: ruff: success"))
 
     def _gh(self, routes):
@@ -2032,14 +2036,31 @@ class CIResultsTest(unittest.TestCase):
         calls = []
         def gl(agent, method, path, body=None):
             calls.append(path)
+            if "/bridges" in path:
+                return []
             return pages.get(int(path.rsplit("page=", 1)[1]), [])
         orig = w.gl_req
         w.gl_req = gl
         self.addCleanup(setattr, w, "gl_req", orig)
         text = w.ci_results(agent(gitProvider="gitlab"), "gitlab", "g/p",
-                            {"sha": "e" * 40, "head_pipeline": {"id": 7}})
-        self.assertEqual(len(calls), 2)
-        self.assertIn("101 checks, 1 failed, 100 passed", text)
+                            {"sha": "e" * 40, "head_pipeline": {"id": 7, "status": "failed"}})
+        self.assertEqual(sum("/jobs" in c for c in calls), 2)
+        self.assertIn("102 checks, 2 failed, 100 passed", text)
+
+    def test_failed_downstream_trigger_is_not_reported_as_passed(self):
+        def gl(agent, method, path, body=None):
+            if "/bridges" in path:
+                return [{"stage": "deploy", "name": "downstream", "status": "failed"}]
+            return [{"stage": "build", "name": "build", "status": "success"}]
+        orig = w.gl_req
+        w.gl_req = gl
+        self.addCleanup(setattr, w, "gl_req", orig)
+        text = w.ci_results(agent(gitProvider="gitlab"), "gitlab", "g/p",
+                            {"sha": "9" * 40, "head_pipeline": {"id": 5, "status": "failed"}})
+        self.assertIn("3 checks, 2 failed, 1 passed", text)
+        lines = text.splitlines()
+        self.assertIn("- deploy: downstream (trigger): failed", lines[1:3])
+        self.assertIn("- pipeline: failed", lines[1:3])
 
     def test_too_many_pages_is_flagged_incomplete(self):
         ok = {"status": "completed", "conclusion": "success"}

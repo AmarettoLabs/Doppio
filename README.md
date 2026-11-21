@@ -68,6 +68,11 @@ ignored and logged in the agent's event stream.
 | Assigned issues | Works on a `<login>/<number>-<slug>` branch, implements and tests the change, pushes and opens a PR with `Closes #<number>`, then comments with the link. If the issue is blocked or unclear, it asks instead. |
 | Assigned PRs | Checks out the PR's branch, addresses the owner's review comments and pushes. |
 
+Only open issues and PRs create tasks. A queued task can wait a while, so the
+worker checks the item again before it starts and before it posts the answer.
+If the PR was merged or the issue closed in the meantime, the task ends as
+`skipped`: nothing runs or gets posted, and it isn't retried.
+
 A task typed in the portal reaches the model as a message from the owner, not
 as git work. The agent answers it and does only what it asks. It doesn't go
 looking for assigned issues or PRs, and it doesn't read credentials.

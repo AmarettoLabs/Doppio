@@ -23,6 +23,10 @@ import agent_worker as w  # noqa: E402
 
 # Engine HOMEs stay in the throwaway workspace, like everything else.
 w.ENGINE_HOME_ROOT = os.path.join(WS_DIR, "engine-home")
+# run_task looks up whether a task's item is still open: tests that don't care
+# see every item open (and make no request). ClosedItemTest uses the real one.
+REAL_ITEM_CLOSED = w.item_closed
+w.item_closed = lambda agent, t: ""
 
 API = "https://api.github.com"
 REPO = "o/r"
@@ -1688,6 +1692,76 @@ class StatusLabelTest(Patched):
         for trigger in ("assigned_issues", "assigned_prs"):
             self.assertIn("STATUS: needs-review", w.PLAYBOOKS[trigger])
             self.assertIn("STATUS: blocked", w.PLAYBOOKS[trigger])
+
+
+class ClosedItemTest(Patched):
+    SRC = "github:o/r#pull_requests:8@abc"
+
+    def setUp(self):
+        w.item_closed = REAL_ITEM_CLOSED
+        self.addCleanup(setattr, w, "item_closed", lambda agent, t: "")
+        self.posted = []
+        for name, fn in (("post_comment", lambda a, src, ans: self.posted.append(ans)),
+                         ("post_review", lambda a, src, ans: self.posted.append(ans) or "COMMENT"),
+                         ("set_status", lambda a, src, st: ""),
+                         ("prepare_task", lambda a, t: "context")):
+            orig = getattr(w, name)
+            setattr(w, name, fn)
+            self.addCleanup(setattr, w, name, orig)
+        orig = dict(w.ENGINES)
+        self.addCleanup(lambda: (w.ENGINES.clear(), w.ENGINES.update(orig)))
+        self.ran = []
+        w.ENGINES["fake"] = lambda run: self.ran.append(1) or w.EngineResult("done", answer="LGTM")
+
+    def item(self, **pr):
+        self.use({r"/repos/o/r/pulls/8": dict(PR, **pr), r"/repos/o/r/issues/7": dict(ISSUE, **pr)})
+
+    def test_item_state(self):
+        t = {"source": self.SRC}
+        for fields, want in (({}, ""), ({"state": "closed", "merged": True}, "merged"),
+                             ({"state": "closed", "merged": False}, "closed")):
+            self.item(**fields)
+            self.assertEqual(w.item_closed(agent(), t), want, fields)
+        self.item(state="closed")
+        self.assertEqual(w.item_closed(agent(), {"source": "github:o/r#issues:7@assigned"}), "closed")
+        # GitLab states.
+        orig = w.gl_req
+        self.addCleanup(setattr, w, "gl_req", orig)
+        for st, want in (("opened", ""), ("merged", "merged"), ("closed", "closed")):
+            w.gl_req = lambda a, m, p, b=None, st=st: {"state": st}
+            self.assertEqual(w.item_closed(agent(gitProvider="gitlab"), {"source": "gitlab:g/p#merge_requests:3"}), want)
+        # A failed lookup lets the task go ahead.
+        self.use({})
+        self.assertEqual(w.item_closed(agent(), t), "")
+
+    def test_closed_items_are_skipped_before_the_engine_runs(self):
+        self.item(state="closed", merged=True)
+        mgr = RunTaskMgr()
+        task = {"id": "t", "kind": "review", "title": "x", "input": "go", "source": self.SRC}
+        self.assertEqual(w.run_task(mgr, agent(engine="fake"), "sys", task), "skipped")
+        self.assertEqual((self.ran, self.posted), ([], []))
+        self.assertEqual(mgr.finished, [("t", "skipped", "")])
+        self.assertIn("was merged", mgr.events[-1][1])
+        # Not retried, unlike a failed attempt.
+        state = {"handled": [self.SRC]}
+        w.after_git_task(MgrStub(), state, os.path.join(WS_DIR, "closed-state.json"), task, "skipped")
+        self.assertIn(self.SRC, state["handled"])
+
+    def test_items_closed_while_the_engine_works_get_no_answer(self):
+        states = iter([{}, {"state": "closed"}])
+        self.use({r"/repos/o/r/pulls/8": lambda p: dict(PR, **next(states))})
+        mgr = RunTaskMgr()
+        task = {"id": "t", "kind": "mention", "title": "x", "input": "go", "source": self.SRC}
+        self.assertEqual(w.run_task(mgr, agent(engine="fake"), "sys", task), "skipped")
+        self.assertEqual((self.ran, self.posted), ([1], []))
+        self.assertEqual(mgr.finished[-1][1], "skipped")
+
+    def test_open_items_are_answered(self):
+        self.item()
+        mgr = RunTaskMgr()
+        task = {"id": "t", "kind": "mention", "title": "x", "input": "go", "source": self.SRC}
+        self.assertEqual(w.run_task(mgr, agent(engine="fake"), "sys", task), "done")
+        self.assertEqual(self.posted, ["LGTM"])
 
 
 class RetryTest(unittest.TestCase):

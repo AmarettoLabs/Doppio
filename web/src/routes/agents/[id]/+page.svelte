@@ -4,10 +4,11 @@
 	import PollTimer from '#lib/PollTimer.svelte';
 
 	let agent = $state<AgentView | null>(null);
-	const PAGE = 20;
+	const PAGE = 5;
 	let tasks = $state<Task[]>([]);
 	let taskTotal = $state(0);
-	let taskOffset = $state(0); // 0 = newest page
+	let taskShown = $state(PAGE); // newest N; "Load older" adds a page
+	let loadingOlder = $state(false);
 	let events = $state<AgentEvent[]>([]);
 	let error = $state('');
 	let taskInput = $state('');
@@ -21,12 +22,8 @@
 	async function load() {
 		try {
 			agent = await api.agent(id);
-			let p = await api.tasks(id, taskOffset, PAGE);
-			// The page we were on is gone (tasks deleted): show the last one.
-			if (p.tasks.length === 0 && p.total > 0 && taskOffset > 0) {
-				taskOffset = Math.floor((p.total - 1) / PAGE) * PAGE;
-				p = await api.tasks(id, taskOffset, PAGE);
-			}
+			// The poll re-fetches only the tasks on screen, newest first.
+			const p = await api.tasks(id, 0, taskShown);
 			tasks = p.tasks;
 			taskTotal = p.total;
 			error = '';
@@ -35,9 +32,11 @@
 		}
 	}
 
-	function goTasks(offset: number) {
-		taskOffset = Math.max(0, offset);
-		load();
+	async function loadOlder() {
+		taskShown += PAGE;
+		loadingOlder = true;
+		await load();
+		loadingOlder = false;
 	}
 
 	$effect(() => {
@@ -213,9 +212,15 @@
 		</div>
 		{#if taskTotal > PAGE}
 			<div class="row pager">
-				<button class="ghost" onclick={() => goTasks(taskOffset - PAGE)} disabled={taskOffset === 0}>Newer</button>
-				<span class="muted">{taskOffset + 1}–{Math.min(taskOffset + PAGE, taskTotal)} of {taskTotal}</span>
-				<button class="ghost" onclick={() => goTasks(taskOffset + PAGE)} disabled={taskOffset + PAGE >= taskTotal}>Older</button>
+				<span class="muted">{tasks.length} of {taskTotal}</span>
+				{#if tasks.length < taskTotal}
+					<button class="ghost" onclick={loadOlder} disabled={loadingOlder || taskShown >= 500}>
+						{#if loadingOlder}<span class="spinner"></span>Loading…{:else}Load older{/if}
+					</button>
+				{/if}
+				{#if taskShown > PAGE}
+					<button class="ghost" onclick={() => { taskShown = PAGE; load(); }}>Show fewer</button>
+				{/if}
 			</div>
 		{/if}
 	{/if}

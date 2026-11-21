@@ -852,11 +852,12 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toView(a))
 }
 
-// Task list paging: the UI polls this every few seconds, so it gets one page,
-// not the agent's whole history.
+// Task list paging: the UI polls this every few seconds, so it asks for the
+// few tasks it shows (5 at first, more as the user loads older ones), not the
+// agent's whole history.
 const (
-	defaultTaskPage = 20
-	maxTaskPage     = 100
+	defaultTaskPage = 5
+	maxTaskPage     = 500
 )
 
 // taskPage is one page of an agent's tasks, newest first; Total counts them all.

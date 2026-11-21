@@ -256,6 +256,9 @@ func TestListTasksPages(t *testing.T) {
 	if p.Total != 25 || len(p.Tasks) != defaultTaskPage || p.Tasks[0].Title != "t24" {
 		t.Fatalf("default page: total %d, %d tasks, first %q", p.Total, len(p.Tasks), p.Tasks[0].Title)
 	}
+	if p.Tasks[defaultTaskPage-1].Title != "t20" {
+		t.Fatalf("default page ends at %q", p.Tasks[defaultTaskPage-1].Title)
+	}
 	p, _ = get("?limit=10&offset=20")
 	if p.Total != 25 || len(p.Tasks) != 5 || p.Tasks[0].Title != "t4" || p.Tasks[4].Title != "t0" {
 		t.Fatalf("last page: total %d, %d tasks", p.Total, len(p.Tasks))
@@ -264,7 +267,7 @@ func TestListTasksPages(t *testing.T) {
 	if p.Total != 25 || p.Tasks == nil || len(p.Tasks) != 0 {
 		t.Fatalf("past the end: %+v", p)
 	}
-	for _, q := range []string{"?limit=0", "?limit=101", "?limit=x", "?offset=-1"} {
+	for _, q := range []string{"?limit=0", "?limit=501", "?limit=x", "?offset=-1"} {
 		if _, code := get(q); code != http.StatusBadRequest {
 			t.Errorf("%s: got %d", q, code)
 		}

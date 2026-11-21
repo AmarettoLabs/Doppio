@@ -232,7 +232,7 @@ export const api = {
 	deleteAgent: (id: string) => req<{ deleted: string }>(`/api/agents/${id}`, { method: 'DELETE' }),
 	action: (id: string, op: 'start' | 'stop' | 'restart') =>
 		req<AgentView>(`/api/agents/${id}/${op}`, { method: 'POST' }),
-	tasks: (id: string, offset = 0, limit = 20) =>
+	tasks: (id: string, offset = 0, limit = 5) =>
 		req<TaskPage>(`/api/agents/${id}/tasks?offset=${offset}&limit=${limit}`),
 	createTask: (id: string, input: string, title?: string) =>
 		req<Task>(`/api/agents/${id}/tasks`, json('POST')({ input, title })),

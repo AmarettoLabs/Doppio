@@ -4,7 +4,10 @@
 	import PollTimer from '#lib/PollTimer.svelte';
 
 	let agent = $state<AgentView | null>(null);
+	const PAGE = 20;
 	let tasks = $state<Task[]>([]);
+	let taskTotal = $state(0);
+	let taskOffset = $state(0); // 0 = newest page
 	let events = $state<AgentEvent[]>([]);
 	let error = $state('');
 	let taskInput = $state('');
@@ -18,11 +21,23 @@
 	async function load() {
 		try {
 			agent = await api.agent(id);
-			tasks = await api.tasks(id);
+			let p = await api.tasks(id, taskOffset, PAGE);
+			// The page we were on is gone (tasks deleted): show the last one.
+			if (p.tasks.length === 0 && p.total > 0 && taskOffset > 0) {
+				taskOffset = Math.floor((p.total - 1) / PAGE) * PAGE;
+				p = await api.tasks(id, taskOffset, PAGE);
+			}
+			tasks = p.tasks;
+			taskTotal = p.total;
 			error = '';
 		} catch (e) {
 			error = String(e instanceof Error ? e.message : e);
 		}
+	}
+
+	function goTasks(offset: number) {
+		taskOffset = Math.max(0, offset);
+		load();
 	}
 
 	$effect(() => {
@@ -177,7 +192,7 @@
 	</div>
 
 	<h2>Tasks</h2>
-	{#if tasks.length === 0}
+	{#if taskTotal === 0}
 		<p class="muted">No tasks yet.</p>
 	{:else}
 		<div class="table-wrap">
@@ -196,6 +211,13 @@
 			</tbody>
 		</table>
 		</div>
+		{#if taskTotal > PAGE}
+			<div class="row pager">
+				<button class="ghost" onclick={() => goTasks(taskOffset - PAGE)} disabled={taskOffset === 0}>Newer</button>
+				<span class="muted">{taskOffset + 1}–{Math.min(taskOffset + PAGE, taskTotal)} of {taskTotal}</span>
+				<button class="ghost" onclick={() => goTasks(taskOffset + PAGE)} disabled={taskOffset + PAGE >= taskTotal}>Older</button>
+			</div>
+		{/if}
 	{/if}
 
 	<h2>Live stream</h2>

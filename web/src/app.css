@@ -145,6 +145,7 @@ textarea { min-height: 7rem; resize: vertical; }
 .ev.action .c { color: var(--ok); }
 .ev.error .c { color: var(--err); }
 .ev.log .c { color: var(--muted); }
+.pager { margin-top: 0.5rem; }
 .filters { display: flex; gap: 0.4rem; margin-bottom: 0.5rem; }
 .filters button { background: transparent; border: 1px solid var(--border); color: var(--muted); padding: 0.2rem 0.6rem; }
 .filters button.active { color: var(--text); border-color: var(--accent); }

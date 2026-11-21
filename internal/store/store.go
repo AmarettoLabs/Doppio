@@ -28,11 +28,12 @@ type Data struct {
 
 // Store is a goroutine-safe JSON-file store.
 type Store struct {
-	mu   sync.Mutex
-	dir  string
-	path string
-	data Data
-	keep int // max events kept per agent; 0 = unlimited
+	mu        sync.Mutex
+	dir       string
+	path      string
+	data      Data
+	keep      int // max events kept per agent; 0 = unlimited
+	keepTasks int // max finished tasks kept per agent; 0 = unlimited
 }
 
 // Dir is the directory the store was opened in (secrets live under it).
@@ -44,6 +45,58 @@ func (s *Store) SetEventRetention(keep int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.keep = keep
+}
+
+// SetTaskRetention caps how many finished (done/failed) tasks are kept per
+// agent (0 = unlimited) and prunes the oldest right away. Pending and running
+// tasks are never pruned. Later finishes prune as they happen.
+func (s *Store) SetTaskRetention(keep int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.keepTasks = keep
+	agents := map[string]bool{}
+	for _, t := range s.data.Tasks {
+		agents[t.AgentID] = true
+	}
+	pruned := false
+	for id := range agents {
+		if s.pruneTasksLocked(id) {
+			pruned = true
+		}
+	}
+	if !pruned {
+		return nil
+	}
+	return s.saveLocked()
+}
+
+// pruneTasksLocked drops an agent's oldest finished tasks beyond keepTasks,
+// reporting whether it dropped any.
+func (s *Store) pruneTasksLocked(agentID string) bool {
+	if s.keepTasks <= 0 {
+		return false
+	}
+	var finished []*model.Task
+	for _, t := range s.data.Tasks {
+		if t.AgentID == agentID && t.Status != "pending" && t.Status != "running" {
+			finished = append(finished, t)
+		}
+	}
+	if len(finished) <= s.keepTasks {
+		return false
+	}
+	// Newest first by finish time (creation time if it never recorded one).
+	at := func(t *model.Task) time.Time {
+		if t.FinishedAt != nil {
+			return *t.FinishedAt
+		}
+		return t.CreatedAt
+	}
+	sort.Slice(finished, func(i, j int) bool { return at(finished[i]).After(at(finished[j])) })
+	for _, t := range finished[s.keepTasks:] {
+		delete(s.data.Tasks, t.ID)
+	}
+	return true
 }
 
 // Open loads (or creates) the store in dir.
@@ -243,6 +296,7 @@ func (s *Store) FinishTask(id, status, output, errMsg string) error {
 	t.Output = output
 	t.Error = errMsg
 	t.FinishedAt = &now
+	s.pruneTasksLocked(t.AgentID)
 	return s.saveLocked()
 }
 

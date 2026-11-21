@@ -1249,6 +1249,33 @@ def fetch_item(agent, repo, kind, num):
     return gl_req(agent, "GET", f"/api/v4/projects/{proj}/{kind}/{num}") or {}
 
 
+def item_closed(agent, t):
+    """'merged' or 'closed' when the git item a task came from is no longer
+    open, else ''. Tasks wait in the queue (and run for a while): the PR may
+    be merged or the issue closed by the time the agent gets to it. A failed
+    lookup counts as open: the task goes ahead as it would have."""
+    try:
+        _, repo, kind, num = parse_source(t["source"])
+        item = fetch_item(agent, repo, kind, num)
+    except Exception as e:
+        log("item state lookup failed:", t.get("source"), e)
+        return ""
+    state = (item.get("state") or "").lower()
+    if item.get("merged") or item.get("merged_at") or state == "merged":
+        return "merged"
+    if state in ("closed", "locked"):
+        return "closed"
+    return ""
+
+
+def skip_closed(mgr, t, why, output=""):
+    """Finish a task whose item is closed without acting on it."""
+    msg = f"skipped: {t['source']} was {why}; not acting on it"
+    mgr.emit("status", msg, task_id=t["id"])
+    mgr.finish(t["id"], "skipped", output=output or msg)
+    return "skipped"
+
+
 CI_MAX_LISTED = 30
 CI_PAGE_SIZE = 100
 CI_MAX_PAGES = 10  # 1000 checks; more than that is reported as incomplete
@@ -3092,8 +3119,9 @@ def task_workdir(t, agent=None):
 
 def run_task(mgr, agent, system, t):
     """Run one task with the agent's engine, then post its answer on the
-    git item it came from. Returns the outcome: "done", "failed", "error"
-    or "limit" (see RETRIED_OUTCOMES)."""
+    git item it came from. Returns the outcome: "done", "failed", "error",
+    "limit" (see RETRIED_OUTCOMES) or "skipped" (the item was merged or
+    closed before the agent acted on it)."""
     if agent.get("engine") == "codex":
         agent = apply_account(agent, load_account())
     tid = t["id"]
@@ -3107,6 +3135,9 @@ def run_task(mgr, agent, system, t):
         return "failed"
     prompt = t["input"]
     if t.get("source") and task_trigger(t):
+        why = item_closed(agent, t)
+        if why:
+            return skip_closed(mgr, t, why)
         try:
             prompt = prepare_task(agent, t) + "\n\n" + prompt
         except Exception as e:
@@ -3146,6 +3177,11 @@ def run_task(mgr, agent, system, t):
             report_status(mgr, agent, t, "blocked")
         return res.outcome
     answer, status = split_status(res.answer) if assigned else (res.answer, "")
+    if t.get("source") and task_trigger(t):
+        # Closed while the engine worked: keep the answer here, post nothing.
+        why = item_closed(agent, t)
+        if why:
+            return skip_closed(mgr, t, why, output=res.answer)
     if t.get("source"):
         if res.answer.strip():
             try:

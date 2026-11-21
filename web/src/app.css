@@ -106,7 +106,7 @@ table.tasks td { overflow-wrap: anywhere; }
 table.tasks td.nowrap, table.tasks td:first-child { white-space: nowrap; overflow-wrap: normal; }
 .badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px; font-size: 0.75rem; border: 1px solid var(--border); }
 .badge.running { color: var(--ok); border-color: var(--ok); }
-.badge.stopped, .badge.created { color: var(--muted); }
+.badge.stopped, .badge.created, .badge.skipped { color: var(--muted); }
 .badge.error { color: var(--err); border-color: var(--err); }
 .badge.exited { color: var(--warn); border-color: var(--warn); }
 .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; }

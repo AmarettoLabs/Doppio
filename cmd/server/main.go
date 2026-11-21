@@ -87,6 +87,17 @@ func main() {
 		}
 	}
 	st.SetEventRetention(retention)
+	// Cap the finished tasks kept per agent (0 = keep everything); pending
+	// and running ones always stay.
+	taskRetention := 20
+	if v := os.Getenv("MAX_FINISHED_TASKS_PER_AGENT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			taskRetention = n
+		}
+	}
+	if err := st.SetTaskRetention(taskRetention); err != nil {
+		log.Fatal(err)
+	}
 	// Tasks whose worker died with a restart go back to pending (fresh context).
 	for _, t := range st.RequeueRunningTasks() {
 		st.AppendEvents(t.AgentID, t.ID, []model.Event{{Type: "status", Content: "task requeued after manager restart (context starts fresh)"}})

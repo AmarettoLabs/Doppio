@@ -215,6 +215,14 @@ const json = (method: string) => (body: unknown) => ({
 	body: JSON.stringify(body)
 });
 
+/** One page of an agent's tasks, newest first; total counts them all. */
+export interface TaskPage {
+	tasks: Task[];
+	total: number;
+	limit: number;
+	offset: number;
+}
+
 export const api = {
 	providers: () => req<{ llm: ProviderInfo[]; git: GitProviderInfo[]; engines: EngineInfo[] }>('/api/providers'),
 	agents: () => req<AgentView[]>('/api/agents'),
@@ -224,7 +232,8 @@ export const api = {
 	deleteAgent: (id: string) => req<{ deleted: string }>(`/api/agents/${id}`, { method: 'DELETE' }),
 	action: (id: string, op: 'start' | 'stop' | 'restart') =>
 		req<AgentView>(`/api/agents/${id}/${op}`, { method: 'POST' }),
-	tasks: (id: string) => req<Task[]>(`/api/agents/${id}/tasks`),
+	tasks: (id: string, offset = 0, limit = 5) =>
+		req<TaskPage>(`/api/agents/${id}/tasks?offset=${offset}&limit=${limit}`),
 	createTask: (id: string, input: string, title?: string) =>
 		req<Task>(`/api/agents/${id}/tasks`, json('POST')({ input, title })),
 	events: (id: string, since = 0) => req<AgentEvent[]>(`/api/agents/${id}/events?since=${since}`),

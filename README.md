@@ -262,6 +262,7 @@ Manager environment variables:
 | `AGENT_NETWORK` | `doppio_agents` | Shared Docker network |
 | `MANAGER_URL` | `http://manager:8080` | URL agents use to reach the manager |
 | `MAX_EVENTS_PER_AGENT` | `5000` | Persisted events per agent (`0` = unlimited) |
+| `MAX_FINISHED_TASKS_PER_AGENT` | `20` | Finished (done/failed) tasks kept per agent; pending and running ones always stay (`0` = unlimited) |
 | `DOCKER_BIN` | `docker` | Docker CLI binary |
 | `AGENT_EXTRA_HOSTS` | _(empty)_ | Comma-separated `name:ip` entries added to every agent's `/etc/hosts` |
 | `AGENT_CA_BUNDLE` | _(empty)_ | PEM file of extra CA certificates agents trust, on top of the system ones |

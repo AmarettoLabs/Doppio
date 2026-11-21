@@ -2,10 +2,12 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func agentJSON(extra string) string {
@@ -225,6 +227,49 @@ func TestAgentListFieldsAreNeverNull(t *testing.T) {
 		}
 		if strings.Contains(body, "null") {
 			t.Errorf("GET %s: null in %s", path, body)
+		}
+	}
+}
+
+func TestListTasksPages(t *testing.T) {
+	srv, st := newTestServer(t, "")
+	addAgent(t, st, "a1")
+	for i := 0; i < 25; i++ {
+		if _, err := st.CreateTask("a1", "manual", fmt.Sprintf("t%d", i), "in", ""); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(time.Millisecond) // distinct CreatedAt, so newest-first is stable
+	}
+	h := srv.Handler()
+	get := func(q string) (taskPage, int) {
+		rec := do(h, "GET", "/api/agents/a1/tasks"+q, "", "")
+		var p taskPage
+		if rec.Code == http.StatusOK {
+			if err := json.Unmarshal(rec.Body.Bytes(), &p); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return p, rec.Code
+	}
+
+	p, _ := get("")
+	if p.Total != 25 || len(p.Tasks) != defaultTaskPage || p.Tasks[0].Title != "t24" {
+		t.Fatalf("default page: total %d, %d tasks, first %q", p.Total, len(p.Tasks), p.Tasks[0].Title)
+	}
+	if p.Tasks[defaultTaskPage-1].Title != "t20" {
+		t.Fatalf("default page ends at %q", p.Tasks[defaultTaskPage-1].Title)
+	}
+	p, _ = get("?limit=10&offset=20")
+	if p.Total != 25 || len(p.Tasks) != 5 || p.Tasks[0].Title != "t4" || p.Tasks[4].Title != "t0" {
+		t.Fatalf("last page: total %d, %d tasks", p.Total, len(p.Tasks))
+	}
+	p, _ = get("?offset=40")
+	if p.Total != 25 || p.Tasks == nil || len(p.Tasks) != 0 {
+		t.Fatalf("past the end: %+v", p)
+	}
+	for _, q := range []string{"?limit=0", "?limit=501", "?limit=x", "?offset=-1"} {
+		if _, code := get(q); code != http.StatusBadRequest {
+			t.Errorf("%s: got %d", q, code)
 		}
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -851,8 +852,46 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toView(a))
 }
 
+// Task list paging: the UI polls this every few seconds, so it asks for the
+// few tasks it shows (5 at first, more as the user loads older ones), not the
+// agent's whole history.
+const (
+	defaultTaskPage = 5
+	maxTaskPage     = 500
+)
+
+// taskPage is one page of an agent's tasks, newest first; Total counts them all.
+type taskPage struct {
+	Tasks  []*model.Task `json:"tasks"`
+	Total  int           `json:"total"`
+	Limit  int           `json:"limit"`
+	Offset int           `json:"offset"`
+}
+
 func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.store.TasksFor(r.PathValue("id")))
+	limit, offset := defaultTaskPage, 0
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > maxTaskPage {
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("limit must be between 1 and %d", maxTaskPage))
+			return
+		}
+		limit = n
+	}
+	if v := r.URL.Query().Get("offset"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			writeErr(w, http.StatusBadRequest, "offset must be 0 or more")
+			return
+		}
+		offset = n
+	}
+	all := s.store.TasksFor(r.PathValue("id"))
+	page := taskPage{Tasks: []*model.Task{}, Total: len(all), Limit: limit, Offset: offset}
+	if offset < len(all) {
+		page.Tasks = all[offset:min(offset+limit, len(all))]
+	}
+	writeJSON(w, http.StatusOK, page)
 }
 
 func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {

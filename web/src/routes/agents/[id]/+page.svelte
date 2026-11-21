@@ -4,7 +4,11 @@
 	import PollTimer from '#lib/PollTimer.svelte';
 
 	let agent = $state<AgentView | null>(null);
+	const PAGE = 5;
 	let tasks = $state<Task[]>([]);
+	let taskTotal = $state(0);
+	let taskShown = $state(PAGE); // newest N; "Load older" adds a page
+	let loadingOlder = $state(false);
 	let events = $state<AgentEvent[]>([]);
 	let error = $state('');
 	let taskInput = $state('');
@@ -18,11 +22,21 @@
 	async function load() {
 		try {
 			agent = await api.agent(id);
-			tasks = await api.tasks(id);
+			// The poll re-fetches only the tasks on screen, newest first.
+			const p = await api.tasks(id, 0, taskShown);
+			tasks = p.tasks;
+			taskTotal = p.total;
 			error = '';
 		} catch (e) {
 			error = String(e instanceof Error ? e.message : e);
 		}
+	}
+
+	async function loadOlder() {
+		taskShown += PAGE;
+		loadingOlder = true;
+		await load();
+		loadingOlder = false;
 	}
 
 	$effect(() => {
@@ -177,7 +191,7 @@
 	</div>
 
 	<h2>Tasks</h2>
-	{#if tasks.length === 0}
+	{#if taskTotal === 0}
 		<p class="muted">No tasks yet.</p>
 	{:else}
 		<div class="table-wrap">
@@ -196,6 +210,19 @@
 			</tbody>
 		</table>
 		</div>
+		{#if taskTotal > PAGE}
+			<div class="row pager">
+				<span class="muted">{tasks.length} of {taskTotal}</span>
+				{#if tasks.length < taskTotal}
+					<button class="ghost" onclick={loadOlder} disabled={loadingOlder || taskShown >= 500}>
+						{#if loadingOlder}<span class="spinner"></span>Loading…{:else}Load older{/if}
+					</button>
+				{/if}
+				{#if taskShown > PAGE}
+					<button class="ghost" onclick={() => { taskShown = PAGE; load(); }}>Show fewer</button>
+				{/if}
+			</div>
+		{/if}
 	{/if}
 
 	<h2>Live stream</h2>
